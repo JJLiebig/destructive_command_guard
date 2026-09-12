@@ -84,6 +84,7 @@ pub mod packs;
 pub mod pending_exceptions;
 pub mod perf;
 pub mod rebase_recovery;
+pub mod redaction;
 pub mod sarif;
 pub mod scan;
 pub mod session;
@@ -212,8 +213,8 @@ pub use confidence::{
 pub use history::{
     AgentStat, BackupResult, CURRENT_SCHEMA_VERSION, CheckResult, CommandEntry,
     DEFAULT_DB_FILENAME, ENV_HISTORY_DB_PATH, ENV_HISTORY_DISABLED, HistoryDb, HistoryError,
-    HistoryStats, HistoryWriter, Outcome as HistoryOutcome, OutcomeStats, PatternStat,
-    PerformanceStats, ProjectStat, StatsTrends,
+    HistoryPathSource, HistoryStats, HistoryWriter, Outcome as HistoryOutcome, OutcomeStats,
+    PatternStat, PerformanceStats, ProjectStat, ResolvedHistoryPath, StatsTrends,
 };
 
 // Re-export interactive prompt types for human verification

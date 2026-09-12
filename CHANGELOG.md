@@ -11,6 +11,463 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.14.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.3) -- 2026-09-10 [Release]
+
+Five false-positive reports arrived within twenty-four hours (#401, #402, #403,
+#404, #405). Each had its own mechanism, but four of the five shared a shape:
+an operand dcg could not resolve was allowed to condemn a command whose *verb*
+was plainly read-only. Every fix below narrows the evidence to what was
+actually seen; none of them relaxes a rule's coverage of the thing it exists to
+stop.
+
+### Fixed
+
+- **A read-only `git` subcommand survives an unresolvable `-C` / `--git-dir`
+  path (#405).** `git -C $d status` — and therefore every `for d in ...; do
+  git -C $d status; done` sweep — denied as
+  `core.git:git-alias-semantic-unverified`, a rule whose job is to refuse a
+  Git invocation whose *alias chain* cannot be resolved. A path is not an
+  alias: a dynamic, field-splitting value for `-C`, `--git-dir`,
+  `--work-tree`, `--namespace`, `--super-prefix`, `--shallow-file` or
+  `--attr-source` (separated or glued, `-C$d` / `--git-dir=$d/.git`) no longer
+  ends the walk. The subcommand decides instead — a builtin resolves the
+  dispatch and its own pack rules still see the command (`git -C $d clean
+  -fdx`, `git -C $d reset --hard` and `git -C $d checkout -- .` stay denied),
+  and a non-builtin word still returns `Unverified`. A bare dynamic word in
+  the options region (`git $flag status`) and a dynamic `--exec-path=` — which
+  really can redirect dispatch to another `git-<name>` helper — keep their
+  denial.
+
+- **A keyword-less external pack is evaluated (#402).** `Pack::might_match`
+  documents that a pack declaring no `keywords` is always checked, but the
+  *global* quick reject runs before it and is built from the union of every
+  enabled pack's keywords — to which such a pack contributes nothing. The pack
+  therefore fired only when some unrelated pack's keyword happened to appear
+  in the command, which made its coverage depend on the rest of the command
+  line rather than on the configuration, on every surface including the hook.
+  A loaded pack with no keywords now stands the global reject down for the
+  process, honouring the documented contract. `dcg pack validate` reports
+  `[S001]` as a warning that names the runtime consequence instead of a
+  performance suggestion, and `dcg doctor` names the pack.
+
+- **`dcg config` lists the packs that evaluate (#402).** The listing printed
+  the *requested* set, so it disagreed with `dcg packs` and `dcg doctor`: a
+  pack reached only through `packs.custom_paths` was missing even though it
+  was firing, and a pack whose YAML failed to parse was presented as coverage.
+  All three surfaces now report the same set; an external pack is marked as
+  such, a configured id that never loaded is marked `configured but NOT
+  loaded`, and the load warnings are printed. `dcg doctor` counts external
+  packs and fails its pack check when one could not be loaded. The JSON form
+  gains `packs.configured_but_not_loaded`,
+  `packs.external_without_keywords` and `packs.load_warnings`.
+
+- **Tailwind's `truncate` class is not SQL DDL (#403).** The
+  `database.mysql` and `database.postgresql` `truncate-table` rules matched
+  "the word `truncate`, whitespace, a letter", which every Tailwind class list
+  satisfies — `class="min-w-0 truncate line-through"` read as
+  `TRUNCATE <tablename>` and blocked ordinary React/TypeScript edits in any
+  project using the utility class. The expression now requires the keyword to
+  start a word (a punctuation-aware lookbehind: `\b` alone also matches after
+  `.` and `-`, so `s.truncate` and `--truncate` matched), a full SQL
+  identifier that is not followed by a hyphen (an unquoted SQL identifier
+  cannot contain one), and a statement end after it. Every real spelling still
+  blocks, including `TRUNCATE TABLE db.t`, `truncate foo CASCADE`,
+  `TRUNCATE users RESTART IDENTITY` and the `psql -c` / `mysql -e` forms. The
+  sibling rules in these packs were audited for the same `\b`-after-punctuation
+  defect; `delete-without-where` and `grant-all` gained the word boundary they
+  never had.
+
+- **An inline payload's redirect is judged in the payload's own coordinates
+  (#404).** `ssh h "a 2>/dev/null"` was allowed and `ssh h "a 2>/dev/null"
+  2>&1` was denied, for a byte-identical inner redirect: the local `2>` joined
+  the `ssh` payload token run, which stopped the quote stripping and glued the
+  closing quote onto the target, producing `/dev/null"`. A redirect always
+  belongs to the local command, so the payload run now stops at one. The
+  redirect guard also asks the rule its own question against the payload text:
+  if the expression does not match there, the outer hit was assembled from
+  bytes the payload does not contain. Multi-segment payloads used to bail out
+  of that guard entirely, which is why the reporter's composition case
+  disappeared under simplification. A payload that really does carry the
+  syntax (`bash -c "cat x > $T"`) still denies.
+
+- **A cross-dialect quote artifact is not a dynamic redirect target (#404).**
+  With no proven dialect dcg unions the POSIX, PowerShell and Cmd views. Cmd
+  has no single-quote literal, so in a POSIX single-quoted argument it read
+  the bytes as live syntax *and* swallowed the closing `'` into the redirect
+  target — the only reason the target then looked "dynamic". No shell does
+  both, so that combination no longer denies. A real redirect keeps its
+  operator outside the quotes and is unaffected.
+
+- **`/dev/tcp/<host>/<port>` and `/dev/udp/<host>/<port>` are sockets, not
+  files (#404).** Bash intercepts those two prefixes in its own redirect
+  parser and opens a socket; no file is opened and nothing can be truncated.
+  `echo > /dev/tcp/host/22`, the standard port probe on a host without `nc`,
+  is allowed. The exemption is scoped to the exact `host/port` shape bash
+  recognises and refuses a `.`/`..` segment, because under `sh`/`dash` the
+  same word is an ordinary filename. `/dev/stdout`, `/dev/stderr` and
+  `/dev/fd/N` deliberately stay denied: they are symlinks to whatever the
+  descriptor currently points at, which may be a regular file.
+
+- **An embedded denial names the carrier it came from (#404).** The reason
+  string hardcoded `(line N of heredoc)` for every extracted payload, sending
+  anyone triaging `ssh h "a 2>/dev/null" 2>&1` — a command with no heredoc
+  anywhere — into the heredoc extractor for behaviour that lives in argument
+  handling, and re-wrapping an already-wrapped reason doubled the entire
+  prefix. The frame now names the real carrier (`(ssh inline script)`,
+  `(line 2 of heredoc)`) and an inner frame is kept rather than repeated.
+
+- **A PowerShell assignment is not a POSIX launcher (#401).** `$residue =
+  Get-ChildItem "$env:TEMP" -Directory` denied as
+  `heredoc.posix:inline-launcher-unverified`: the POSIX reading made `$residue`
+  a "dynamically assembled executable", and `-Directory` was read as a cluster
+  of short flags one of which is `c`, the inline-code flag. A `$name = <rhs>`
+  statement is now analysed as the assignment it is — the right-hand side is
+  still analysed, so `$x = sh -c "<payload>"` stays gated — and a CamelCase
+  long parameter is no longer read as a short-flag cluster when the executable
+  is unknown, unless it is one of PowerShell's own inline-code parameters
+  (`-Command`, `-EncodedCommand`). A proven shell keeps the permissive
+  cluster reading, so `sh -Bec '<payload>'` is still an inline-code launcher.
+  The right-hand side is handed to the whole pipeline rather than skipped, so
+  it is judged by the rule that actually describes it — which also closes a
+  gap v0.14.2 had: `$x = cmd /c "del /f /s /q C:\Windows"` is now denied.
+
+- **An unresolvable executable is not upgraded into `git branch` (#401
+  class).** A bare expansion may equal any name, so asking whether it equals
+  `git-branch` always said yes, and the synthesized pattern-matching view read
+  `git branch <the whole argv>` — which handed `branch-force-delete` a
+  `-D`-looking token from an unrelated command. That is how `$items =
+  Get-ChildItem C:\temp -Recurse -Directory` came to be denied as a forced
+  branch deletion. An unbounded executable now synthesizes plain `git`;
+  literal branch evidence after it is still caught, and attributed to
+  `branch-dynamic-token`, the rule that describes what was actually seen.
+
+### Added
+
+- **A corpus of ordinary developer command lines that must never be denied**
+  (`tests/false_positive_corpus.rs`): git read-only operations including the
+  directory-loop shapes, npm/bun/pnpm/pip/cargo installs and builds, Tailwind
+  class edits, `docker ps`, `kubectl get`, PowerShell read-only assignments,
+  remote payloads carrying `2>/dev/null`, and everyday shell. It runs the real
+  binary in hook mode with **every** pack category enabled, and carries a
+  control list of destructive commands so it cannot pass by weakening dcg.
+  This is the guard against the class, rather than against the five instances.
+
+---
+
+## [v0.14.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.2) -- 2026-09-09 [Release]
+
+The credential-file write rule, the `;`-joined heredoc boundary fix (#393),
+the Codex `hooks.json` doctor classification (#391), and the post-0.14.1
+dependency bumps.
+
+### Added
+
+- **`core.filesystem:credential-file-write`: writing a credential, key,
+  login-shell startup, or system authentication file is denied whether or
+  not the file exists yet.** The #390 carve-out made `> ~/absent-file`
+  creation rather than truncation, which was right for `~/.config/new.toml`
+  and wrong for `~/.ssh/authorized_keys`: creating that file grants login,
+  and `>>` to it (or to `~/.zshrc`, `~/.npmrc`, `/etc/sudoers.d/x`) had
+  always been allowed because no rule modelled persistence, only data loss.
+  The new rule covers `~/.ssh/*` (private keys, `authorized_keys`, `config`,
+  `rc`), `~/.aws/credentials` and `config`, `~/.netrc`/`_netrc`,
+  `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`,
+  `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the shell rc
+  files (`.bashrc`, `.bash_profile`, `.bash_login`, `.profile`, `.zshrc`,
+  `.zshenv`, `.zprofile`, `.zlogin`) and `~/.bashrc.d/*`/`~/.zshrc.d/*`,
+  plus `/etc/sudoers`, `/etc/sudoers.d/*`, `/etc/passwd`, `/etc/shadow`,
+  `/etc/group`, `/etc/gshadow`, and `/etc/ssh/*`. Writers: every truncating
+  and appending redirect spelling (`>`, `>>`, `>|`, `&>`, `&>>`, `N>`,
+  `{fd}>`, `>&file`), `tee`/`sponge` (with and without `-a`),
+  `cp`/`mv`/`install`/`ln` onto the file or into its directory (`-t DIR`,
+  `-T`, `--`, and a glob, brace, or `dir/.` source that could land on a
+  protected name are all understood), `dd of=`, and `sed -i`/`perl -i`, with
+  `sudo`/`doas`/`env`/`command`/`nohup`/`nice`/`timeout`/`stdbuf` and
+  leading assignments or reserved words stripped, inside `bash -c` payloads,
+  and after `;`/`&&`/`|`. The path is judged as the shell will open it:
+  `~`, `~user`, `$HOME`/`${HOME}`, `/home/<u>`, `/Users/<u>`, `/root`,
+  `/private/etc`, the relocation variables (`ZDOTDIR`, `GNUPGHOME`,
+  `XDG_CONFIG_HOME`, `GH_CONFIG_DIR`, `DOCKER_CONFIG`, `KUBECONFIG`,
+  `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE`, `NPM_CONFIG_USERCONFIG`),
+  quote removal and backslash escapes (`~/.zsh"rc"`, `~/.zshr\c`), and
+  lexical `..` are all resolved; a spelling the shell rewrites first (brace
+  expansion, globs, zsh alternation, an embedded expansion) is judged with
+  the literal-token whitelist from ce11b48 and denied when its literal
+  prefix can still complete into a protected path (`~/.zshr{c..c}`,
+  `~/.ssh/id_*`, `~/{.zshrc,x}`), ignored when it cannot
+  (`~/notes-{a,b}.txt`). The rule runs ahead of `redirect-truncate-root-home`
+  and takes precedence over the absent-file carve-out. Untouched: reads
+  (`cat`, `grep`, `diff`, `source`, `ssh -F`), `chmod`/`chown`, `~/.ssh/*.pub`,
+  relative paths, every unlisted file (which keeps its ordinary truncation
+  verdict), and appending to `~/.ssh/known_hosts` — what `ssh` itself does;
+  truncating or replacing the trust store is denied. Each denial names the
+  writer and the file with the remedy (`dcg allow-once`, or allowlisting
+  `core.filesystem:credential-file-write` for a project that manages its own
+  dotfiles — an allowlist entry lifts only this rule). PowerShell and Cmd
+  spellings are not classified by this rule. `tee`, `sponge`, `install`,
+  `sed`, and `perl` join the pack's keyword list, but select the pack only
+  when the command can also spell a protected root (`~`, `$`, `/etc`,
+  `/home/`, `/Users/`, `/root`): `npm install`, `cargo install`, and a
+  `sed … | tee /tmp/out` pipeline never cold-initialise core.filesystem's
+  regex set on this rule's account (hook latency for them is unchanged at
+  ~14 ms; measured, not assumed). Coverage: the classifier's own matrix
+  (`src/packs/core/credential_files.rs`), the evaluator precedence test, and
+  `tests/credential_file_write_e2e.rs` against the real binary in an
+  isolated `HOME` (absent and existing targets, every writer, neighbours,
+  and the allowlist).
+
+### Changed
+
+- Dependency bumps: toml 1.1.5, smallvec 1.16.0, ast-grep-language 0.45.3,
+  self_update 1.3.0 (99068cc, dependabot `rust-minor-patch` group;
+  `Cargo.lock` only, no source changes).
+- `> /etc/passwd`, `mv x ~/.ssh/authorized_keys`, and every other write to a
+  listed file that an existing rule already denied is now attributed to
+  `core.filesystem:credential-file-write` (the more specific rule, with the
+  persistence explanation); the redirect and `mv` rules keep their verdicts
+  for unlisted paths. Allowlist entries and `exempt_target_globs` written
+  for the old rule ids do not apply to listed files.
+
+### Fixed
+
+- **A heredoc body on a `;`-joined operator line was re-scanned as live
+  shell (#393).** The report (`git commit -F - <<EOF` whose message mentions
+  `restore`, matched by `core.git:restore-worktree` across the operator
+  boundary) was filed against 0.4.0; the git stdin-sink model added for #136
+  / #277 already keeps that exact input, and the `cat > file <<EOF` /
+  `tee <<EOF` forms, inert on `main`. Auditing the class found the survivor:
+  tree-sitter-bash rejects a heredoc whose operator line continues with `;`
+  (`cat <<EOF; echo done`, `git commit -F - <<EOF; git push`), and on a
+  parse error the masking view dropped EVERY heredoc in the command, so the
+  data body reached the pack regexes while the identical command joined with
+  `&&` or `|` was allowed. `active_heredocs` now recovers the one unambiguous
+  body span from the tier-2 extractor (single operator, proven active, not
+  commented, simple delimiter, terminator found) for every operator flavor,
+  not just `<<~`; multi-operator or exotic-delimiter failures stay unmasked.
+  The same audit widened the structured stdin sinks: `git commit -aF -` and
+  other glued value-less short flags, `-F /dev/stdin` / `--file=/dev/stdin`,
+  `git merge -F -`, and `gh issue|pr|release … --body-file -` / `-F -` /
+  `--notes-file -` plus `gh api --input -` (`gh api -F` is a typed field and
+  is deliberately excluded). Executing receivers (`bash <<EOF; …`,
+  `cat <<'EOF' | bash`), expanding `$(…)` in unquoted bodies, and commands
+  after the terminator or on the operator line keep failing closed.
+  Regression coverage in `src/heredoc.rs` and
+  `tests/repro_393_heredoc_boundary_data_sink.rs`.
+- **`dcg doctor` reported a Codex `hooks.json` that Codex refuses to load as
+  "registered but untrusted" (#391).** Codex's `HooksFile` is
+  `deny_unknown_fields` (`description` and `hooks` only), so a stray
+  top-level `"version": 1` makes it reject the whole file (`failed to parse
+  hooks config … unknown field \`version\``) and load none of its hooks —
+  there is no trust prompt to approve, yet doctor pointed at one. The probe
+  now mirrors Codex's schema and distinguishes: file missing; not JSON;
+  valid JSON the schema rejects (unknown top-level key, non-list event,
+  unknown handler `type`, non-numeric `timeout`); loadable but no dcg
+  `PreToolUse` command hook selecting `Bash` (matcher semantics follow
+  Codex: absent/empty/`*` match all, `[A-Za-z0-9_|]` lists are exact, else
+  regex); dcg present but misplaced (wrong event or a matcher that excludes
+  `Bash`); registered but the command's program does not exist on disk /
+  PATH; and the existing untrusted / disabled / enabled states. Each state
+  carries its own remedy in both the pretty and `--format json` renderers.
+
+---
+
+## [v0.14.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.1) -- 2026-09-07 [Release]
+
+Crush support, the closed-pipe / fail-closed hook hardening, the absent-file
+redirect carve-out and its obfuscation follow-ups, and the post-0.14.0 pack
+fixes (git lfs, Azure, Azure DevOps, gh, heredocs, allowlist path scoping).
+
+### Added
+
+- **First-class Charm Crush hook support (#388).** Crush pipes
+  `{"event":"PreToolUse","tool_name":"bash","tool_input":{"command":…}}`
+  to the hook and reads `{"decision":"deny","reason":…}` on exit 0. That
+  payload used to fall through to the Copilot arm and get a flat
+  `permissionDecision` envelope Crush does not read, so a block was silently
+  "no opinion" — dcg failed open under Crush (confirmed against Crush's own
+  parser). New `HookProtocol::Crush` (PascalCase `event` + `tool_input`, no
+  `tool_args`), `CrushHookOutput`, and `Agent::Crush` (`CRUSH=1`). Warnings
+  travel as `context` with no decision, because in Crush `"allow"` is an
+  affirmative pre-approval that skips the user's permission prompt — dcg
+  never emits it. `dcg install --crush` / `dcg uninstall --crush` merge and
+  remove a `matcher: "^bash$"` entry in `crush.json` (`CRUSH_GLOBAL_CONFIG`,
+  `XDG_CONFIG_HOME`, `--project` honored), the installers configure it when
+  Crush is detected, `dcg doctor` reports a `crush_hook` check, and
+  `docs/crush-integration.md` documents the contract.
+- **`platform.azure_devops` pack (#385).** `az devops`, `az repos`,
+  `az pipelines`, `az boards`, and `az artifacts` act on an organization,
+  not Azure resources, and were unmatched (or partially overlapped by the
+  Azure resource safes after #384). GA commands only; `az devops invoke`
+  matches on `--http-method`; `az artifacts` has no destructive verb and no
+  rule pretends otherwise; list/show/search and ordinary create/run stay
+  unmatched. `--query`, display-name, WIQL, and PR-title text are registered
+  as non-executed strings.
+- **`git lfs` is a known subcommand with its own destructive rules
+  (PR #383).** `git lfs` dispatches to the git-lfs helper and never consults
+  `alias.lfs`, so the unverifiable-alias catch-all denied every read-only
+  `git lfs ls-files` / `status` / `fetch`. Those are allowed now, as is
+  `git lfs prune --dry-run` (whole token, not quoted text); `lfs migrate
+  import|export` (history rewrite), `lfs prune`, and `lfs uninstall` are
+  High-severity rules with preview/recover suggestions registered.
+- **`history.db` lives in the XDG state directory and its path is
+  configurable (#381).** History is state, not configuration, so it no
+  longer defaults into `~/.config/dcg` (read-only config mounts could not
+  write it). One resolver decides the path everywhere: `DCG_HISTORY_DB`,
+  then `[history] database_path`, then an existing pre-0.15 `history.db`
+  beside `config.toml` (honored, never moved), then
+  `$XDG_STATE_HOME/dcg/history.db` / `~/.local/state/dcg/history.db`
+  (`%LOCALAPPDATA%\dcg\history.db` on Windows). Directories are created
+  0700; `dcg doctor` gains a `history` check with a writability probe.
+
+### Fixed
+
+- **`> ~/new-file` outside a VCS worktree is creation, not truncation
+  (#390).** `core.filesystem:redirect-truncate-root-home` allowed a
+  truncating redirect to an absent literal file only when the parent sat
+  inside a home-directory git worktree (#337), so `echo x > ~/.config/new`
+  and `echo x > ~/.claude/notes.md` were denied while `>> ` to the very same
+  absent path was allowed. The worktree predicate was attached to the wrong
+  case: VCS recoverability matters for existing tracked files (still
+  denied), not for a file that does not exist. The carve-out now applies to
+  any absent literal target under the home directory whose parent exists;
+  existing files, symlinks (dangling included), missing parents, dynamic
+  targets, system paths, parents that resolve outside the home directory,
+  and `.git` internals stay blocked. The check-then-open window is unchanged
+  from #337; `dcg create-new` remains the race-free path.
+- **Brace- and quote-obfuscated redirect targets no longer qualify for the
+  absent-file carve-out (follow-up to #390).** The literal-target check
+  rejected globs, backslashes, and backticks but not brace expansion or
+  embedded quotes, so `echo x > ~/.zshr{c..c}` (a one-word sequence
+  expansion in bash and zsh), `echo x > ~/.zshrc{,}` (zsh MULTIOS writes
+  every word), and `echo x > ~/.zsh"rc"` (quote removal) were judged by a
+  path that does not exist while the shell truncated one that does. The
+  #337 worktree carve-out had the same gap inside repositories; #390 widened
+  it to the whole home directory. A redirect target is now literal only when
+  every ASCII character in it is one no supported shell rewrites (letters,
+  digits, `/ . _ - + , @ % : = ~`); non-ASCII names stay literal. `"~/x"` is
+  no longer treated as a home path (`~` does not expand inside double quotes).
+- **A closed output pipe no longer kills dcg with `SIGABRT` (#389).**
+  `dcg --version 2>&1 | head -1` — and, in hook mode, any stderr diagnostic
+  written after the host stopped reading — hit `EPIPE`, which the `println!`
+  family turns into a panic and `panic = "abort"` into a core dump. In hook
+  mode that also dropped the verdict: a config warning on a closed stderr
+  aborted the process before the deny JSON was written to a stdout the host
+  was still reading, which fail-open hosts treat as "proceed". `SIGPIPE`
+  deliberately stays ignored (resetting it to `SIG_DFL` would kill the hook on
+  that same stderr write); instead the hook path, `--version`, and `--help`
+  write through the new non-panicking `emit_stderr!`/`emit_stdout!` helpers
+  (`src/output/emit.rs`), and a panic backstop installed first thing in `main`
+  maps the standard library's broken-pipe print panic on the ordinary CLI
+  surface to a clean exit with the new documented `EXIT_BROKEN_PIPE` (141),
+  never a signal death. `--version` keeps the bare semver as the only stdout
+  line and the provenance banner on stderr, where `scripts/perf_baseline.py`
+  reads it.
+- **A blocking verdict that cannot be written to stdout now fails closed
+  through the exit status (follow-up to #389).** Every hook protocol reads
+  the decision from stdout JSON on exit 0 and treats exit 0 with *no* JSON as
+  "proceed", so when the stdout write itself failed (`EPIPE`: the host closed
+  the pipe before the verdict was written) a deny quietly became an allow.
+  The `output_*_for_protocol` writers now render the verdict into a buffer
+  and report whether the single `write_all` + `flush` to stdout succeeded; a
+  deny, ask, or indeterminate verdict that did not arrive exits with the new
+  documented `EXIT_HOOK_BLOCK` (2) and explains itself on stderr. Exit 2 is
+  the blocking status of the Claude Code contract and of every protocol that
+  copied it (Gemini CLI, Copilot CLI, Crush, Grok — Crush's `runner.go`
+  verified); Codex, Hermes, and Antigravity log a non-zero exit as a hook
+  failure and fail open, which is no worse than the silent exit 0. The
+  per-protocol table lives on `HookProtocol::undeliverable_block_exit_code`
+  and in `docs/agents.md`. An undeliverable allow or warning stays exit 0
+  (nothing was lost), a delivered verdict keeps exit 0 + JSON, and the
+  history row is flushed before the fail-closed exit. The CLI surface keeps
+  `EXIT_BROKEN_PIPE` (141).
+- **An `rm` operand glued to `(` no longer qualifies for
+  `exempt_target_globs` (sibling of the #390 follow-up).** The
+  `[rules."core.filesystem:rm-*"] exempt_target_globs` match (#284) trusts the
+  spelled operand, and the tokenizer ends an operand at `(` because it is
+  subshell syntax — so `rm -rf ~/scratch/lo(g|x)` was matched as
+  `~/scratch/lo`, which a scratch glob exempts, while zsh reads `lo(g|x)` as
+  glob alternation and removes `~/scratch/log` (bash rejects the text as a
+  syntax error). zsh forbids `/` inside alternation, so the reachable file is
+  always a sibling in the same directory; the gap could not escape the
+  exempted subtree, but it did let a narrow exemption cover a neighbouring
+  file. The operand is now ineligible whenever the byte after it is `(`;
+  subshell grouping (`(rm -rf ~/scratch/x)`, `rm -rf ~/scratch/x (echo
+  done)`) is unaffected. The redirect exemption and the #390 absent-file
+  carve-out were audited for the same class (brace expansion, embedded
+  quotes, alternation, escapes) and already reject every such spelling; the
+  new tests pin that.
+- **`redaction_mode = "pattern"` performs secret redaction again (#386).**
+  The pattern redactor added in v0.2.8 was deleted by a tracker-sync commit
+  shortly after v0.2.10 and never restored, so from v0.2.11 onward the
+  `"pattern"` mode — the documented default — only truncated *quoted*
+  arguments longer than `max_argument_len`, and bare credentials were stored
+  byte-for-byte in `history.db`. `src/redaction.rs` reinstates pattern
+  matching over provider API keys, forge and registry tokens, JWTs,
+  `Authorization:` headers, `scheme://user:password@host` URLs, private-key
+  headers, and `password=`/`secret=` assignments, and runs it before argument
+  truncation. `[general] log_file` (`log_blocked_command` and
+  `log_budget_skip`), which took no redaction config and wrote the raw
+  command, and the allow-once pending store now go through the same redactor.
+  Its `***` example in `docs/allow-once-usage.md` never matched the code and
+  now reflects the real placeholders.
+- **`HOME=/` no longer grants the absent-file creation carve-out** (follow-up
+  to #390). `path_is_new_file_under_home` treated every absolute parent as
+  under a root home, which would have allowed `> /etc/new-file`; a home with
+  no parent now scopes nothing.
+- **Allowlist `--path` grants are scoped to the directory the command really
+  runs in, and fail closed without one (#387).** A `paths = [...]` entry was
+  matched against the hook process's own `getcwd()`, which has nothing to do
+  with the guarded tool call: the host reports that directory in the
+  payload's `cwd`, and a leading `cd`/`pushd` can move it again. The hook
+  now resolves the effective cwd from the payload plus any static leading
+  `cd`, compares canonical paths (a symlink out of the scope cannot borrow
+  the grant), lets a `cd` out of the scoped tree revoke the grant but never
+  extend it, and treats anything it cannot resolve statically (dynamic
+  targets, `popd`, subshells, pipes, a nested-payload `cd`, an unknown
+  working directory) as "no directory to test against" — every scoped entry
+  is then inapplicable. Entries without `paths` are unaffected.
+- **Backquoted substitutions inside expanding heredocs are evaluated (#377),
+  and a Codex `Bash` payload on Windows is judged by its command text
+  (#379).** tree-sitter-bash leaves a backquoted substitution in an
+  unquoted-delimiter heredoc body as plain content, so `` `rm -rf ~/x` ``
+  never reached the evaluator while `$(…)` was denied; expanding bodies are
+  now scanned with here-document escape rules, `$(…)` spans are evaluated
+  once, and an unterminated backquote fails closed. Delimiter quoting is
+  judged from the delimiter word only (a trailing `| tee "out"` no longer
+  makes the body look quoted), and backquote bodies carry their post-escape
+  text. Codex labels its shell tool `Bash` on every platform but may run it
+  through PowerShell, Git Bash, WSL, or `cmd.exe`; a command whose POSIX
+  substitution parse fails is evaluated as PowerShell, anything that parses
+  as POSIX as the fail-closed union of dialects, so `"`n"` escapes are
+  allowed and POSIX-only destructive forms are denied whichever shell runs.
+- **`gh release delete` no longer matches `delete-asset`, `--help`, or
+  quoted search text (#380).** Every verb in the GitHub pack ends in
+  `(?![\w-])` instead of `\b`, `gh release delete-asset` is its own Medium
+  rule, `--help`/`-h`/`gh help <cmd>` is a pack safe pattern (quoted tokens
+  consumed whole, walk stops at redirection), and `gh search <kind> …` is
+  query data.
+- **Quoted heredoc bodies handed to a non-shell interpreter are not shell
+  launchers (#382).** `python3 - <<'EOF'` (node/ruby/perl/php too) with a
+  Markdown fence in the body tripped `heredoc.shell:launcher-unverified`; a
+  segment lying entirely inside a quoted body to a proven non-shell
+  interpreter is withdrawn. Unquoted delimiters and shell receivers keep the
+  fail-closed treatment.
+- **Azure group-wide safes no longer hide deletions (#384).** The blanket
+  `az account` safe suppressed management-group, hierarchy-settings,
+  subscription, alias, and lock deletions, and `show`/`list` safes matched
+  flag values (`az group delete --name prod --yes --query show`). The
+  group-wide safes are gone (unmatched read-only commands are allowed by
+  default), show/list require a real service token, and help is a real
+  `--help`/`-h` flag walk.
+
+### Changed
+
+- `self_update` 1.0.0-rc.6 → 1.2.0 (PR #376): only additive API changes for
+  the backends dcg uses.
+- Toolchain pinned to `nightly-2026-08-31` (fleet-wide unification).
+
+---
+
 ## [v0.14.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.0) -- 2026-09-01 [Release]
 
 ### Added

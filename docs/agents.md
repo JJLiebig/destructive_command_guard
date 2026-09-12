@@ -20,6 +20,7 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
 | Oh My Pi (`omp`) | Explicit bridge / process | Generated extension passes `--agent omp`; exact `omp` and `oh-my-pi` process names are fallback matches |
+| Crush | Environment | `CRUSH=1` (set by Crush for hook subprocesses and `bash`-tool commands; the generic `AGENT`/`AI_AGENT` markers are not consulted). Hook payloads are recognized by their `event: "PreToolUse"` + `tool_input` envelope — see [crush-integration.md](crush-integration.md) |
 | Pi | Environment | `PI_CODING_AGENT=true` |
 | Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses; checked last among environment markers so agents with their own markers win — environment detection still precedes parent-process detection) |
 
@@ -382,6 +383,7 @@ In robot mode, dcg uses consistent exit codes across all commands:
 | 3 | `EXIT_CONFIG_ERROR` | Configuration error |
 | 4 | `EXIT_PARSE_ERROR` | Parse/input error |
 | 5 | `EXIT_IO_ERROR` | IO error |
+| 141 | `EXIT_BROKEN_PIPE` | stdout/stderr reader went away (`EPIPE`); a clean exit, never a signal death |
 
 ### Robot Mode JSON Output
 
@@ -411,6 +413,30 @@ All robot-mode responses are pure JSON on stdout:
 - Codex CLI uses strict hook parsing, so dcg emits a minimal
   `hookSpecificOutput` denial on stdout and exits 0.
 - Rich output always goes to stderr for human visibility.
+
+Hook mode carries the verdict in stdout JSON and exits 0 whether the command
+was allowed, warned about, sent for review, or denied. The exit status changes
+only when a blocking verdict could not be delivered:
+
+| Code | Constant | Meaning |
+|------|----------|---------|
+| 0 | `EXIT_SUCCESS` | Verdict delivered on stdout (an allow is empty stdout). Also an allow or a warning whose stdout reader went away: nothing was lost. |
+| 2 | `EXIT_HOOK_BLOCK` | A deny, ask, or indeterminate verdict could not be written to stdout (`EPIPE`: the host closed the pipe early). Exit 0 with nothing on stdout would read as "proceed", so the block travels in the exit status instead, with the reason on stderr. |
+
+How hosts read exit 2 with nothing on stdout:
+
+| Protocol | Effect |
+|----------|--------|
+| Claude Code and Claude-compatible hosts (Posit Assistant, Augment) | Blocks; stderr is fed back to the model as the reason |
+| Gemini CLI | Blocks (exit 2 is its blocking error) |
+| Copilot CLI | Blocks (`preToolUse` hooks that exit 2 deny the call) |
+| Crush | Blocks; stderr is the reason |
+| Grok | Blocks (exit 2 is a documented explicit deny) |
+| Codex CLI, Hermes, Antigravity (`agy`) | Logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON, but visible |
+
+Hook mode never exits 2 for any other reason, and never exits 141: every
+hook-mode write tolerates a closed pipe. `EXIT_BROKEN_PIPE` belongs to the
+CLI surface below.
 
 **Robot mode** with subcommands uses standardized exit codes:
 - Exit 1 for denials (allows scripting with `$?`)

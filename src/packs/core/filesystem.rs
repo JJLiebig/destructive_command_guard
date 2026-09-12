@@ -636,6 +636,15 @@ struct PathToken<'a> {
     unquoted: &'a str,
     quote: QuoteKind,
     range: Range<usize>,
+    /// The byte right after the operand is an unquoted `(`.
+    ///
+    /// The tokenizer ends an operand at `(` because it is subshell syntax,
+    /// but zsh reads a `(` glued to a word as glob alternation or a glob
+    /// qualifier: `rm -rf ~/scratch/lo(g|x)` removes `~/scratch/log`, not
+    /// the spelled `~/scratch/lo`. The operand text is therefore not the
+    /// path the shell would hand to `unlink`, and nothing that trusts the
+    /// spelling (the `exempt_target_globs` match) may act on it.
+    glued_to_paren: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1341,7 +1350,12 @@ fn posix_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
     decoder
         .decode(raw, ShellTokenRole::Syntax)
-        .is_some_and(|decoded| rm_frontend_basename(decoded.as_ref()) == "rm")
+        .is_some_and(|decoded| {
+            let executable = rm_frontend_basename(decoded.as_ref());
+            // An obfuscated writer spelling (`t''ee`, `\tee`) carries no
+            // keyword; `credential-file-write` still has to see it.
+            executable == "rm" || super::credential_files::is_credential_writer(executable)
+        })
 }
 
 /// Candidate-selection signal for every dialect-sensitive semantic owned by
@@ -1394,11 +1408,24 @@ pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
     const COMMAND_WORDS: &[&str] = &[
         "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
     ];
+    // `credential-file-write` writers (plus the GNU-prefixed spellings macOS
+    // users install from Homebrew coreutils). These are common words —
+    // `npm install`, `cargo install`, `sed … | tee /tmp/out` — so they only
+    // select the pack when the command can also spell a protected path;
+    // cold-initialising the pack's regex set costs ~10 ms per hook process.
+    const WRITER_WORDS: &[&str] = &[
+        "tee", "sponge", "install", "sed", "perl", "gtee", "gsed", "gcp", "gmv", "ginstall", "gln",
+        "gdd",
+    ];
 
     command.contains('>')
         || COMMAND_WORDS
             .iter()
             .any(|word| contains_ascii_command_word(command, word))
+        || (super::credential_files::may_name_protected_path(command)
+            && WRITER_WORDS
+                .iter()
+                .any(|word| contains_ascii_command_word(command, word)))
 }
 
 fn contains_ascii_command_word(command: &str, word: &str) -> bool {
@@ -2652,10 +2679,12 @@ fn parse_rm_segment_with_option_scanning(
         }
 
         let (quote, unquoted) = strip_outer_quotes(text);
+        let glued_to_paren = command.as_bytes().get(token.byte_range.end) == Some(&b'(');
         paths.push(PathToken {
             unquoted,
             quote,
             range: token.byte_range.clone(),
+            glued_to_paren,
         });
         if option_scanning == RmOptionScanning::AppleStopAtFirstOperand {
             options_ended = true;
@@ -3036,7 +3065,10 @@ fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
 /// All-or-nothing on purpose: `rm -rf ~/scratch/a /etc` must stay denied, so a
 /// single unexempted target keeps the rule firing. Single-quoted targets are
 /// never eligible — the shell does not expand `~` inside them, so the literal
-/// spelling names a different path than the glob's author meant.
+/// spelling names a different path than the glob's author meant. Neither is
+/// an operand glued to a `(`: the tokenizer stops the operand there, but zsh
+/// reads `lo(g|x)` as alternation and removes `log`, so the spelled prefix is
+/// not the path removed (bash rejects the same text as a syntax error).
 fn rm_targets_exempted_for_rule(pattern_name: &str, paths: &[PathToken<'_>]) -> bool {
     if paths.is_empty() {
         return false;
@@ -3050,7 +3082,7 @@ fn rm_targets_exempted_for_rule(pattern_name: &str, paths: &[PathToken<'_>]) -> 
     for path in paths {
         // A double-quoted path keeps its literal text; the shared normalizer
         // rejects any remaining expansion syntax either way.
-        if path.quote == QuoteKind::Single {
+        if path.quote == QuoteKind::Single || path.glued_to_paren {
             return false;
         }
         let Some(glob) = crate::config::rule_target_exemption(&rule_id, path.unquoted) else {
@@ -3292,10 +3324,14 @@ pub fn create_pack() -> Pack {
         // temp-family paths followed by forced recursive deletion.
         // Mirror entries MUST also exist in src/packs/mod.rs::PACK_ENTRIES
         // (the duplicate-source-of-truth that gates execution).
+        // `tee`, `sponge`, `install`, `sed`, and `perl` are the non-redirect
+        // writers `credential-file-write` classifies (`cp`, `mv`, `ln`, and
+        // `dd` are already here).
         keywords: &[
             "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
-            ">/", "> /", ">~", "> ~", ">$", "> $", ">\"", "> \"", ">'", "> '", "&>", ">&", ">|",
-            "1>", "2>", ">%", "> %", ">!", "> !", ">^", "> ^",
+            "tee", "sponge", "install", "sed", "perl", ">/", "> /", ">~", "> ~", ">$", "> $",
+            ">\"", "> \"", ">'", "> '", "&>", ">&", ">|", "1>", "2>", ">%", "> %", ">!", "> !",
+            ">^", "> ^",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -4336,6 +4372,45 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use `dcg allow-once` only after verifying the resolved source and destination.",
             MV_DYNAMIC_SUGGESTIONS
         ),
+        // ----- credential / login-file writes (Critical, semantic) -----
+        //
+        // Evaluated by `core::credential_files` inside the evaluator's
+        // per-segment pass, ahead of every redirect and command rule below,
+        // so it outranks `redirect-truncate-root-home` and the #390
+        // absent-file carve-out (which only stands that one rule down). The
+        // regex is intentionally unsatisfiable, exactly like
+        // `sed-exec-unverified`: the entry exists so the rule has a stable id
+        // for allowlists, `dcg rules`, the generated docs, and the authored
+        // guidance below.
+        destructive_pattern!(
+            "credential-file-write",
+            r"(?!)",
+            "writing a credential, private-key, login-shell startup, or system authentication file (`~/.ssh/*`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the shell rc files and `~/.bashrc.d`/`~/.zshrc.d`, `/etc/sudoers*`, `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/ssh/*`) with `>`, `>>`, `tee`, `cp`/`mv`/`install`/`ln`, `dd of=`, or `sed -i` installs persistent access or replaces the trust this machine runs on, whether or not the file exists yet. Reads and `chmod`/`chown` are unaffected; appending to `~/.ssh/known_hosts` stays allowed.",
+            Critical,
+            "These files decide who can log in, which keys and tokens act as this user, and what \
+             code every new shell runs. Writing one of them — even creating it where it did not \
+             exist — is not data loss in the `rm -rf` sense; it is persistence: an authorized_keys \
+             line grants login, a `.zshrc` line runs on every shell start, an `.npmrc`/`.netrc` \
+             entry publishes and pulls as this user, a sudoers drop-in changes who becomes root. \
+             The write is judged by the path the shell will open, so quoted, escaped, `$HOME`, \
+             `~user`, `/home/<user>`, and `$ZDOTDIR`-style spellings are all recognised, and a \
+             brace, glob, or alternation that could still expand into one of these paths is \
+             treated as if it did.\n\n\
+             What stays allowed:\n\
+             - Reading them (`cat`, `grep`, `diff`, `ssh -F`, `source`).\n\
+             - `chmod 600` / `chown` on them.\n\
+             - `>>` (or `tee -a`) to `~/.ssh/known_hosts`, which is what `ssh` itself does; \
+               truncating or replacing that trust store is still denied.\n\
+             - Writing `~/.ssh/*.pub` and every file that is not on the list.\n\n\
+             Safer alternatives:\n\
+             - Show the user the exact line or file you want to add and let them apply it.\n\
+             - Write the proposed content to a scratch file under `/tmp/<subdir>/` and point \
+               the user at it.\n\
+             - For a one-off the user has approved, use `dcg allow-once`.\n\
+             - For a project that must manage one of these files, allowlist \
+               `core.filesystem:credential-file-write` in that project's dcg config with a reason.",
+            super::credential_files::CREDENTIAL_FILE_WRITE_SUGGESTIONS
+        ),
         // ----- `> <sensitive>` (Critical: shell redirect truncate) -----
         //
         // Bash output redirection truncates the target file to zero
@@ -4393,6 +4468,25 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      keeps `/dev/tty0`..`/dev/ttyN` (consoles / other terminals)
         //      blocked as before.
         //
+        //      `/dev/tcp/<host>/<port>` and `/dev/udp/<host>/<port>` join the
+        //      carve-out for a different reason (#404): they are not files at
+        //      all. Bash intercepts those two prefixes in its *own* redirect
+        //      parser and opens a socket — no `open(2)`, no `O_TRUNC`, and no
+        //      such path exists on disk to truncate. `echo > /dev/tcp/h/p` is
+        //      the standard "is this port open" idiom on a host without `nc`,
+        //      and denying it as file destruction sent operators to rewrite it
+        //      in Python.
+        //
+        //      The exemption is scoped to the exact shape bash recognises —
+        //      one host segment, one port/service segment, nothing after it —
+        //      and refuses a `.`/`..` segment. That matters because only
+        //      *bash* intercepts these paths: under `sh`/`dash` the same word
+        //      is an ordinary filename, so `> /dev/tcp/../../etc/passwd`
+        //      would really open `/etc/passwd` with `O_TRUNC`. It stays
+        //      denied, as does `/dev/tcpdump` and every other real node under
+        //      `/dev` — `/dev/sda` is exactly what this rule exists to
+        //      protect.
+        //
         //   2. `(?:['"\\]|\$['"])?` — extends the historical optional
         //      single-char quote prefix to also accept the two-byte
         //      Bash quoting introducers `$'` (ANSI-C) and `$"`
@@ -4400,8 +4494,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full|tty)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
-            "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target inside an existing home-directory VCS worktree is allowed; dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked.",
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:(?:null|zero|full|tty)\b|(?:tcp|udp)/(?!\.\.?(?:/|$))[^/\s]+/[A-Za-z0-9_-]+(?=[\s;|&)'"]|$)))(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target under the home directory with an existing parent is allowed (creation, not truncation — the same thing `>>` would do); existing files, dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
              the target file with O_WRONLY|O_CREAT|O_TRUNC — the contents are destroyed \
@@ -4411,9 +4505,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              There is NO recovery without backups.\n\n\
              Safer alternatives:\n\
              - Use append (`>>`) to preserve existing content: `echo line >> <file>`.\n\
-             - A literal, currently absent destination inside an existing home-directory VCS \
-               worktree is allowed. Existing files, symlinks, dynamic paths, missing parents, \
-               system paths, and `.git` internals remain blocked.\n\
+             - A literal, currently absent destination under your home directory whose parent \
+               directory exists is allowed (nothing to truncate). Existing files, symlinks, \
+               dynamic paths, missing parents, system paths, and `.git` internals remain blocked.\n\
              - For race-free exclusive creation, resolve a literal path and use:\n  \
                `producer | dcg create-new <path>` (existing files, directories, and symlinks are refused).\n\
              - Make a backup, then write via a temp file:\n  \
@@ -7353,6 +7447,13 @@ mod tests {
             "echo data > /etc/passwd",
             "ECHO data 2> C:\\logs\\error.txt",
             "CP --help",
+            // `credential-file-write` writers with a protected-root spelling.
+            "echo x | tee -a ~/.zshrc",
+            "sudo tee /etc/sudoers.d/agent",
+            "install -m 600 key $HOME/.ssh/id_ed25519",
+            "sed -i 's/a/b/' /home/bob/.bashrc",
+            "perl -pi -e 's/a/b/' /Users/bob/.zshrc",
+            "gtee /root/.ssh/authorized_keys",
         ] {
             assert!(
                 filesystem_keyword_candidate(command),
@@ -7366,6 +7467,14 @@ mod tests {
             "winscp.exe /help",
             "echo xcp",
             "printf 'carpet'",
+            // Writer words without any protected-root spelling must not
+            // cold-initialise the pack (`npm install` is every session).
+            "npm install",
+            "cargo install ripgrep",
+            "pip install -r requirements.txt",
+            "sed -n 1,10p README.md | tee /tmp/out.txt",
+            "perl -e 'print 1'",
+            "install -d build/out",
         ] {
             assert!(
                 !filesystem_keyword_candidate(command),

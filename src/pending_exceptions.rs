@@ -17,7 +17,7 @@ use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::resolve_config_path_value;
-use crate::logging::{RedactionConfig, redact_command};
+use crate::logging::{RedactionConfig, RedactionMode, redact_command};
 
 /// Environment override for pending exceptions file path.
 pub const ENV_PENDING_EXCEPTIONS_PATH: &str = "DCG_PENDING_EXCEPTIONS_PATH";
@@ -402,7 +402,7 @@ impl PendingExceptionStore {
         // future allow-once code issuance fails silently.
         let over_watermark = file.metadata()?.len() > PENDING_MAINTENANCE_WATERMARK_BYTES;
         if over_watermark && !allow_maintenance {
-            eprintln!(
+            crate::emit_stderr!(
                 "[dcg] Warning: pending-exceptions store is above the {PENDING_MAINTENANCE_WATERMARK_BYTES}-byte \
                  maintenance watermark; running a prune/rotate pass despite the low deadline budget."
             );
@@ -1596,6 +1596,17 @@ fn redact_for_pending(command: &str, redaction: &RedactionConfig) -> String {
     let mut effective = redaction.clone();
     if !effective.enabled {
         effective.enabled = true;
+    }
+    // The pending store is persisted and later displayed by `allow-once`, so
+    // recognised secret shapes are replaced regardless of the configured mode
+    // (issue #386). `Full` already discards everything, so only the modes that
+    // keep command text need it.
+    if matches!(
+        effective.mode,
+        RedactionMode::None | RedactionMode::Arguments
+    ) {
+        let secrets_redacted = crate::redaction::redact_secrets(command);
+        return redact_command(&secrets_redacted, &effective);
     }
     redact_command(command, &effective)
 }

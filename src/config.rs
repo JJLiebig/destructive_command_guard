@@ -71,7 +71,7 @@ pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Opt
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: refusing to load config file '{}': {}",
                 path.display(),
                 e
@@ -88,7 +88,7 @@ pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Opt
         .take(MAX_CONFIG_BYTES + 1)
         .read_to_string(&mut buf)
     {
-        eprintln!(
+        crate::emit_stderr!(
             "Warning: Failed to read config file '{}': {}",
             path.display(),
             e
@@ -96,7 +96,7 @@ pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Opt
         return None;
     }
     if buf.len() as u64 > MAX_CONFIG_BYTES {
-        eprintln!(
+        crate::emit_stderr!(
             "Warning: refusing to load config '{}' — exceeds {}-byte cap",
             path.display(),
             MAX_CONFIG_BYTES
@@ -319,13 +319,13 @@ fn warn_and_ignore_non_unix_restricted_config(path: &Path, source: ConfigSource)
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Ok(_) => {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: ignoring {source_name} config '{}' — native ACL and reparse-point validation is unavailable",
                 path.display()
             );
         }
         Err(error) => {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: ignoring {source_name} config '{}' — unable to inspect path safely: {}",
                 path.display(),
                 error
@@ -2175,7 +2175,7 @@ impl PacksConfig {
                 .map(|(pattern, n)| format!("{pattern} ({n} skipped)"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            eprintln!(
+            crate::emit_stderr!(
                 "[dcg] Warning: packs.custom_paths hit the cumulative {MAX_CUSTOM_PACK_FILES}-file cap \
                  (issue #293); {total} matching file(s) were NOT loaded from: {detail}"
             );
@@ -2779,7 +2779,7 @@ pub fn rule_target_exempted(rule_id: &str, raw_target: &str) -> bool {
 /// [`take_rule_target_suppressions`]) and echoed to stderr in verbose mode.
 pub fn note_rule_target_suppression(rule_id: &str, glob: &str, target: &str) {
     if active_rule_target_exemptions().is_some_and(|active| active.verbose) {
-        eprintln!(
+        crate::emit_stderr!(
             "dcg: rule {rule_id} matched but target {target:?} is exempted by \
              [rules.\"{rule_id}\"] exempt_target_globs entry {glob:?}"
         );
@@ -3978,7 +3978,7 @@ impl Config {
         // Apply environment variable overrides (highest priority)
         config.apply_env_overrides();
         if config.history.normalize_runtime_invariants() {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: invalid history limits were clamped to safe runtime values \
                  (retention_days=1..={}, max_size_mb>=1, prune_check_interval_hours>=1, \
                  batch_size>=1, batch_flush_interval_ms>=1)",
@@ -4070,7 +4070,7 @@ impl Config {
             ),
             Err(e) if source == ConfigSource::AutoProject => {
                 let detail = safe_auto_project_toml_error(&content, &e);
-                eprintln!("Warning: {}; ignoring it", detail);
+                crate::emit_stderr!("Warning: {}; ignoring it", detail);
                 (
                     None,
                     capture_outcome.then(|| {
@@ -4085,7 +4085,7 @@ impl Config {
                 )
             }
             Err(e) => {
-                eprintln!(
+                crate::emit_stderr!(
                     "Warning: Failed to parse config file '{}': {}",
                     path.display(),
                     e
@@ -4112,7 +4112,7 @@ impl Config {
         let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
         let mut config: Self = toml::from_str(&content).ok()?;
         if config.history.normalize_runtime_invariants() {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: invalid history limits in '{}' were clamped to safe runtime values",
                 path.display()
             );
@@ -5495,8 +5495,13 @@ redaction_mode = "pattern"
 retention_days = 90
 max_size_mb = 500
 
-# Optional database path override.
-# database_path = "~/.config/dcg/history.db"
+# Optional database path override (`~` is expanded; relative paths resolve
+# against the working directory). The DCG_HISTORY_DB environment variable
+# takes precedence over this setting. Default: $XDG_STATE_HOME/dcg/history.db
+# (~/.local/state/dcg/history.db) on Unix, %LOCALAPPDATA%\dcg\history.db on
+# Windows; an existing ~/.config/dcg/history.db from an older release keeps
+# being used until you move it. `dcg doctor` shows the resolved path.
+# database_path = "~/.local/state/dcg/history.db"
 
 #─────────────────────────────────────────────────────────────
 # GRADUATED RESPONSE SYSTEM
@@ -9901,6 +9906,45 @@ exempt_target_globs = ["/srv/jobs/*/tmp/**"]
                 "dynamic target {dynamic} must never be exempted"
             );
         }
+    }
+
+    #[test]
+    fn rule_target_rejects_brace_quote_and_alternation_obfuscation() {
+        // The spellings from the #390 follow-up: brace expansion (`{a..a}`
+        // is a one-word sequence; zsh MULTIOS writes `{,}`/`{a,b}` to every
+        // word), quote removal, zsh glob alternation, and escapes all make
+        // the runtime path differ from the spelled one, so no glob may match
+        // the spelling.
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**", "/**"]
+"#,
+        );
+        for obfuscated in [
+            "/srv/jobs/abc/tmp/scr{a..a}tch",
+            "/srv/jobs/abc/tmp/scratch{,}",
+            "/srv/jobs/abc/{tmp,etc}/scratch",
+            "/srv/jobs/abc/tmp/scr\"atch\"",
+            "/srv/jobs/abc/tmp/'scratch'",
+            "/srv/jobs/abc/tmp/scr(a|b)tch",
+            #[cfg(not(windows))]
+            "/srv/jobs/abc/tmp/scr\\atch",
+        ] {
+            assert_eq!(
+                exemptions.matching_glob("core.filesystem:rm-rf-general", obfuscated),
+                None,
+                "obfuscated target {obfuscated} must never be exempted"
+            );
+        }
+        // Ordinary punctuation and non-ASCII names remain literal.
+        assert_eq!(
+            exemptions.matching_glob(
+                "core.filesystem:rm-rf-general",
+                "/srv/jobs/abc/tmp/héllo-wörld+v1,2@x.log"
+            ),
+            Some("/srv/jobs/*/tmp/**")
+        );
     }
 
     #[test]

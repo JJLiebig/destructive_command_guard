@@ -5,6 +5,7 @@
 //! Agent). It parses incoming hook requests and formats denial responses.
 
 use crate::evaluator::MatchSpan;
+use crate::exit_codes::EXIT_HOOK_BLOCK;
 use crate::highlight::HighlightSpan;
 use crate::normalize::ShellDialect;
 use crate::output::auto_theme;
@@ -381,6 +382,66 @@ pub struct GrokHookOutput<'a> {
     pub remediation: Option<Remediation>,
 }
 
+/// Crush (Charm) `PreToolUse` output envelope, version 1.
+///
+/// Crush parses stdout only on exit code 0. `decision` is `"allow"`, `"deny"`
+/// or absent; absent means "no opinion" and the call proceeds through Crush's
+/// ordinary permission prompt. dcg never emits `"allow"` — in Crush that is
+/// an *affirmative* pre-approval that skips the user's permission prompt, and
+/// a guard has no business vouching for a command. `reason` is shown to the
+/// model when denying; `context` is appended to what the model sees on any
+/// decision, which is how non-blocking warnings travel. Crush's parser ignores
+/// unknown fields, so dcg's ergonomics fields (`allowOnceCode`, `ruleId`, …)
+/// ride along for tooling that wants them.
+///
+/// See `docs/hooks/README.md` in <https://github.com/charmbracelet/crush>.
+#[derive(Debug, Serialize)]
+pub struct CrushHookOutput<'a> {
+    /// Output envelope version. Crush defaults to 1 when omitted; pinning it
+    /// keeps the payload self-describing if the envelope evolves.
+    pub version: u8,
+
+    /// `"deny"` to block the tool call. Omitted (no opinion) for warnings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<&'static str>,
+
+    /// Why the call was denied. Surfaced to the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Cow<'a, str>>,
+
+    /// Extra context appended to what the model sees (used for warnings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<Cow<'a, str>>,
+
+    /// Short allow-once code (if a pending exception was recorded).
+    #[serde(rename = "allowOnceCode", skip_serializing_if = "Option::is_none")]
+    pub allow_once_code: Option<String>,
+
+    /// Full hash for allow-once disambiguation (if available).
+    #[serde(rename = "allowOnceFullHash", skip_serializing_if = "Option::is_none")]
+    pub allow_once_full_hash: Option<String>,
+
+    /// Stable rule identifier (e.g., "core.git:reset-hard").
+    #[serde(rename = "ruleId", skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+
+    /// Pack identifier that matched (e.g., "core.git").
+    #[serde(rename = "packId", skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+
+    /// Severity level of the matched pattern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<crate::packs::Severity>,
+
+    /// Confidence score for this match (0.0-1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+
+    /// Remediation suggestions for the blocked command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<Remediation>,
+}
+
 /// Hook protocol variant for response formatting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookProtocol {
@@ -447,6 +508,92 @@ pub enum HookProtocol {
     /// hook config from `~/.gemini/config/hooks.json` (with
     /// `~/.gemini/antigravity-cli/hooks.json` symlinked to it).
     Antigravity,
+    /// Charm Crush protocol (#388). Wire shape: stdin carries the flat
+    /// snake_case envelope `{"event": "PreToolUse", "session_id": "...",
+    /// "cwd": "...", "tool_name": "bash", "tool_input": {"command": "..."}}`
+    /// — verified against `internal/hooks/input.go` (`BuildPayload`) in
+    /// <https://github.com/charmbracelet/crush>. The shell tool is named
+    /// `bash` on every platform (Crush runs an embedded POSIX shell). Crush
+    /// parses stdout as JSON on exit code 0: `{"decision": "deny", "reason":
+    /// "..."}` blocks the call, an omitted `decision` is "no opinion" (the
+    /// call goes through Crush's normal permission prompt), and `"allow"`
+    /// pre-approves the call and *skips* that prompt — so dcg never emits it.
+    /// Exit code 2 also blocks (stderr as reason) but dcg keeps its exit-0 +
+    /// JSON contract so the ergonomics fields survive; any other non-zero
+    /// exit is logged and fails open. Crush's parser ignores unknown fields.
+    ///
+    /// The `event` field is what Copilot CLI also sends (`"pre-tool-use"`,
+    /// hyphenated, alongside `tool_args`); Crush's PascalCase `"PreToolUse"`
+    /// together with `tool_input` and no `tool_args` is the discriminator.
+    /// Without it the payload fell through to the Copilot arm, whose flat
+    /// `permissionDecision` envelope Crush does not read, so a block was
+    /// silently downgraded to "no opinion" — dcg failed open under Crush.
+    Crush,
+}
+
+impl HookProtocol {
+    /// Exit status for a blocking verdict (deny, ask, or indeterminate) that
+    /// could not be written to stdout.
+    ///
+    /// Stdout JSON is every protocol's primary channel and dcg exits 0 next
+    /// to it. When that write fails — `EPIPE`, the host closed the pipe
+    /// before the verdict was written — the exit status is the only signal
+    /// left, and exit 0 with no JSON reads as "proceed" on every host. Exit 2
+    /// is the fail-closed answer wherever one exists and no worse than 0
+    /// elsewhere:
+    ///
+    /// | Protocol | Exit 2 with nothing on stdout |
+    /// |----------|-------------------------------|
+    /// | `ClaudeCompatible` (Claude Code, Posit Assistant, Augment) | blocks; stderr is fed back to the model as the reason |
+    /// | `Gemini` | blocks (`packages/core/src/hooks/hookRunner.ts`: exit 2 is the blocking error) |
+    /// | `Copilot` | blocks (`preToolUse` hooks that exit 2 deny the call) |
+    /// | `Crush` | blocks; stderr is the reason (`internal/hooks/runner.go`) |
+    /// | `Grok` | blocks (exit 2 is a documented explicit deny) |
+    /// | `Codex` | logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON |
+    /// | `Hermes` | warning logged, never aborts — same as exit 0 with no JSON |
+    /// | `Antigravity` | logged, does not reliably abort — same as exit 0 with no JSON |
+    ///
+    /// Every arm maps to [`EXIT_HOOK_BLOCK`] today; the match is spelled out
+    /// so a new protocol has to state its contract here rather than inherit
+    /// one. Only the stdout write is judged: a stdout that is `/dev/null` or
+    /// a closed descriptor (`EBADF`, which the standard library reports as
+    /// success) is indistinguishable from a listening host. The OpenCode
+    /// plugin dcg installs also speaks `ClaudeCompatible` but reads stdout
+    /// to completion through a pipe it owns and ignores the exit status; the
+    /// write cannot fail there.
+    #[must_use]
+    // The arms are identical on purpose: the split documents which hosts
+    // honour the status and which merely log it.
+    #[allow(clippy::match_same_arms)]
+    pub const fn undeliverable_block_exit_code(self) -> i32 {
+        match self {
+            // Exit 2 is the blocking status of the protocol itself.
+            Self::ClaudeCompatible | Self::Gemini | Self::Copilot | Self::Crush | Self::Grok => {
+                EXIT_HOOK_BLOCK
+            }
+            // Non-zero is logged and fails open: no worse than exit 0, and
+            // visibly a hook failure rather than a silent allow.
+            Self::Codex | Self::CodexAsk | Self::Hermes | Self::Antigravity => EXIT_HOOK_BLOCK,
+        }
+    }
+}
+
+/// Write a rendered verdict to process stdout and report whether it arrived.
+///
+/// The `output_*_for_protocol` wrappers render their JSON into a buffer
+/// first so that one place owns the delivery check. `write_all` is followed
+/// by an explicit `flush`: stdout is line-buffered, the payload ends in a
+/// newline, and a `BufWriter` that hit `EPIPE` keeps the unwritten bytes and
+/// reports the failure again on the next flush, so the combination surfaces
+/// a failed write wherever it happened. `Err` means the host stopped reading
+/// before the verdict was written; the caller turns that into
+/// [`HookProtocol::undeliverable_block_exit_code`] for blocking verdicts and
+/// ignores it for warnings, whose command was going to proceed anyway.
+fn deliver_verdict(payload: &[u8]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    handle.write_all(payload)?;
+    handle.flush()
 }
 
 /// A shell command extracted from a hook request together with its execution
@@ -960,6 +1107,26 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         return HookProtocol::Grok;
     }
 
+    // --- Crush (Charm) indicators (checked before Copilot) ---
+    // Crush's stdin envelope is `{"event": "PreToolUse", "session_id", "cwd",
+    // "tool_name": "bash", "tool_input": {"command": ...}}`. The only other
+    // agent that sends a top-level `event` is Copilot CLI, whose value is the
+    // hyphenated "pre-tool-use" and which carries `tool_args` rather than
+    // `tool_input`. Crush's PascalCase event name is compared byte-for-byte
+    // (case-insensitively) WITHOUT stripping separators — normalizing
+    // "pre-tool-use" would collapse the two. Crush's parser reads
+    // `decision`/`reason`, not Copilot's flat `permissionDecision`, so
+    // misrouting this payload to the Copilot arm turned every block into
+    // "no opinion" (#388). As with Grok, no `CRUSH=1` env fallback is used
+    // here: real Crush hook payloads always carry the wire markers.
+    let is_crush_event = input
+        .event
+        .as_deref()
+        .is_some_and(|event| event.eq_ignore_ascii_case("PreToolUse"));
+    if is_crush_event && input.tool_input.is_some() && input.tool_args.is_none() {
+        return HookProtocol::Crush;
+    }
+
     // --- Copilot indicators (checked first) ---
     // Copilot sends a distinctive `event` field (e.g. "pre-tool-use") that
     // neither Claude Code nor Gemini use. The `tool_args` field is also
@@ -1177,6 +1344,60 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
         "powershell" | "pwsh" => ShellDialect::PowerShell,
         "cmd" | "cmd.exe" => ShellDialect::Cmd,
         _ => ShellDialect::Unknown,
+    }
+}
+
+/// Resolve the dialect a `Bash`-labeled Codex payload is evaluated under.
+///
+/// Codex names its shell tool `Bash` on every platform (its hooks schema
+/// mirrors Claude Code's), but its PreToolUse payload carries only
+/// `{"command": …}` (`codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs`,
+/// `pre_tool_use_payload`) — not the shell the command will run in. On native
+/// Windows that shell is PowerShell by default
+/// (`codex-rs/shell-command/src/shell_detect.rs`), yet the tool's `shell`
+/// parameter lets the model request `bash`/`sh` (Git Bash, or WSL's launcher,
+/// whichever is on `PATH`), and Codex falls back to `cmd.exe` when the
+/// requested shell is missing. The label alone therefore cannot name the
+/// dialect.
+///
+/// Evaluating every such payload as POSIX turned PowerShell's backtick escape
+/// (`"`n"`) into an unterminated command substitution and denied a read-only
+/// command (#379). Evaluating every one as PowerShell instead let the
+/// POSIX-only forms a requested bash would execute — a backquoted
+/// substitution in an expanding heredoc, ``x=`…` ``, `eval '…'`, a
+/// backslash-continued line — pass unseen. The command text separates the
+/// two cases: a command whose POSIX substitution parse fails cannot run under
+/// bash (the shell rejects it as well), so it is evaluated as PowerShell;
+/// anything that parses as POSIX is evaluated as `Unknown`, the fail-closed
+/// union of every dialect, exactly as a mislabeled Agent Host payload is
+/// (#322). A command the parser refuses for its size says nothing about the
+/// shell and keeps the union.
+///
+/// Claude Code's `Bash` tool on Windows is Git Bash, so the resolution is
+/// gated on the Codex protocol; and because a hook always runs on the host
+/// that executes the command, `host_is_windows` (`cfg!(windows)` at the call
+/// site) is the platform signal — a Codex session under WSL runs a Linux dcg
+/// and keeps POSIX. Explicit `powershell`/`pwsh`/`cmd` labels are never
+/// touched.
+#[must_use]
+pub(crate) fn codex_host_shell_dialect(
+    labeled: ShellDialect,
+    protocol: HookProtocol,
+    host_is_windows: bool,
+    command: &str,
+) -> ShellDialect {
+    if labeled != ShellDialect::Posix || protocol != HookProtocol::Codex || !host_is_windows {
+        return labeled;
+    }
+    if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+        return ShellDialect::Unknown;
+    }
+    // The same masked view the POSIX evaluation path parses, so the verdict
+    // here matches the one that path would reach.
+    let posix_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    match crate::heredoc::extract_posix_command_substitutions(posix_view.as_ref()) {
+        Ok(_) => ShellDialect::Unknown,
+        Err(crate::heredoc::PosixCommandSubstitutionParseError) => ShellDialect::PowerShell,
     }
 }
 
@@ -1540,7 +1761,16 @@ fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<Strin
 #[must_use]
 pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCommand> {
     let protocol = detect_protocol(input);
-    let dialect = shell_dialect_for_tool_name(input.tool_name.as_deref());
+    let labeled = shell_dialect_for_tool_name(input.tool_name.as_deref());
+    // The label alone cannot name the dialect of a Codex `Bash` payload on
+    // Windows (#379), so each command resolves its own; a Posix label whose
+    // command is unmistakably PowerShell then widens to the union (#322).
+    let resolve = |command: &str, label: ShellDialect| {
+        refine_shell_dialect(
+            command,
+            codex_host_shell_dialect(label, protocol, cfg!(windows), command),
+        )
+    };
 
     // Only process shell-command invocations for supported clients. Copilot
     // can omit toolName and put the shell command directly in toolArgs, so
@@ -1573,16 +1803,14 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
                 continue;
             }
             if let Some(command) = call.args.as_ref().and_then(extract_command_from_tool_args) {
-                let entry_dialect = refine_shell_dialect(
-                    &command,
-                    shell_dialect_for_tool_name(call.name.as_deref()),
-                );
+                let entry_dialect =
+                    resolve(&command, shell_dialect_for_tool_name(call.name.as_deref()));
                 commands.push((command, entry_dialect));
             }
         }
         if let Some(tool_call) = input.tool_call.as_ref() {
             if let Some(command) = extract_command_from_tool_call(tool_call) {
-                let entry_dialect = refine_shell_dialect(&command, dialect);
+                let entry_dialect = resolve(&command, labeled);
                 commands.push((command, entry_dialect));
             }
         }
@@ -1591,7 +1819,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
             .as_ref()
             .and_then(extract_command_from_tool_input)
         {
-            let entry_dialect = refine_shell_dialect(&command, dialect);
+            let entry_dialect = resolve(&command, labeled);
             commands.push((command, entry_dialect));
         }
         if let Some(command) = input
@@ -1599,7 +1827,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
             .as_ref()
             .and_then(extract_command_from_tool_args)
         {
-            let entry_dialect = refine_shell_dialect(&command, dialect);
+            let entry_dialect = resolve(&command, labeled);
             commands.push((command, entry_dialect));
         }
         let mut entries = commands.into_iter();
@@ -1616,7 +1844,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
     // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
     if let Some(tool_call) = input.tool_call.as_ref() {
         if let Some(command) = extract_command_from_tool_call(tool_call) {
-            let dialect = refine_shell_dialect(&command, dialect);
+            let dialect = resolve(&command, labeled);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -1628,7 +1856,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
 
     if let Some(tool_input) = input.tool_input.as_ref() {
         if let Some(command) = extract_command_from_tool_input(tool_input) {
-            let dialect = refine_shell_dialect(&command, dialect);
+            let dialect = resolve(&command, labeled);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -1640,7 +1868,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
 
     if let Some(tool_args) = input.tool_args.as_ref() {
         if let Some(command) = extract_command_from_tool_args(tool_args) {
-            let dialect = refine_shell_dialect(&command, dialect);
+            let dialect = resolve(&command, labeled);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -2120,7 +2348,8 @@ pub fn write_denial_to(
         | HookProtocol::Gemini
         | HookProtocol::Hermes
         | HookProtocol::Grok
-        | HookProtocol::Antigravity => WarningAudience::HumanOperator,
+        | HookProtocol::Antigravity
+        | HookProtocol::Crush => WarningAudience::HumanOperator,
     };
 
     print_colorful_warning_to(
@@ -2317,6 +2546,30 @@ pub fn write_denial_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        HookProtocol::Crush => {
+            // Crush parses stdout JSON on exit 0: `{"decision":"deny","reason":
+            // ...}` blocks the bash tool call and shows `reason` to the model.
+            // Exit code 2 would also block (stderr as the reason) but the JSON
+            // path keeps dcg's ergonomics fields intact; Crush's parser ignores
+            // the ones it does not know. The colored deny message has already
+            // been written to stderr for the human operator.
+            let output = CrushHookOutput {
+                version: 1,
+                decision: Some("deny"),
+                reason: Some(Cow::Owned(message)),
+                context: None,
+                allow_once_code: allow_once.map(|info| info.code.clone()),
+                allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity,
+                confidence,
+                remediation,
+            };
+
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
     }
 }
 
@@ -2422,7 +2675,8 @@ pub fn write_review_request_to(
         | HookProtocol::CodexAsk
         | HookProtocol::Hermes
         | HookProtocol::Grok
-        | HookProtocol::Antigravity => {
+        | HookProtocol::Antigravity
+        | HookProtocol::Crush => {
             unreachable!("non-review protocols returned through write_denial_to")
         }
     }
@@ -2445,13 +2699,12 @@ pub fn output_denial_for_protocol(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
-) {
-    let out = io::stdout();
-    let mut out_handle = out.lock();
+) -> io::Result<()> {
+    let mut verdict = Vec::new();
     let err = io::stderr();
     let mut err_handle = err.lock();
     write_denial_to(
-        &mut out_handle,
+        &mut verdict,
         &mut err_handle,
         protocol,
         command,
@@ -2466,6 +2719,7 @@ pub fn output_denial_for_protocol(
         pattern_suggestions,
         branch_context,
     );
+    deliver_verdict(&verdict)
 }
 
 /// Output an operator-review request using the active hook protocol.
@@ -2485,13 +2739,12 @@ pub fn output_review_request_for_protocol(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
-) {
-    let out = io::stdout();
-    let mut out_handle = out.lock();
+) -> io::Result<()> {
+    let mut verdict = Vec::new();
     let err = io::stderr();
     let mut err_handle = err.lock();
     write_review_request_to(
-        &mut out_handle,
+        &mut verdict,
         &mut err_handle,
         protocol,
         command,
@@ -2506,6 +2759,7 @@ pub fn output_review_request_for_protocol(
         pattern_suggestions,
         branch_context,
     );
+    deliver_verdict(&verdict)
 }
 
 /// Output a denial response to stdout (JSON for hook protocol).
@@ -2523,7 +2777,7 @@ pub fn output_denial(
     severity: Option<crate::packs::Severity>,
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
-) {
+) -> io::Result<()> {
     output_denial_for_protocol(
         HookProtocol::ClaudeCompatible,
         command,
@@ -2537,7 +2791,7 @@ pub fn output_denial(
         confidence,
         pattern_suggestions,
         None,
-    );
+    )
 }
 
 /// Write a safety-evaluation indeterminate response to hook protocol streams.
@@ -2694,6 +2948,29 @@ pub fn write_indeterminate_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        HookProtocol::Crush => {
+            // Crush has no `ask`: an omitted decision falls through to its
+            // normal permission prompt, which an allowlist or auto-approver
+            // may wave through — exactly the unattended case #338 guards
+            // against. Deny outright with the plain reason, like the other
+            // prompt-less protocols (the `unverified_decision` annotation is
+            // for protocols whose `ask` was downgraded).
+            let output = CrushHookOutput {
+                version: 1,
+                decision: Some("deny"),
+                reason: Some(Cow::Borrowed(reason)),
+                context: None,
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id: None,
+                pack_id: None,
+                severity: None,
+                confidence: None,
+                remediation: None,
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
     }
 
     // A deadline response is useful only if the hook runner receives it before
@@ -2708,12 +2985,16 @@ pub fn write_indeterminate_to(
 /// Emit a safety-evaluation indeterminate response on process stdout/stderr.
 #[cold]
 #[inline(never)]
-pub fn output_indeterminate_for_protocol(protocol: HookProtocol, reason: &str, deny: bool) {
-    let out = io::stdout();
-    let mut out_handle = out.lock();
+pub fn output_indeterminate_for_protocol(
+    protocol: HookProtocol,
+    reason: &str,
+    deny: bool,
+) -> io::Result<()> {
+    let mut verdict = Vec::new();
     let err = io::stderr();
     let mut err_handle = err.lock();
-    write_indeterminate_to(&mut out_handle, &mut err_handle, protocol, reason, deny);
+    write_indeterminate_to(&mut verdict, &mut err_handle, protocol, reason, deny);
+    deliver_verdict(&verdict)
 }
 
 /// Write a warning response to arbitrary stdout/stderr writers (test seam).
@@ -2848,6 +3129,30 @@ pub(crate) fn write_warning_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        HookProtocol::Crush => {
+            // Crush's `"allow"` is an affirmative pre-approval that SKIPS the
+            // user's permission prompt, so unlike Grok/agy a warn must not be
+            // expressed as an explicit allow — dcg would be vouching for a
+            // command it only meant to annotate. Omit `decision` ("no
+            // opinion": the call proceeds through Crush's ordinary permission
+            // flow, exactly as if dcg had stayed silent) and carry the warning
+            // in `context`, which Crush appends to what the model sees.
+            let output = CrushHookOutput {
+                version: 1,
+                decision: None,
+                reason: None,
+                context: Some(Cow::Owned(warn_reason)),
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity: None,
+                confidence: None,
+                remediation: None,
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
     }
 }
 
@@ -2861,13 +3166,12 @@ pub fn output_warning_for_protocol(
     pack: Option<&str>,
     pattern: Option<&str>,
     explanation: Option<&str>,
-) {
-    let out = io::stdout();
-    let mut out_handle = out.lock();
+) -> io::Result<()> {
+    let mut verdict = Vec::new();
     let err = io::stderr();
     let mut err_handle = err.lock();
     write_warning_to(
-        &mut out_handle,
+        &mut verdict,
         &mut err_handle,
         protocol,
         command,
@@ -2876,6 +3180,7 @@ pub fn output_warning_for_protocol(
         pattern,
         explanation,
     );
+    deliver_verdict(&verdict)
 }
 
 /// Log a blocked command to a file (if logging is enabled).
@@ -2912,6 +3217,11 @@ pub fn log_blocked_command(
     let timestamp = chrono_lite_timestamp();
     let pack_str = pack.unwrap_or("unknown");
 
+    // The log file outlives the hook invocation and a blocked command is
+    // exactly where credentials turn up, so recognised secret shapes are
+    // replaced before the line is written (issue #386). This path has no
+    // redaction config of its own; pattern redaction is unconditional here.
+    let command = crate::redaction::redact_secrets(command);
     writeln!(file, "[{timestamp}] [{pack_str}] {reason}")?;
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
@@ -2962,6 +3272,8 @@ pub fn log_budget_skip(
         budget.as_millis(),
         elapsed.as_millis()
     )?;
+    // Same unconditional secret redaction as `log_blocked_command`.
+    let command = crate::redaction::redact_secrets(command);
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
 
@@ -3104,7 +3416,14 @@ mod tests {
             (
                 r#"{"tool_name":"bash","tool_input":{"command":"git status"},"turn_id":"turn-1"}"#,
                 HookProtocol::Codex,
-                ShellDialect::Posix,
+                // Codex's `Bash` tool on native Windows runs PowerShell by
+                // default or a model-requested bash; a POSIX-parseable
+                // command takes the fail-closed union (#379).
+                if cfg!(windows) {
+                    ShellDialect::Unknown
+                } else {
+                    ShellDialect::Posix
+                },
             ),
             (
                 r#"{"tool_name":"runTerminalCommand","tool_input":{"command":"git status"}}"#,
@@ -3125,6 +3444,132 @@ mod tests {
             assert_eq!(extracted.protocol, expected_protocol);
             assert_eq!(extracted.dialect, expected_dialect);
         }
+    }
+
+    #[test]
+    fn test_379_codex_bash_tool_on_windows_host_resolves_powershell() {
+        // Codex labels its shell tool `Bash` everywhere. On native Windows
+        // the command runs under PowerShell by default, but the model may
+        // request bash through the tool's `shell` parameter, which the hook
+        // payload does not carry (#379). The command text decides.
+        //
+        // The reporter's command: PowerShell's backtick escape is an
+        // unterminated POSIX substitution, so it can only be PowerShell.
+        let ps_only =
+            "$a=[IO.File]::ReadAllLines('x'); [string]::Join(\"`n\",$a[239..($a.Length-1)])";
+        assert_eq!(
+            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, true, ps_only),
+            ShellDialect::PowerShell
+        );
+        // Commands a requested Git Bash would execute parse as POSIX; the
+        // label cannot tell them from PowerShell, so they take the
+        // fail-closed union.
+        let posix_parseable = [
+            "git status",
+            "tee /private/tmp/sink.md <<EOF\n`git reset --hard`\nEOF",
+            "x=`rm -rf ~/x`",
+            "eval 'rm -rf ~/x'",
+            "rm \\\n-rf ~/x",
+            "Get-ChildItem -Recurse | Select-Object Name",
+        ];
+        for command in posix_parseable {
+            assert_eq!(
+                codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, true, command),
+                ShellDialect::Unknown,
+                "{command:?}"
+            );
+        }
+        // A command the parser refuses for its size keeps the union rather
+        // than trusting a verdict that never looked at the syntax.
+        let oversized = format!(
+            "echo `{}`",
+            "x".repeat(crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES)
+        );
+        assert_eq!(
+            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, true, &oversized),
+            ShellDialect::Unknown
+        );
+        // The same payloads on a Unix host (including Codex under WSL) keep
+        // the POSIX dialect: Codex runs the user's login shell there.
+        for command in std::iter::once(ps_only).chain(posix_parseable) {
+            assert_eq!(
+                codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, false, command),
+                ShellDialect::Posix,
+                "{command:?}"
+            );
+        }
+        // Claude Code's `Bash` tool on Windows is Git Bash — never re-mapped.
+        for protocol in [
+            HookProtocol::ClaudeCompatible,
+            HookProtocol::Copilot,
+            HookProtocol::Gemini,
+            HookProtocol::Hermes,
+            HookProtocol::Grok,
+            HookProtocol::Antigravity,
+            HookProtocol::Crush,
+        ] {
+            for command in [ps_only, "git status"] {
+                assert_eq!(
+                    codex_host_shell_dialect(ShellDialect::Posix, protocol, true, command),
+                    ShellDialect::Posix,
+                    "{protocol:?} must keep the POSIX label on Windows for {command:?}"
+                );
+            }
+        }
+        // Explicit labels are authoritative on every host.
+        for labeled in [
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+            ShellDialect::Unknown,
+        ] {
+            for host_is_windows in [true, false] {
+                for command in [ps_only, "git status"] {
+                    assert_eq!(
+                        codex_host_shell_dialect(
+                            labeled,
+                            HookProtocol::Codex,
+                            host_is_windows,
+                            command
+                        ),
+                        labeled
+                    );
+                }
+            }
+        }
+
+        // End to end through the extractor: the reporter's payload.
+        let json = r#"{"tool_name":"Bash","turn_id":"turn-379","tool_input":{"command":"$a=[IO.File]::ReadAllLines('x'); [string]::Join(\"`n\",$a[239..($a.Length-1)])"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.protocol, HookProtocol::Codex);
+        assert_eq!(
+            extracted.dialect,
+            if cfg!(windows) {
+                ShellDialect::PowerShell
+            } else {
+                ShellDialect::Posix
+            }
+        );
+        // A POSIX-parseable Codex payload takes the union on Windows.
+        let json = r#"{"tool_name":"Bash","turn_id":"turn-379","tool_input":{"command":"tee /private/tmp/sink.md <<EOF\n`git reset --hard`\nEOF"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.protocol, HookProtocol::Codex);
+        assert_eq!(
+            extracted.dialect,
+            if cfg!(windows) {
+                ShellDialect::Unknown
+            } else {
+                ShellDialect::Posix
+            }
+        );
+        // Without `turn_id` the payload is Claude Code's, whose Windows
+        // `Bash` tool is Git Bash: the POSIX label stands on every host.
+        let json = r#"{"tool_name":"Bash","tool_input":{"command":"$a=[IO.File]::ReadAllLines('x'); [string]::Join(\"`n\",$a[239..($a.Length-1)])"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
+        assert_eq!(extracted.dialect, ShellDialect::Posix);
     }
 
     #[test]
@@ -4438,6 +4883,246 @@ mod tests {
     }
 
     // =========================================================================
+    // Crush (Charm) protocol tests (#388).
+    //
+    // The stdin shape below is what `hooks.BuildPayload` in
+    // charmbracelet/crush (`internal/hooks/input.go`) marshals for a
+    // PreToolUse hook: a flat snake_case envelope whose `event` is the
+    // PascalCase "PreToolUse" and whose `tool_input` is the raw JSON the model
+    // sent to the `bash` tool. Crush parses stdout on exit 0 and honors
+    // `{"decision":"deny","reason":...}`; an omitted `decision` is "no
+    // opinion" and `"allow"` skips the user's permission prompt entirely.
+    // =========================================================================
+
+    /// Verbatim shape of Crush's PreToolUse stdin payload.
+    const CRUSH_DENY_PAYLOAD: &str = r#"{"event":"PreToolUse","session_id":"313909e","cwd":"/home/user/project","tool_name":"bash","tool_input":{"command":"git reset --hard HEAD~1"}}"#;
+
+    #[test]
+    fn test_crush_payload_detected_as_crush_protocol() {
+        let input: HookInput = serde_json::from_str(CRUSH_DENY_PAYLOAD).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Crush);
+    }
+
+    #[test]
+    fn test_crush_payload_command_is_extracted() {
+        let input: HookInput = serde_json::from_str(CRUSH_DENY_PAYLOAD).unwrap();
+        let extracted = extract_command_with_context(&input).expect("command present");
+        assert_eq!(extracted.command, "git reset --hard HEAD~1");
+        assert_eq!(extracted.protocol, HookProtocol::Crush);
+        assert!(extracted.additional_commands.is_empty());
+        assert!(is_supported_shell_tool(input.tool_name.as_deref()));
+    }
+
+    #[test]
+    fn test_crush_event_name_is_case_insensitive_but_separator_sensitive() {
+        // Crush's config loader accepts `pretooluse`; be tolerant of the case
+        // in the payload too. The hyphenated Copilot spelling must NOT match:
+        // stripping separators would fold "pre-tool-use" onto "pretooluse".
+        for event in ["PreToolUse", "pretooluse", "PRETOOLUSE"] {
+            let json = format!(
+                r#"{{"event":"{event}","tool_name":"bash","tool_input":{{"command":"ls"}}}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::Crush,
+                "event {event}"
+            );
+        }
+        for event in ["pre-tool-use", "pre_tool_use", "PreToolUsed"] {
+            let json = format!(
+                r#"{{"event":"{event}","tool_name":"bash","tool_input":{{"command":"ls"}}}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            assert_ne!(
+                detect_protocol(&input),
+                HookProtocol::Crush,
+                "event {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_copilot_payload_is_not_captured_by_crush() {
+        // Copilot's `event` is hyphenated and it ships `tool_args`, not
+        // `tool_input`. Both must keep routing to the Copilot arm.
+        let json =
+            r#"{"event":"pre-tool-use","tool_name":"bash","tool_args":"{\"command\":\"ls\"}"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+
+        // Even a PascalCase event loses to Copilot when `tool_args` is present.
+        let json =
+            r#"{"event":"PreToolUse","tool_name":"bash","tool_args":"{\"command\":\"ls\"}"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+
+        // A bare PascalCase event without any tool input is not Crush's shape.
+        let json = r#"{"event":"PreToolUse","tool_name":"bash"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_crush_non_shell_tool_is_still_crush_protocol_but_not_evaluated() {
+        // A user may register dcg with a broader matcher; the envelope is
+        // still Crush's, and the non-shell tool is ignored like everywhere else.
+        let json = r#"{"event":"PreToolUse","session_id":"s","cwd":"/p","tool_name":"edit","tool_input":{"file_path":"/p/main.go","old_string":"a","new_string":"b"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Crush);
+        assert!(!is_supported_shell_tool(input.tool_name.as_deref()));
+        assert!(extract_command_with_context(&input).is_none());
+    }
+
+    #[test]
+    fn test_crush_hook_output_deny_json_shape() {
+        let output = CrushHookOutput {
+            version: 1,
+            decision: Some("deny"),
+            reason: Some(Cow::Borrowed(
+                "git reset --hard destroys uncommitted changes",
+            )),
+            context: None,
+            allow_once_code: Some("abc123".to_string()),
+            allow_once_full_hash: None,
+            rule_id: Some("core.git:reset-hard".to_string()),
+            pack_id: Some("core.git".to_string()),
+            severity: Some(crate::packs::Severity::Critical),
+            confidence: None,
+            remediation: None,
+        };
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["decision"], "deny");
+        assert_eq!(
+            json["reason"],
+            "git reset --hard destroys uncommitted changes"
+        );
+        assert!(json.get("context").is_none(), "context omitted when None");
+        assert_eq!(json["allowOnceCode"], "abc123");
+        assert_eq!(json["ruleId"], "core.git:reset-hard");
+        // Never the Claude/Copilot/Hermes spellings.
+        assert!(json.get("hookSpecificOutput").is_none());
+        assert!(json.get("permissionDecision").is_none());
+        assert!(json.get("action").is_none());
+    }
+
+    #[test]
+    fn test_write_denial_crush_produces_deny_json() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Crush,
+            "git reset --hard HEAD~1",
+            "git reset --hard destroys uncommitted changes",
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::Critical),
+            None,
+            &[],
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["decision"], "deny");
+        assert!(
+            json["reason"]
+                .as_str()
+                .unwrap()
+                .contains("git reset --hard destroys uncommitted changes"),
+            "reason must carry the human-readable explanation, got: {}",
+            json["reason"]
+        );
+        assert_eq!(json["ruleId"], "core.git:reset-hard");
+        assert_eq!(json["packId"], "core.git");
+        assert!(json.get("hookSpecificOutput").is_none());
+        assert!(json.get("permissionDecision").is_none());
+        assert!(
+            !stderr.is_empty(),
+            "Crush denial must still surface the stderr warning box"
+        );
+    }
+
+    #[test]
+    fn test_write_warning_crush_has_no_decision_and_carries_context() {
+        // In Crush an explicit "allow" is an affirmative pre-approval that
+        // skips the user's permission prompt, so a warn must be expressed as
+        // "no opinion" (decision omitted) with the text in `context`.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Crush,
+            "git stash drop",
+            "drops stashed changes",
+            Some("core.git"),
+            Some("stash-drop"),
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert!(
+            json.get("decision").is_none(),
+            "warn must not pre-approve (allow) or block (deny) on Crush: {json}"
+        );
+        assert!(
+            json.get("reason").is_none(),
+            "reason is deny/halt-only: {json}"
+        );
+        assert!(
+            json["context"].as_str().unwrap().starts_with("DCG warn:"),
+            "context should be prefixed so the model knows this is advisory"
+        );
+        assert_eq!(json["ruleId"], "core.git:stash-drop");
+        assert!(!stderr.is_empty(), "stderr must contain warn text");
+    }
+
+    #[test]
+    fn test_write_review_request_crush_falls_back_to_deny() {
+        // Crush has no `ask` decision; review policy must not degrade to
+        // "no opinion" (which an allowlist could wave through).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_review_request_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Crush,
+            "git push --force",
+            "force push rewrites remote history",
+            Some("core.git"),
+            Some("push-force"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::High),
+            None,
+            &[],
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+        assert_eq!(json["decision"], "deny");
+    }
+
+    // =========================================================================
     // Antigravity CLI (`agy`) protocol tests.
     //
     // The wire shapes below are taken verbatim from the stdin `agy` passes to a
@@ -5224,6 +5909,7 @@ mod tests {
             (HookProtocol::Hermes, "block"),
             (HookProtocol::Grok, "deny"),
             (HookProtocol::Antigravity, "block"),
+            (HookProtocol::Crush, "deny"),
         ];
 
         for (protocol, expected_decision) in cases {
@@ -5259,7 +5945,8 @@ mod tests {
                 HookProtocol::Gemini
                 | HookProtocol::Hermes
                 | HookProtocol::Grok
-                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+                | HookProtocol::Antigravity
+                | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -5293,6 +5980,7 @@ mod tests {
             (HookProtocol::Hermes, "block", false),
             (HookProtocol::Grok, "deny", false),
             (HookProtocol::Antigravity, "block", false),
+            (HookProtocol::Crush, "deny", false),
         ];
 
         for (protocol, expected_decision, reason_is_annotated) in cases {
@@ -5317,7 +6005,8 @@ mod tests {
                 HookProtocol::Gemini
                 | HookProtocol::Hermes
                 | HookProtocol::Grok
-                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+                | HookProtocol::Antigravity
+                | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -5341,6 +6030,7 @@ mod tests {
             (HookProtocol::Hermes, "block"),
             (HookProtocol::Grok, "deny"),
             (HookProtocol::Antigravity, "block"),
+            (HookProtocol::Crush, "deny"),
         ];
         let allow = test_allow_once();
 
@@ -5384,7 +6074,8 @@ mod tests {
                 HookProtocol::Gemini
                 | HookProtocol::Hermes
                 | HookProtocol::Grok
-                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+                | HookProtocol::Antigravity
+                | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -5781,5 +6472,42 @@ mod tests {
             shell_tool_from_truncated_json(prefix).expect("real shell tool must still be found");
         assert_eq!(name, "Bash");
         assert_eq!(dialect, ShellDialect::Posix);
+    }
+
+    /// Issue #386: `[general] log_file` takes no redaction config and used to
+    /// write `Command: {command}` raw, so a blocked command carrying a token
+    /// landed in the log verbatim. Canaries below are synthetic.
+    #[test]
+    fn blocked_command_log_redacts_secrets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("blocked.log");
+        let path = log.to_str().expect("utf-8 path");
+        let command = "deploy --purge AKIAABCDEFGHIJKLMNOP \
+             ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+        log_blocked_command(path, command, "destructive", Some("core")).expect("write log");
+        log_budget_skip(
+            path,
+            command,
+            "prefilter",
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+        )
+        .expect("write budget log");
+
+        let contents = std::fs::read_to_string(&log).expect("read log");
+        for canary in [
+            "AKIAABCDEFGHIJKLMNOP",
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        ] {
+            assert!(
+                !contents.contains(canary),
+                "canary {canary} survived into the log file: {contents}"
+            );
+        }
+        // The non-secret part of the command must still be legible.
+        assert!(contents.contains("deploy --purge"), "{contents}");
+        assert!(contents.contains("[AWS_ACCESS_KEY]"), "{contents}");
+        assert!(contents.contains("[GITHUB_TOKEN]"), "{contents}");
     }
 }

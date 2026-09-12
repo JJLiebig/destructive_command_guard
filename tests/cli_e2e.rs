@@ -2040,6 +2040,148 @@ mod config_tests {
         assert!(cwd.join(".omp/extensions/dcg-guard.ts").is_file());
     }
 
+    /// #388: `dcg install --crush` merges a flat `hooks.PreToolUse` entry into
+    /// Crush's user config (`$XDG_CONFIG_HOME/crush/crush.json`), preserves
+    /// unrelated keys and hooks, is idempotent without --force, honors the
+    /// `CRUSH_GLOBAL_CONFIG` directory override, and `dcg uninstall --crush`
+    /// removes exactly what it added.
+    #[test]
+    fn install_crush_merges_hook_into_user_config_and_uninstalls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let config_path = xdg_config_dir.join("crush").join("crush.json");
+        std::fs::create_dir_all(config_path.parent().unwrap()).expect("crush dir");
+        std::fs::write(
+            &config_path,
+            r#"{"$schema":"https://charm.land/crush.json","options":{"debug":true},"hooks":{"PreToolUse":[{"matcher":"^bash$","command":"./hooks/no-haskell.sh"}]}}"#,
+        )
+        .expect("seed crush.json");
+
+        let run = |args: &[&str]| {
+            std::process::Command::new(dcg_binary())
+                .args(args)
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .current_dir(temp.path())
+                .output()
+                .expect("run dcg")
+        };
+
+        let output = run(&["install", "--crush"]);
+        assert!(
+            output.status.success(),
+            "install --crush: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+                .expect("crush.json stays valid JSON");
+        assert_eq!(config["$schema"], "https://charm.land/crush.json");
+        assert_eq!(config["options"]["debug"], true, "unrelated keys preserved");
+        let entries = config["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("hooks.PreToolUse array");
+        assert_eq!(entries.len(), 2, "dcg entry plus the user's hook: {config}");
+        let dcg_entry = &entries[0];
+        assert_eq!(dcg_entry["name"], "dcg");
+        assert_eq!(dcg_entry["matcher"], "^bash$");
+        assert_eq!(dcg_entry["timeout"], 5);
+        let command = dcg_entry["command"].as_str().expect("command string");
+        assert!(
+            command
+                .trim_matches('"')
+                .ends_with(&format!("dcg{}", std::env::consts::EXE_SUFFIX)),
+            "command points at the dcg binary: {command}"
+        );
+        assert!(
+            dcg_entry.get("hooks").is_none() && dcg_entry.get("type").is_none(),
+            "Crush entries are flat, not Claude-shaped: {dcg_entry}"
+        );
+        assert_eq!(entries[1]["command"], "./hooks/no-haskell.sh");
+
+        // Idempotent without --force.
+        let output = run(&["install", "--crush"]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("already installed"), "idempotent: {stdout}");
+        let again = std::fs::read_to_string(&config_path).expect("read config");
+        let again: serde_json::Value = serde_json::from_str(&again).unwrap();
+        assert_eq!(again["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+
+        // Uninstall removes only the dcg entry.
+        let output = run(&["uninstall", "--crush"]);
+        assert!(
+            output.status.success(),
+            "uninstall --crush: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let entries = config["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{config}");
+        assert_eq!(entries[0]["command"], "./hooks/no-haskell.sh");
+        assert_eq!(config["options"]["debug"], true);
+
+        // CRUSH_GLOBAL_CONFIG is a directory override that beats XDG.
+        let override_dir = temp.path().join("crush-global");
+        let output = std::process::Command::new(dcg_binary())
+            .args(["install", "--crush"])
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("CRUSH_GLOBAL_CONFIG", &override_dir)
+            .current_dir(temp.path())
+            .output()
+            .expect("run dcg");
+        assert!(
+            output.status.success(),
+            "install --crush with CRUSH_GLOBAL_CONFIG: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let overridden: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(override_dir.join("crush.json")).expect("override file"),
+        )
+        .unwrap();
+        assert_eq!(overridden["hooks"]["PreToolUse"][0]["name"], "dcg");
+    }
+
+    /// #388: `dcg install --crush --project` edits the repo's `crush.json`
+    /// (creating it when absent) so the hook rides along with the project.
+    #[test]
+    fn install_crush_project_writes_repo_crush_json() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let nested = temp.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+
+        let output = std::process::Command::new(dcg_binary())
+            .args(["install", "--crush", "--project"])
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .current_dir(&nested)
+            .output()
+            .expect("run dcg");
+        assert!(
+            output.status.success(),
+            "install --crush --project: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let project_config = temp.path().join("crush.json");
+        assert!(project_config.is_file(), "written at the repo root");
+        assert!(
+            !xdg_config_dir.join("crush").join("crush.json").exists(),
+            "project install must not touch the user config"
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&project_config).unwrap()).unwrap();
+        assert_eq!(config["hooks"]["PreToolUse"][0]["matcher"], "^bash$");
+    }
+
     #[test]
     fn install_omp_matches_profile_and_legacy_override_precedence() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2913,6 +3055,215 @@ mod config_tests {
         assert!(
             checks.iter().any(|c| c["id"] == "binary_path"),
             "expected binary_path check in JSON output"
+        );
+    }
+
+    /// Run `dcg doctor --format json` in an isolated HOME and return the
+    /// `history` check (#381).
+    fn doctor_history_check(
+        temp: &tempfile::TempDir,
+        home_dir: &std::path::Path,
+        xdg_config_dir: &std::path::Path,
+        bin_dir: &std::path::Path,
+        extra_env: &[(&str, &std::ffi::OsStr)],
+    ) -> serde_json::Value {
+        let mut command = Command::new(dcg_binary());
+        command
+            .env_clear()
+            .env("HOME", home_dir)
+            .env("USERPROFILE", home_dir)
+            .env("XDG_CONFIG_HOME", xdg_config_dir)
+            .env("PATH", bin_dir)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(temp.path())
+            .args(["doctor", "--format", "json"]);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run dcg doctor --format json");
+        assert!(
+            output.status.success(),
+            "doctor must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("doctor JSON output");
+        report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"] == "history")
+            .cloned()
+            .expect("history check present")
+    }
+
+    /// #381: history defaults to the XDG state directory, never `~/.config`.
+    #[test]
+    fn doctor_reports_history_default_in_state_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+        std::fs::create_dir_all(xdg_config_dir.join("dcg")).expect("config dir");
+        std::fs::write(
+            xdg_config_dir.join("dcg").join("config.toml"),
+            b"[history]\nenabled = true\n",
+        )
+        .expect("write config");
+
+        let check = doctor_history_check(&temp, &home_dir, &xdg_config_dir, &bin_dir, &[]);
+        assert_eq!(check["status"], "ok", "{check}");
+        let message = check["message"].as_str().expect("message");
+        let expected = home_dir.join(".local").join("state").join("dcg");
+        assert!(
+            message.contains(&expected.display().to_string()),
+            "default must live under the state directory: {message}"
+        );
+        assert!(
+            message.contains("default state directory"),
+            "message must name the source: {message}"
+        );
+        assert!(
+            !message.contains(&xdg_config_dir.display().to_string()),
+            "history must not default into the config directory: {message}"
+        );
+        assert!(
+            !expected.exists(),
+            "doctor must not create the state directory as a side effect"
+        );
+    }
+
+    /// #381: `XDG_STATE_HOME` relocates the default; `DCG_HISTORY_DB` beats
+    /// `[history] database_path`, which beats the default.
+    #[test]
+    fn doctor_reports_history_path_precedence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+        std::fs::create_dir_all(xdg_config_dir.join("dcg")).expect("config dir");
+        let xdg_state = temp.path().join("xdg_state");
+        let config_db = temp.path().join("from-config").join("history.db");
+        let env_db = temp.path().join("from-env").join("history.db");
+
+        // Default with XDG_STATE_HOME set.
+        std::fs::write(
+            xdg_config_dir.join("dcg").join("config.toml"),
+            b"[history]\nenabled = true\n",
+        )
+        .expect("write config");
+        let check = doctor_history_check(
+            &temp,
+            &home_dir,
+            &xdg_config_dir,
+            &bin_dir,
+            &[("XDG_STATE_HOME", xdg_state.as_os_str())],
+        );
+        let message = check["message"].as_str().expect("message").to_string();
+        assert!(
+            message.contains(
+                &xdg_state
+                    .join("dcg")
+                    .join("history.db")
+                    .display()
+                    .to_string()
+            ),
+            "XDG_STATE_HOME must relocate the default: {message}"
+        );
+
+        // Config override.
+        std::fs::write(
+            xdg_config_dir.join("dcg").join("config.toml"),
+            format!(
+                "[history]\nenabled = true\ndatabase_path = {:?}\n",
+                config_db.display().to_string()
+            ),
+        )
+        .expect("write config");
+        let check = doctor_history_check(
+            &temp,
+            &home_dir,
+            &xdg_config_dir,
+            &bin_dir,
+            &[("XDG_STATE_HOME", xdg_state.as_os_str())],
+        );
+        let message = check["message"].as_str().expect("message").to_string();
+        assert!(
+            message.contains(&config_db.display().to_string())
+                && message.contains("[history] database_path"),
+            "config path must beat the default: {message}"
+        );
+
+        // Environment override beats config.
+        let check = doctor_history_check(
+            &temp,
+            &home_dir,
+            &xdg_config_dir,
+            &bin_dir,
+            &[
+                ("XDG_STATE_HOME", xdg_state.as_os_str()),
+                ("DCG_HISTORY_DB", env_db.as_os_str()),
+            ],
+        );
+        let message = check["message"].as_str().expect("message").to_string();
+        assert!(
+            message.contains(&env_db.display().to_string()) && message.contains("DCG_HISTORY_DB"),
+            "DCG_HISTORY_DB must beat config: {message}"
+        );
+        assert!(
+            !message.contains(&config_db.display().to_string()),
+            "config path must not leak into the env-selected message: {message}"
+        );
+    }
+
+    /// #381: an existing pre-0.15 database beside config.toml stays in use,
+    /// and doctor says so; a read-only one is reported as a warning with the
+    /// relocation hint.
+    #[test]
+    #[cfg(unix)]
+    fn doctor_reports_legacy_history_location_and_readonly_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+        let config_dir = xdg_config_dir.join("dcg");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            b"[history]\nenabled = true\n",
+        )
+        .expect("write config");
+        let legacy_db = config_dir.join("history.db");
+        std::fs::write(&legacy_db, b"").expect("legacy db placeholder");
+
+        let check = doctor_history_check(&temp, &home_dir, &xdg_config_dir, &bin_dir, &[]);
+        assert_eq!(check["status"], "ok", "{check}");
+        let message = check["message"].as_str().expect("message");
+        assert!(
+            message.contains(&legacy_db.display().to_string())
+                && message.contains("legacy config-directory location")
+                && message.contains("pre-0.15"),
+            "existing legacy database must be honored and labelled: {message}"
+        );
+
+        // Make the legacy file read-only: the sandbox scenario from #381.
+        std::fs::set_permissions(&legacy_db, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod legacy db");
+        // A privileged test runner (root) can write a 0444 file, so the probe
+        // legitimately reports OK there; only assert the warning when this
+        // process itself cannot open the file for writing.
+        let readonly_observable = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&legacy_db)
+            .is_err();
+        let check = doctor_history_check(&temp, &home_dir, &xdg_config_dir, &bin_dir, &[]);
+        std::fs::set_permissions(&legacy_db, std::fs::Permissions::from_mode(0o644))
+            .expect("restore legacy db perms");
+        if !readonly_observable {
+            return;
+        }
+        assert_eq!(check["status"], "warning", "{check}");
+        let remediation = check["remediation"].as_str().expect("remediation");
+        assert!(
+            remediation.contains("DCG_HISTORY_DB")
+                && remediation.contains("[history] database_path"),
+            "remediation must name both overrides: {remediation}"
         );
     }
 

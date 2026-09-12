@@ -30,9 +30,11 @@ use destructive_command_guard::evaluator::{
     EvaluationDecision, evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 #[allow(unused_imports)]
-use destructive_command_guard::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
+use destructive_command_guard::exit_codes::{
+    EXIT_BROKEN_PIPE, EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS,
+};
 use destructive_command_guard::history::{
-    CommandEntry, ENV_HISTORY_DB_PATH, HistoryWriter, Outcome as HistoryOutcome,
+    CommandEntry, HistoryWriter, Outcome as HistoryOutcome, ResolvedHistoryPath,
 };
 use destructive_command_guard::hook;
 use destructive_command_guard::load_default_allowlists;
@@ -48,6 +50,7 @@ use destructive_command_guard::pending_exceptions::{
 };
 use destructive_command_guard::perf::{Deadline, HOOK_EVALUATION_BUDGET};
 use destructive_command_guard::update::{GIT_DESCRIBE, GIT_SHA};
+use destructive_command_guard::{emit_stderr, emit_stdout};
 // Import HookInput for parsing stdin JSON in hook mode
 #[cfg(test)]
 use destructive_command_guard::hook::HookInput;
@@ -107,11 +110,10 @@ fn enable_windows_ansi() {
     }
 }
 
-fn history_db_path(config: &destructive_command_guard::config::HistoryConfig) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(ENV_HISTORY_DB_PATH) {
-        return Some(PathBuf::from(path));
-    }
-    config.expanded_database_path()
+/// The one history database every writer and reader agrees on
+/// (`DCG_HISTORY_DB` > `[history] database_path` > legacy > state dir).
+fn history_db_path(config: &destructive_command_guard::config::HistoryConfig) -> PathBuf {
+    ResolvedHistoryPath::resolve(config).path
 }
 
 fn build_history_entry(
@@ -147,6 +149,7 @@ fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent:
         hook::HookProtocol::Hermes => Agent::Hermes.config_key(),
         hook::HookProtocol::Grok => Agent::Grok.config_key(),
         hook::HookProtocol::Antigravity => Agent::Antigravity.config_key(),
+        hook::HookProtocol::Crush => Agent::Crush.config_key(),
         hook::HookProtocol::ClaudeCompatible => detected_agent.config_key(),
     }
 }
@@ -162,6 +165,7 @@ fn effective_agent_for_hook_protocol(
         hook::HookProtocol::Hermes => Agent::Hermes,
         hook::HookProtocol::Grok => Agent::Grok,
         hook::HookProtocol::Antigravity => Agent::Antigravity,
+        hook::HookProtocol::Crush => Agent::Crush,
         hook::HookProtocol::ClaudeCompatible => detected_agent.clone(),
     }
 }
@@ -213,7 +217,43 @@ fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
     )
 }
 
-/// Publish one conservative protocol decision for every deadline exit path.
+/// Exit status for a blocking verdict (deny, ask, or indeterminate) after
+/// its publication attempt.
+///
+/// `Ok` means the JSON reached stdout and the protocol's exit-0 contract
+/// applies. `Err` means the host stopped reading before the verdict was
+/// written — with `SIGPIPE` ignored that is an `EPIPE` on the write — and
+/// exit 0 with nothing on stdout reads as "proceed" on every host, so the
+/// protocol's blocking exit status has to carry the verdict instead
+/// (`HookProtocol::undeliverable_block_exit_code`). The stderr line is
+/// best-effort: Claude Code feeds it back to the model on exit 2, and a host
+/// that closed stderr too simply gets the status.
+fn blocking_verdict_exit_code(protocol: hook::HookProtocol, delivery: io::Result<()>) -> i32 {
+    match delivery {
+        Ok(()) => EXIT_SUCCESS,
+        Err(error) => {
+            let exit_code = protocol.undeliverable_block_exit_code();
+            emit_stderr!(
+                "[dcg] BLOCKED: the verdict could not be written to stdout ({error}); exiting {exit_code} so the host fails closed."
+            );
+            exit_code
+        }
+    }
+}
+
+/// Leave hook mode with `exit_code`.
+///
+/// Exit 0 is the ordinary return from `main`. A non-zero status goes through
+/// `process::exit`, which skips `Drop`, so callers must have dropped (and
+/// thereby flushed) the history writer first.
+fn finish_hook_mode(exit_code: i32) {
+    if exit_code != EXIT_SUCCESS {
+        std::process::exit(exit_code);
+    }
+}
+
+/// Publish one conservative protocol decision for every deadline exit path
+/// and return the process exit status (see `blocking_verdict_exit_code`).
 ///
 /// Deadline exhaustion is not an allow: Claude/Copilot can ask the operator,
 /// while protocols without an `ask` decision receive their documented block
@@ -231,12 +271,12 @@ fn handle_indeterminate_evaluation(
     stage: &str,
     deadline: &Deadline,
     deny_unverified: bool,
-) {
+) -> i32 {
     let elapsed = deadline.elapsed();
     let budget = deadline.max_duration();
 
     let reason = format_indeterminate_reason(stage, budget);
-    hook::output_indeterminate_for_protocol(protocol, &reason, deny_unverified);
+    let delivery = hook::output_indeterminate_for_protocol(protocol, &reason, deny_unverified);
 
     if let Some(writer) = history_writer {
         let entry = build_history_entry(
@@ -252,6 +292,7 @@ fn handle_indeterminate_evaluation(
         writer.log(entry);
         writer.detach_worker_on_drop();
     }
+    blocking_verdict_exit_code(protocol, delivery)
 }
 
 /// Handle hook input that could not be parsed (issue #160).
@@ -278,6 +319,7 @@ fn hook_protocol_for_agent(agent: &Agent) -> hook::HookProtocol {
         Agent::Hermes => hook::HookProtocol::Hermes,
         Agent::Grok => hook::HookProtocol::Grok,
         Agent::Antigravity => hook::HookProtocol::Antigravity,
+        Agent::Crush => hook::HookProtocol::Crush,
         _ => hook::HookProtocol::ClaudeCompatible,
     }
 }
@@ -287,7 +329,7 @@ fn handle_unparseable_hook_input(
     detected_agent: &Agent,
     read_err: &hook::HookReadError,
     max_input_bytes: usize,
-) {
+) -> i32 {
     // Block when fail-closed AND the failure is an attacker-influenceable
     // payload problem: a JSON parse error OR an oversized input (padding a
     // command past the size limit must not skip evaluation under fail-closed —
@@ -310,7 +352,8 @@ fn handle_unparseable_hook_input(
         } else {
             HistoryOutcome::Allow
         };
-        let mut writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        let mut writer =
+            HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
         writer.limit_drop_wait_to(HOOK_EVALUATION_BUDGET);
         let entry = build_history_entry(
             detected_agent.config_key(),
@@ -334,18 +377,18 @@ fn handle_unparseable_hook_input(
         // only under verbose.
         match read_err {
             hook::HookReadError::InputTooLarge { len, .. } => {
-                eprintln!(
+                emit_stderr!(
                     "[dcg] Warning: stdin input ({len} bytes) exceeds limit ({max_input_bytes} bytes); allowing command (fail-open)"
                 );
             }
             _ if config.general.verbose => {
-                eprintln!(
+                emit_stderr!(
                     "[dcg] Warning: could not parse hook input; allowing command (fail-open)"
                 );
             }
             _ => {}
         }
-        return;
+        return EXIT_SUCCESS;
     }
 
     // Fail-closed: emit an agent-appropriate denial. Without a parsed payload we
@@ -359,7 +402,7 @@ fn handle_unparseable_hook_input(
         "BLOCKED by dcg: the hook input could not be parsed; DCG_FAIL_CLOSED is set \
          (fail-closed mode). Fix the malformed hook payload or unset DCG_FAIL_CLOSED."
     };
-    hook::output_denial_for_protocol(
+    let delivery = hook::output_denial_for_protocol(
         protocol,
         "<unparseable hook input>",
         reason,
@@ -373,6 +416,7 @@ fn handle_unparseable_hook_input(
         &[],
         None,
     );
+    blocking_verdict_exit_code(protocol, delivery)
 }
 
 /// Overlap between consecutive scan windows of an over-limit command, so a
@@ -435,9 +479,9 @@ fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command
 /// evaluation. The JSON prefix that WAS read usually still contains
 /// `tool_input.command`, so extract it leniently and run it through the
 /// normal evaluation pipeline. A proven Deny/Ask publishes the ordinary
-/// protocol response and returns `true`; every other outcome — nothing
+/// protocol response and returns its exit code; every other outcome — nothing
 /// extractable, benign command, warn/log match, deadline exhausted — returns
-/// `false` so the caller keeps the historic fail-open warning path.
+/// `None` so the caller keeps the historic fail-open warning path.
 ///
 /// Two attribution rules keep this from over-denying and from under-scanning:
 /// - The prefix must name a recognized SHELL tool (`tool_name`/`toolName`).
@@ -461,12 +505,10 @@ fn try_deny_oversized_input(
     compiled_overrides: &CompiledOverrides,
     heredoc_settings: &HeredocSettings,
     external_store: &destructive_command_guard::packs::ExternalPackStore,
-) -> bool {
+) -> Option<i32> {
     // Attribute the payload to a shell tool before evaluating anything. The
     // dialect comes from the same mapping the normal parsed path uses.
-    let Some((_tool_name, shell_dialect)) = hook::shell_tool_from_truncated_json(prefix) else {
-        return false;
-    };
+    let (_tool_name, shell_dialect) = hook::shell_tool_from_truncated_json(prefix)?;
 
     // The padding may live INSIDE the command string (the issue's repro
     // shape), either before or after the destructive part. Evaluating an
@@ -480,7 +522,7 @@ fn try_deny_oversized_input(
         push_oversized_scan_windows(&mut commands, &command, max_command_bytes);
     }
     if commands.is_empty() {
-        return false;
+        return None;
     }
 
     // Recover the protocol from a complete oversized envelope when possible;
@@ -538,6 +580,10 @@ fn try_deny_oversized_input(
         // Only the truncated prefix of an oversized payload is available
         // here; its envelope fields were never parsed.
         hook_cwd: None,
+        // With the envelope unparsed the harness-reported cwd is unknown, and
+        // the hook process's own cwd is not a substitute for it, so
+        // directory-scoped allowlist entries fail closed here (#387).
+        scope_base: None,
         working_dir: &working_dir,
         deadline,
         hook_protocol,
@@ -576,29 +622,31 @@ fn try_deny_oversized_input(
             {
                 let mut history_writer = if config.history.enabled {
                     let mut writer =
-                        HistoryWriter::new(history_db_path(&config.history), &config.history);
+                        HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
                     writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
                     Some(writer)
                 } else {
                     None
                 };
-                publish_decisive_response(
+                let exit_code = publish_decisive_response(
                     &eval_context,
                     ResolvedCommandOutcome::DenyFamily(resolved),
                     &mut history_writer,
                 );
-                return true;
+                // Dropped here, before the caller can `process::exit`: the
+                // audit row must be flushed first.
+                drop(history_writer);
+                return Some(exit_code);
             }
             outcome @ ResolvedCommandOutcome::DeadlineExhausted { .. }
                 if hook_protocol == hook::HookProtocol::CodexAsk =>
             {
-                publish_decisive_response(&eval_context, outcome, &mut None);
-                return true;
+                return Some(publish_decisive_response(&eval_context, outcome, &mut None));
             }
             _ => {}
         }
     }
-    false
+    None
 }
 
 /// Process-wide registry of shutdown actions.
@@ -650,10 +698,43 @@ fn install_signal_shutdown_handler() {
     // (in registration order), then exits 130. Code 130 is the canonical
     // "interrupted by SIGINT" status (128 + SIGINT(2)).
     let _ = ctrlc::set_handler(|| {
-        eprintln!("[dcg] Flushing on signal...");
+        emit_stderr!("[dcg] Flushing on signal...");
         run_shutdown_actions();
         std::process::exit(130);
     });
+}
+
+/// Convert the standard library's `EPIPE` print panic into a clean exit.
+///
+/// `SIGPIPE` is deliberately left ignored (see `output::emit` for why a hook
+/// binary must not die on a stderr write while its stdout verdict may still
+/// have a reader), so a `println!`/`eprintln!` to a pipe whose reader has
+/// gone away panics instead. Under the release profile's `panic = "abort"`
+/// that panic used to become `SIGABRT` plus a core dump, and in hook mode it
+/// dropped the verdict on the floor (issue #389). The hook path itself now
+/// writes through the non-panicking `emit_*` helpers; this backstop covers the
+/// CLI surface (`dcg packs | head -1`, …) and any diagnostic that slips
+/// through, and exits with `EXIT_BROKEN_PIPE` — the status of a C tool killed
+/// by `SIGPIPE`, reached without a signal death.
+///
+/// Every other panic still goes to the default hook and keeps its existing
+/// behaviour; only the exact standard-library broken-pipe message is claimed.
+fn install_broken_pipe_backstop() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let is_broken_pipe = info
+            .payload_as_str()
+            .is_some_and(destructive_command_guard::output::emit::is_broken_pipe_print_panic);
+        if is_broken_pipe {
+            // Deliberately no `run_shutdown_actions()` here, unlike the SIGINT
+            // handler: a panic hook can run on a thread that already holds
+            // the shutdown registry (a flush action that itself hit EPIPE),
+            // and a deadlocked panic hook is strictly worse than an unflushed
+            // history row for a process whose reader has already left.
+            std::process::exit(EXIT_BROKEN_PIPE);
+        }
+        default_hook(info);
+    }));
 }
 
 fn install_history_shutdown_handler(
@@ -804,6 +885,12 @@ struct HookEvalContext<'a> {
     /// it (#331). Allow-once and history keep using `cwd_path`, the path the
     /// matching CLI commands resolve from.
     hook_cwd: Option<&'a Path>,
+    /// Base directory for matching directory-scoped (`paths = [...]`)
+    /// allowlist entries: the directory the harness says the command runs in,
+    /// before any `cd` on the command line itself is applied (#387). `None`
+    /// means dcg could not determine it, which makes every path-scoped grant
+    /// inapplicable — a grant that cannot be located does not apply.
+    scope_base: Option<&'a Path>,
     working_dir: &'a str,
     deadline: &'a Deadline,
     hook_protocol: hook::HookProtocol,
@@ -890,7 +977,10 @@ fn attempt_rebase_recovery(
         &relaxed,
         ctx.heredoc_settings,
         None,
-        ctx.cwd_path,
+        // The residual scan re-runs the same line, so it must scope
+        // path-aware allowlist entries to the same directory the recovery
+        // probe used — the one the command actually reaches (#387).
+        Some(recovery_cwd.as_path()),
         Some(ctx.deadline),
         shell_dialect,
     );
@@ -957,6 +1047,18 @@ fn resolve_hook_command(
         };
     }
 
+    // The directory THIS command runs in: what the harness reported, moved by
+    // any static `cd` on the line (#387). `None` — unknowable — leaves every
+    // `paths = [...]` allowlist entry inapplicable rather than applying it
+    // against a directory that has nothing to do with the command.
+    let scope_cwd = ctx.scope_base.and_then(|base| {
+        destructive_command_guard::rebase_recovery::resolve_effective_cwd(
+            base,
+            command,
+            shell_dialect,
+        )
+    });
+
     // Use the shared evaluator for hook mode parity with `dcg test`.
     let eval_start = Instant::now();
     let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
@@ -967,8 +1069,8 @@ fn resolve_hook_command(
         ctx.compiled_overrides,
         ctx.allowlists,
         ctx.heredoc_settings,
-        None,         // allow_once_audit
-        ctx.cwd_path, // project_path: scopes path-aware allowlist entries (#186)
+        None,                 // allow_once_audit
+        scope_cwd.as_deref(), // project_path: scopes path-aware allowlist entries (#186, #387)
         Some(ctx.deadline),
         shell_dialect,
     );
@@ -1058,7 +1160,7 @@ fn resolve_hook_command(
                 // Inform on stderr (visible to the agent and to humans).
                 // Stays silent when stderr isn't a TTY and robot mode is on,
                 // but the message itself is always safe to emit.
-                eprintln!(
+                emit_stderr!(
                     "[dcg] Allowing `{}` → rebase-recovery mode ({})",
                     pattern.as_deref().unwrap_or("<unknown>"),
                     reason.label()
@@ -1144,27 +1246,32 @@ fn resolve_hook_command(
 /// Publish the single protocol response for the decisive resolved outcome,
 /// with its history row — the decisive entry's row, exactly as the
 /// single-command flow records it.
+///
+/// Returns the process exit status: `EXIT_SUCCESS` whenever the verdict
+/// reached stdout (or needed no stdout), the protocol's blocking status when
+/// a deny, ask, or indeterminate verdict could not be written (see
+/// `blocking_verdict_exit_code`).
 #[allow(clippy::too_many_lines)]
 fn publish_decisive_response(
     ctx: &HookEvalContext<'_>,
     outcome: ResolvedCommandOutcome,
     history_writer: &mut Option<HistoryWriter>,
-) {
+) -> i32 {
     let resolved = match outcome {
         // Never selected as decisive; the caller only publishes non-allow
         // outcomes.
-        ResolvedCommandOutcome::Allow(_) => return,
+        ResolvedCommandOutcome::Allow(_) => return EXIT_SUCCESS,
         ResolvedCommandOutcome::OversizedCommand { command_len } => {
             let reason = format_oversized_command_reason(command_len, ctx.max_command_bytes);
-            hook::output_indeterminate_for_protocol(
+            let delivery = hook::output_indeterminate_for_protocol(
                 ctx.hook_protocol,
                 &reason,
                 ctx.config.unverified_denies(),
             );
-            return;
+            return blocking_verdict_exit_code(ctx.hook_protocol, delivery);
         }
         ResolvedCommandOutcome::DeadlineExhausted { command, stage } => {
-            handle_indeterminate_evaluation(
+            return handle_indeterminate_evaluation(
                 ctx.hook_protocol,
                 history_writer.as_mut(),
                 ctx.history_agent_type,
@@ -1174,7 +1281,6 @@ fn publish_decisive_response(
                 ctx.deadline,
                 ctx.config.unverified_denies(),
             );
-            return;
         }
         ResolvedCommandOutcome::DenyFamily(resolved) => resolved,
     };
@@ -1188,7 +1294,7 @@ fn publish_decisive_response(
     let Some(ref info) = result.pattern_info else {
         // Unreachable by construction: resolve_hook_command only builds a
         // DenyFamily when pattern_info is present.
-        return;
+        return EXIT_SUCCESS;
     };
     let pack = info.pack_id.as_deref();
     let pattern = info.pattern_name.as_deref();
@@ -1269,7 +1375,7 @@ fn publish_decisive_response(
                     // used to be swallowed, so allow-once issuance could stop
                     // silently and permanently. The block still stands; say so.
                     Err(e) => {
-                        eprintln!(
+                        emit_stderr!(
                             "[dcg] Warning: could not record an allow-once code for this block ({e}); the block still stands."
                         );
                     }
@@ -1281,7 +1387,7 @@ fn publish_decisive_response(
             } else {
                 None
             };
-            if mode == DecisionMode::Ask {
+            let delivery = if mode == DecisionMode::Ask {
                 hook::output_review_request_for_protocol(
                     ctx.hook_protocol,
                     &command,
@@ -1295,7 +1401,7 @@ fn publish_decisive_response(
                     None, // confidence not yet available in PatternMatch
                     info.suggestions,
                     branch_ctx,
-                );
+                )
             } else {
                 hook::output_denial_for_protocol(
                     ctx.hook_protocol,
@@ -1310,8 +1416,8 @@ fn publish_decisive_response(
                     None, // confidence not yet available in PatternMatch
                     info.suggestions,
                     branch_ctx,
-                );
-            }
+                )
+            };
 
             // Log if configured
             if let Some(log_file) = &ctx.config.general.log_file {
@@ -1320,10 +1426,14 @@ fn publish_decisive_response(
 
             // Review-capable clients receive ask; all others receive their
             // ordinary blocking response. Returning normally lets
-            // `HistoryWriter::Drop` flush the buffered audit entry.
+            // `HistoryWriter::Drop` flush the buffered audit entry before the
+            // caller acts on a fail-closed exit status.
+            blocking_verdict_exit_code(ctx.hook_protocol, delivery)
         }
         DecisionMode::Warn => {
-            hook::output_warning_for_protocol(
+            // A warning that never reaches the host is harmless: the command
+            // was going to proceed either way, so this stays exit 0.
+            let _ = hook::output_warning_for_protocol(
                 ctx.hook_protocol,
                 &command,
                 &info.reason,
@@ -1331,9 +1441,10 @@ fn publish_decisive_response(
                 pattern,
                 explanation,
             );
+            EXIT_SUCCESS
         }
         // Unreachable: Log-mode entries are handled at resolve time.
-        DecisionMode::Log => {}
+        DecisionMode::Log => EXIT_SUCCESS,
     }
 }
 
@@ -1341,29 +1452,40 @@ fn publish_decisive_response(
 // are now in the hook module. Use hook::output_denial() for all denial responses.
 
 /// Print version information and exit.
+///
+/// Output contract: the bare semver is the ONLY line on stdout (installers
+/// and `dcg update` read it with `--version 2>/dev/null | head -1`), and it is
+/// written first. The banner and the build-provenance lines (`Built:`,
+/// `Commit:`, `Git SHA:`, `Rustc …:`) go to stderr, where
+/// `scripts/perf_baseline.py` and the README's troubleshooting guidance
+/// expect them; they are kept for that reason rather than trimmed to a
+/// one-liner. Every write is best-effort: with `SIGPIPE` ignored, a reader
+/// that stops early (`dcg --version 2>&1 | head -1`) makes the remaining
+/// writes fail with `EPIPE`, and that must end in a normal exit 0 — not the
+/// SIGABRT core dump of issue #389.
 fn print_version() {
     // Machine-readable version on stdout (for scripts, installers, etc.)
-    println!("{PKG_VERSION}");
+    emit_stdout!("{PKG_VERSION}");
 
     // ASCII art logo - compact shield design
-    eprintln!();
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!(
         "  {}",
         "╭─────────────────────────────────────────╮".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}  🛡  {}               {}",
         "│".bright_black(),
         "Destructive Command Guard".white().bold(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}     {}                           {}",
         "│".bright_black(),
         format!("dcg v{PKG_VERSION}").cyan().bold(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}                                         {}",
         "│".bright_black(),
         "│".bright_black()
@@ -1373,7 +1495,7 @@ fn print_version() {
     if let Some(ts) = BUILD_TIMESTAMP {
         // Extract just the date part for cleaner display
         let date = ts.split('T').next().unwrap_or(ts);
-        eprintln!(
+        emit_stderr!(
             "  {}  {} {}                   {}",
             "│".bright_black(),
             "Built:".bright_black(),
@@ -1382,7 +1504,7 @@ fn print_version() {
         );
     }
     if let Some(rustc) = RUSTC_SEMVER {
-        eprintln!(
+        emit_stderr!(
             "  {}  {} {}                      {}",
             "│".bright_black(),
             "Rustc:".bright_black(),
@@ -1401,12 +1523,12 @@ fn print_version() {
     ] {
         if let Some(value) = value {
             if !value.is_empty() && value != "VERGEN_IDEMPOTENT_OUTPUT" {
-                eprintln!("{label}: {value}");
+                emit_stderr!("{label}: {value}");
             }
         }
     }
     if let Some(target) = CARGO_TARGET {
-        eprintln!(
+        emit_stderr!(
             "  {}  {} {}         {}",
             "│".bright_black(),
             "Target:".bright_black(),
@@ -1418,7 +1540,7 @@ fn print_version() {
     // ahead of the tag (`v0.11.0-7-gabc1234` / `-dirty`).
     if let Some(describe) = GIT_DESCRIBE {
         if !describe.is_empty() && describe != "VERGEN_IDEMPOTENT_OUTPUT" {
-            eprintln!(
+            emit_stderr!(
                 "  {}  {} {}                {}",
                 "│".bright_black(),
                 "Commit:".bright_black(),
@@ -1432,30 +1554,35 @@ fn print_version() {
     // stderr so stdout remains the single machine-readable semver line.
     if let Some(sha) = GIT_SHA {
         if !sha.is_empty() && sha != "VERGEN_IDEMPOTENT_OUTPUT" {
-            eprintln!("Git SHA: {sha}");
+            emit_stderr!("Git SHA: {sha}");
         }
     }
 
-    eprintln!(
+    emit_stderr!(
         "  {}                                         {}",
         "│".bright_black(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}  {}  {}",
         "│".bright_black(),
         "Protecting your code from destructive ops".green(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}",
         "╰─────────────────────────────────────────╯".bright_black()
     );
-    eprintln!();
+    emit_stderr!();
 }
 
 #[allow(clippy::too_many_lines)]
 fn main() {
+    // Must run before the first write of any kind: every later `println!` in
+    // the CLI surface relies on it to turn a closed pipe into a clean exit
+    // instead of a SIGABRT core dump (issue #389).
+    install_broken_pipe_backstop();
+
     // Configure colors based on TTY detection
     configure_colors();
 
@@ -1479,7 +1606,7 @@ fn main() {
         Ok(cli) => cli,
         Err(e) => {
             let exit_code = e.exit_code();
-            eprintln!("{e}");
+            emit_stderr!("{e}");
             std::process::exit(exit_code);
         }
     };
@@ -1501,7 +1628,7 @@ fn main() {
     // If there's a subcommand, handle it and exit.
     if cli.command.is_some() {
         if let Err(e) = cli::run_command(cli) {
-            eprintln!("Error: {e}");
+            emit_stderr!("Error: {e}");
             std::process::exit(1);
         }
         return;
@@ -1566,7 +1693,7 @@ fn main() {
     // verbose-only. The store only records warnings on failures, so success
     // stays silent — one stderr line per broken file.
     for warning in external_store.warnings() {
-        eprintln!("[dcg] Warning: {warning}");
+        emit_stderr!("[dcg] Warning: {warning}");
     }
 
     let hook_input = match hook_read {
@@ -1591,7 +1718,7 @@ fn main() {
                     ..
                 } = &read_err
                 {
-                    if try_deny_oversized_input(
+                    if let Some(exit_code) = try_deny_oversized_input(
                         &config,
                         &detected_agent,
                         prefix,
@@ -1601,11 +1728,14 @@ fn main() {
                         &heredoc_settings,
                         external_store,
                     ) {
+                        finish_hook_mode(exit_code);
                         return;
                     }
                 }
             }
-            handle_unparseable_hook_input(&config, &detected_agent, &read_err, max_input_bytes);
+            let exit_code =
+                handle_unparseable_hook_input(&config, &detected_agent, &read_err, max_input_bytes);
+            finish_hook_mode(exit_code);
             return;
         }
     };
@@ -1638,7 +1768,12 @@ fn main() {
     // bytes are identical either way.
     if additional_commands.is_empty() && command.len() > max_command_bytes {
         let reason = format_oversized_command_reason(command.len(), max_command_bytes);
-        hook::output_indeterminate_for_protocol(hook_protocol, &reason, config.unverified_denies());
+        let delivery = hook::output_indeterminate_for_protocol(
+            hook_protocol,
+            &reason,
+            config.unverified_denies(),
+        );
+        finish_hook_mode(blocking_verdict_exit_code(hook_protocol, delivery));
         return;
     }
 
@@ -1687,7 +1822,8 @@ fn main() {
     );
 
     let mut history_writer = if config.history.enabled {
-        let mut writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        let mut writer =
+            HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
         writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
         Some(writer)
     } else {
@@ -1702,6 +1838,19 @@ fn main() {
 
     let hook_cwd = hook_input.cwd.as_deref().map(Path::new);
 
+    // Directory-scoped allowlist entries are judged against the directory the
+    // harness says the command will run in, never the hook process's own
+    // `getcwd()` — the two agree only when dcg is run by hand from a prompt
+    // (#387). When the payload reports a cwd dcg cannot use (relative, or not
+    // a directory) the process cwd is not a substitute, so scoping fails
+    // closed. Only when the payload carries no `cwd` at all — protocols that
+    // omit it, and JSON piped in by hand — is the process cwd the sole
+    // available signal.
+    let scope_base = match hook_cwd {
+        Some(path) => Some(path).filter(|path| path.is_absolute() && path.is_dir()),
+        None => cwd_path.as_deref(),
+    };
+
     let eval_context = HookEvalContext {
         config: &config,
         enabled_keywords: &enabled_keywords,
@@ -1712,6 +1861,7 @@ fn main() {
         heredoc_settings: &heredoc_settings,
         cwd_path: cwd_path.as_deref(),
         hook_cwd,
+        scope_base,
         working_dir: &working_dir,
         deadline: &deadline,
         hook_protocol,
@@ -1764,255 +1914,263 @@ fn main() {
         }
     }
 
-    if let Some(outcome) = decisive {
-        publish_decisive_response(&eval_context, outcome, &mut history_writer);
-    } else if let Some(entry) = primary_allow_row {
+    let exit_code = if let Some(outcome) = decisive {
+        publish_decisive_response(&eval_context, outcome, &mut history_writer)
+    } else {
         // All-allow request: record exactly one history Allow row, for the
         // primary command, matching the single-command flow.
-        if let Some(writer) = history_writer.as_ref() {
-            writer.log(*entry);
+        if let Some(entry) = primary_allow_row {
+            if let Some(writer) = history_writer.as_ref() {
+                writer.log(*entry);
+            }
         }
-    }
+        EXIT_SUCCESS
+    };
+
+    // A fail-closed exit goes through `process::exit`, which skips `Drop`:
+    // flush the audit row first.
+    drop(history_writer);
+    finish_hook_mode(exit_code);
 }
 
 /// Print help information.
 #[allow(clippy::too_many_lines)]
 fn print_help() {
-    eprintln!();
-    eprintln!("  🛡  {} {}", "dcg".green().bold(), PKG_VERSION.cyan());
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!("  🛡  {} {}", "dcg".green().bold(), PKG_VERSION.cyan());
+    emit_stderr!(
         "     {}",
         "Destructive Command Guard - multi-agent safety hook".bright_black()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Usage section
-    eprintln!("  {}", "USAGE".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
-    eprintln!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent,");
-    eprintln!("    OpenCode, and Oh My Pi (omp).");
-    eprintln!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
-    eprintln!();
+    emit_stderr!("  {}", "USAGE".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
+    emit_stderr!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent,");
+    emit_stderr!("    OpenCode, and Oh My Pi (omp).");
+    emit_stderr!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
+    emit_stderr!();
 
     // Configuration section
-    eprintln!("  {}", "CONFIGURATION".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!("    Installers configure supported agent hooks automatically.");
-    eprintln!(
+    emit_stderr!("  {}", "CONFIGURATION".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!("    Installers configure supported agent hooks automatically.");
+    emit_stderr!(
         "    Common Claude Code config in {}:",
         "~/.claude/settings.json".cyan()
     );
-    eprintln!();
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!(
         "    {}",
         "Hook commands must use the resolved absolute dcg executable path.".white()
     );
-    eprintln!(
+    emit_stderr!(
         "    Run {} to install or repair it safely.",
         "dcg install".green()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Options section
-    eprintln!("  {}", "OPTIONS".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "OPTIONS".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    {}     Print version information",
         "--version, -V".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}        Print this help message",
         "--help, -h".green()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Commands section
-    eprintln!("  {}", "COMMANDS".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "COMMANDS".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    {}         Test a command against enabled packs",
         "test".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}      Explain why a command would be blocked/allowed",
         "explain".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}       Check installation and hook registration",
         "doctor".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}        List all available packs and their status",
         "packs".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}         Pack management commands (info, validate)",
         "pack".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}    Manage allowlist entries (add, list, remove)",
         "allowlist".green()
     );
-    eprintln!("    {}        Add a rule to the allowlist", "allow".green());
-    eprintln!(
+    emit_stderr!("    {}        Add a rule to the allowlist", "allow".green());
+    emit_stderr!(
         "    {}      Remove a rule from the allowlist",
         "unallow".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}   Allow a blocked command once via short code",
         "allow-once".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}    Create a new file from stdin without overwriting",
         "create-new".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}         Scan files for destructive commands",
         "scan".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}     Simulate policy evaluation on command logs",
         "simulate".green()
     );
-    eprintln!("    {}       Show current configuration", "config".green());
-    eprintln!(
+    emit_stderr!("    {}       Show current configuration", "config".green());
+    emit_stderr!(
         "    {}         Generate a sample configuration file",
         "init".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}      Install the hook into Claude Code settings",
         "install".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}    Remove the hook from Claude Code settings",
         "uninstall".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}       Update dcg to the latest release",
         "update".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}        Show local statistics from the log file",
         "stats".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}      Query command history database",
         "history".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}  Suggest allowlist patterns from history",
         "suggest-allowlist".green()
     );
-    eprintln!("    {}       Run regression corpus tests", "corpus".green());
-    eprintln!(
+    emit_stderr!("    {}       Run regression corpus tests", "corpus".green());
+    emit_stderr!(
         "    {}         Run in explicit hook mode (batch support)",
         "hook".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}  Generate shell completion scripts",
         "completions".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}          Developer tools for pack development",
         "dev".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}   Start MCP server for agent integration",
         "mcp-server".green()
     );
-    eprintln!();
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!(
         "    Run {} for detailed help on a command.",
         "dcg <command> --help".cyan()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Environment section
-    eprintln!("  {}", "ENVIRONMENT".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "ENVIRONMENT".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    {}=0-3     Verbosity level (0 = quiet, 3 = trace)",
         "DCG_VERBOSE".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1       Suppress non-error output",
         "DCG_QUIET".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1    Disable colored output (same as NO_COLOR)",
         "DCG_NO_COLOR".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=text|json|sarif  Default output format (command-specific).",
         "DCG_FORMAT".green()
     );
-    eprintln!("                          `sarif` is real SARIF only for `dcg scan`; on every");
-    eprintln!("                          other command `sarif`/`structured` is an alias for");
-    eprintln!("                          JSON, and `text` an alias for pretty. Per-command");
-    eprintln!("                          accepted values: see `dcg <command> --help`.");
-    eprintln!(
+    emit_stderr!("                          `sarif` is real SARIF only for `dcg scan`; on every");
+    emit_stderr!("                          other command `sarif`/`structured` is an alias for");
+    emit_stderr!("                          JSON, and `text` an alias for pretty. Per-command");
+    emit_stderr!("                          accepted values: see `dcg <command> --help`.");
+    emit_stderr!(
         "    {}=/path  Use explicit config file",
         "DCG_CONFIG".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=ms  Hook evaluation timeout budget",
         "DCG_HOOK_TIMEOUT_MS".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1      Robot mode for AI agents (JSON output, no stderr)",
         "DCG_ROBOT".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1  Block (deny) on unparseable hook input (default: fail-open)",
         "DCG_FAIL_CLOSED".green()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Blocked commands section
-    eprintln!("  {}", "BLOCKED COMMANDS".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!();
-    eprintln!(
+    emit_stderr!("  {}", "BLOCKED COMMANDS".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!();
+    emit_stderr!(
         "    {} {}",
         "Git".red().bold(),
         "(core.git pack)".bright_black()
     );
-    eprintln!("      {} git reset --hard", "•".red());
-    eprintln!("      {} git checkout -- <path>", "•".red());
-    eprintln!("      {} git restore (without --staged)", "•".red());
-    eprintln!("      {} git clean -f", "•".red());
-    eprintln!("      {} git push --force", "•".red());
-    eprintln!("      {} git branch -D", "•".red());
-    eprintln!("      {} git stash drop/clear", "•".red());
-    eprintln!();
-    eprintln!(
+    emit_stderr!("      {} git reset --hard", "•".red());
+    emit_stderr!("      {} git checkout -- <path>", "•".red());
+    emit_stderr!("      {} git restore (without --staged)", "•".red());
+    emit_stderr!("      {} git clean -f", "•".red());
+    emit_stderr!("      {} git push --force", "•".red());
+    emit_stderr!("      {} git branch -D", "•".red());
+    emit_stderr!("      {} git stash drop/clear", "•".red());
+    emit_stderr!();
+    emit_stderr!(
         "    {} {}",
         "Filesystem".red().bold(),
         "(core.filesystem pack)".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "      {} rm -rf outside literal /tmp and /var/tmp subtrees",
         "•".red()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Additional packs note. These IDs must be real pack IDs that resolve via
     // `dcg pack info <id>` — listing non-existent IDs here misleads users into
     // trying to enable packs that don't exist (see issue #152).
-    eprintln!("    📦 Additional packs: containers.docker, kubernetes.kubectl,");
-    eprintln!("       database.postgresql, infrastructure.terraform, and more.");
-    eprintln!();
+    emit_stderr!("    📦 Additional packs: containers.docker, kubernetes.kubectl,");
+    emit_stderr!("       database.postgresql, infrastructure.terraform, and more.");
+    emit_stderr!();
 
     // Links section
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    📖 {}",
         "https://github.com/Dicklesworthstone/destructive_command_guard"
             .blue()
             .underline()
     );
-    eprintln!();
+    emit_stderr!();
 }
 
 #[cfg(test)]

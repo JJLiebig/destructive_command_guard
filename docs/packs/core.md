@@ -33,6 +33,7 @@ These patterns match safe commands that are always allowed:
 | `restore-staged-short` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree\|-W)\b)` |
 | `clean-dry-run-short` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+-[a-z]*n[a-z]*` |
 | `clean-dry-run-long` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+--dry-run` |
+| `lfs-prune-dry-run` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*lfs\s+prune(?:\s+[^\s;&\|<>\x22']+)*\s+--dry-run(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -55,6 +56,9 @@ These patterns match potentially destructive commands:
 | `branch-force-delete` | git branch deletion or forced ref updates require explicit user approval. | high |
 | `stash-drop` | git stash drop deletes a single stash. Recoverable via `git fsck` (unreachable objects). | medium |
 | `stash-clear` | git stash clear permanently deletes ALL stashed changes. | critical |
+| `lfs-migrate-rewrite` | git lfs migrate import/export rewrites history — every commit in the range gets a new SHA. | high |
+| `lfs-prune` | git lfs prune deletes local LFS objects; with --force it deletes objects the remote does not have. | medium |
+| `lfs-uninstall` | git lfs uninstall removes the LFS filters and hooks, so LFS files check out as pointer text. | medium |
 
 ### Allowlist Guidance
 
@@ -98,6 +102,11 @@ Commands containing these keywords are checked against this pack:
 - `cp`
 - `ln`
 - `rsync`
+- `tee`
+- `sponge`
+- `install`
+- `sed`
+- `perl`
 - `>/`
 - `> /`
 - `>~`
@@ -193,7 +202,8 @@ These patterns match potentially destructive commands:
 | `dd-overwrite-general` | dd with of=<file> overwrites file contents and requires human approval. | high |
 | `mv-sensitive-source-root-home` | mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS. | critical |
 | `mv-dynamic-path` | mv with a shell-expanded or escaped path cannot be verified before execution. | high |
-| `redirect-truncate-root-home` | shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target inside an existing home-directory VCS worktree is allowed; dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked. | critical |
+| `credential-file-write` | writing a credential, private-key, login-shell startup, or system authentication file (`~/.ssh/*`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the shell rc files and `~/.bashrc.d`/`~/.zshrc.d`, `/etc/sudoers*`, `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/ssh/*`) with `>`, `>>`, `tee`, `cp`/`mv`/`install`/`ln`, `dd of=`, or `sed -i` installs persistent access or replaces the trust this machine runs on, whether or not the file exists yet. Reads and `chmod`/`chown` are unaffected; appending to `~/.ssh/known_hosts` stays allowed. | critical |
+| `redirect-truncate-root-home` | shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target under the home directory with an existing parent is allowed (creation, not truncation — the same thing `>>` would do); existing files, dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked. | critical |
 | `redirect-truncate-dynamic-path` | shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval. | high |
 | `fork-bomb` | This is a fork bomb: it recursively spawns processes until the system is unusable. | critical |
 

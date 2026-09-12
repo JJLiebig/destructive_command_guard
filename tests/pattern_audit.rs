@@ -211,12 +211,20 @@ fn test_audit_backtracking_requirements() {
         (
             "cloud.azure",
             HashSet::from([
-                "az-account",
-                "az-configure",
+                "az-help",
+                "az-help-short",
                 "az-list",
-                "az-login",
                 "az-show",
-                "az-version",
+                // `az account` descendants and the management-group guard
+                // on `group-delete` (#384).
+                "group-delete",
+                "account-alias-delete",
+                "account-clear",
+                "account-lock-delete",
+                "account-management-group-delete",
+                "account-management-group-hierarchy-settings-delete",
+                "account-management-group-subscription-remove",
+                "account-subscription-cancel",
             ]),
         ),
         (
@@ -354,6 +362,13 @@ fn test_audit_backtracking_requirements() {
                 "restore-worktree",
                 // Backreference pins redirect target == shown path (#373).
                 "show-redirect-overwrite-source",
+                // Git LFS verb guards (Refs PR #383). `lfs-prune-dry-run` is
+                // deliberately absent: 91715d5 replaced its trailing
+                // `(?![\w-])` lookahead with `(?:\s|$)`, so it runs on the
+                // linear engine again.
+                "lfs-migrate-rewrite",
+                "lfs-prune",
+                "lfs-uninstall",
             ]),
         ),
         (
@@ -366,8 +381,19 @@ fn test_audit_backtracking_requirements() {
                 "mongodump-no-drop",
             ]),
         ),
-        ("database.mysql", HashSet::from(["mysqldump-no-drop"])),
-        ("database.postgresql", HashSet::from(["pg-dump-no-clean"])),
+        // `truncate-table` needs the backtracking engine on purpose: separating
+        // SQL DDL from Tailwind's `truncate` utility class costs a
+        // punctuation-aware lookbehind and a "not followed by a hyphenated
+        // token" lookahead (issue #403). These packs are opt-in and the
+        // expression is anchored on a literal keyword, so the cost is bounded.
+        (
+            "database.mysql",
+            HashSet::from(["mysqldump-no-drop", "truncate-table"]),
+        ),
+        (
+            "database.postgresql",
+            HashSet::from(["pg-dump-no-clean", "truncate-table"]),
+        ),
         (
             "database.redis",
             HashSet::from([
@@ -710,6 +736,38 @@ fn test_audit_backtracking_requirements() {
             HashSet::from(["stripe-api-delete", "stripe-api-get"]),
         ),
         (
+            // Azure DevOps CLI extension (#385): every rule uses `(?<![\w-])`
+            // / `(?![\w-])` verb guards, so the whole pack backtracks.
+            "platform.azure_devops",
+            HashSet::from([
+                "az-devops-help",
+                "az-devops-help-short",
+                "boards-classification-node-delete",
+                "boards-work-item-delete",
+                "devops-extension-uninstall",
+                "devops-invoke-delete",
+                "devops-invoke-write",
+                "devops-logout",
+                "devops-project-delete",
+                "devops-security-group-delete",
+                "devops-security-group-membership-remove",
+                "devops-security-permission-reset",
+                "devops-security-permission-reset-all",
+                "devops-service-endpoint-delete",
+                "devops-team-delete",
+                "devops-user-remove",
+                "devops-wiki-delete",
+                "devops-wiki-page-delete",
+                "pipelines-delete",
+                "pipelines-folder-delete",
+                "pipelines-variable-delete",
+                "pipelines-variable-group-delete",
+                "repos-delete",
+                "repos-policy-delete",
+                "repos-ref-delete",
+            ]),
+        ),
+        (
             "platform.github",
             HashSet::from([
                 "gh-api-delete-actions-secret",
@@ -723,9 +781,13 @@ fn test_audit_backtracking_requirements() {
                 "gh-auth-status",
                 "gh-gist-delete",
                 "gh-gist-list-view",
+                "gh-help",
+                "gh-help-short",
+                "gh-help-topic",
                 "gh-issue-delete",
                 "gh-issue-list-view",
                 "gh-release-delete",
+                "gh-release-delete-asset",
                 "gh-release-list-view",
                 "gh-repo-archive",
                 "gh-repo-delete",

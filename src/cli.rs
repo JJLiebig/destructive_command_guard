@@ -18,9 +18,9 @@ use crate::evaluator::{
 use crate::exit_codes::{EXIT_DENIED, EXIT_WARNING};
 use crate::highlight::{HighlightSpan, format_highlighted_command, should_use_color};
 use crate::history::{
-    CommandEntry, ENV_HISTORY_DB_PATH, ExportOptions, HistoryDb, HistoryStats, HistoryWriter,
-    InteractiveAllowlistAuditEntry, InteractiveAllowlistOptionType, Outcome, SuggestionAction,
-    SuggestionAuditEntry,
+    CommandEntry, ENV_HISTORY_DISABLED, ExportOptions, HistoryDb, HistoryPathSource, HistoryStats,
+    HistoryWriter, InteractiveAllowlistAuditEntry, InteractiveAllowlistOptionType, Outcome,
+    ResolvedHistoryPath, SuggestionAction, SuggestionAuditEntry,
 };
 use crate::interactive::{
     AllowlistScope, InteractiveConfig, InteractiveResult, check_interactive_available,
@@ -307,7 +307,7 @@ pub enum Command {
     },
 
     /// Install the hook into Claude Code settings (or another agent with
-    /// `--grok`, `--agy`, `--opencode`, or `--omp`)
+    /// `--grok`, `--agy`, `--opencode`, `--omp`, or `--crush`)
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -324,7 +324,7 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp"])]
+        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush"])]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -332,7 +332,7 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp"])]
+        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush"])]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -342,7 +342,7 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long, conflicts_with_all = ["grok", "agy", "omp"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush"])]
         opencode: bool,
 
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
@@ -351,8 +351,17 @@ pub enum Command {
         /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
         /// extension discovery is cwd-only and does not walk Git ancestors.
         /// Every OMP bash tool call is routed through dcg before execution.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush"])]
         omp: bool,
+
+        /// Install the dcg PreToolUse hook for Charm Crush by merging a
+        /// `hooks.PreToolUse` entry (matcher `^bash$`) into
+        /// `~/.config/crush/crush.json` (user-level; honors `XDG_CONFIG_HOME`
+        /// and `CRUSH_GLOBAL_CONFIG`) or the repo's `crush.json` (with
+        /// `--project`). Crush pipes every bash tool call to dcg's stdin and
+        /// blocks the call when dcg answers `{"decision":"deny"}`.
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp"])]
+        crush: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -375,12 +384,17 @@ pub enum Command {
         no_shell_check: bool,
     },
 
-    /// Remove the hook from Claude Code settings
+    /// Remove the hook from Claude Code settings (or from Crush with `--crush`)
     #[command(name = "uninstall")]
     Uninstall {
         /// Also remove configuration files
         #[arg(long)]
         purge: bool,
+
+        /// Remove the dcg hook entry from `~/.config/crush/crush.json` instead
+        /// of Claude Code settings
+        #[arg(long, conflicts_with = "purge")]
+        crush: bool,
     },
 
     /// Update dcg to the latest release (re-runs the installer)
@@ -431,6 +445,17 @@ pub enum Command {
     },
 
     /// Test a command against enabled packs
+    ///
+    /// Two differences from the hook are worth knowing before you use this to
+    /// validate an override or replay a corpus of real blocks (#402):
+    ///
+    /// The hook evaluates the full tool payload, including heredoc bodies;
+    /// `dcg test` evaluates the command line you give it.
+    ///
+    /// The hook is told which tool it is gating, so a `Bash` payload is
+    /// evaluated as POSIX. `dcg test` has no such context and evaluates the
+    /// conservative union of the POSIX, PowerShell and Cmd views, which can
+    /// deny where the hook allows.
     #[command(name = "test")]
     TestCommand {
         /// Command to test
@@ -2392,6 +2417,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             agy,
             opencode,
             omp,
+            crush,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
@@ -2401,6 +2427,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 install_opencode_plugin(force, project)?;
             } else if omp {
                 install_omp_extension(force, project, true)?;
+            } else if crush {
+                install_crush_hook(force, project)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -2412,8 +2440,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             run_setup(force, shell_check, no_shell_check)?;
         }
-        Some(Command::Uninstall { purge }) => {
-            uninstall_hook(purge)?;
+        Some(Command::Uninstall { purge, crush }) => {
+            if crush {
+                uninstall_crush_hook()?;
+            } else {
+                uninstall_hook(purge)?;
+            }
         }
         Some(Command::Update(update)) => {
             self_update(update, config.general.update_pin)?;
@@ -2581,6 +2613,10 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {
                 if !verbosity.quiet {
+                    // The listing reports what actually evaluates, which
+                    // requires the external store (issue #402).
+                    let external_paths = config.packs.expand_custom_paths();
+                    let _ = load_external_packs(&external_paths);
                     match format {
                         ConfigFormat::Json => show_config_json(
                             &config,
@@ -3948,15 +3984,20 @@ fn pack_validate(
 
     // === Suggestions (informational) ===
 
-    // Suggest adding keywords if none defined
+    // A pack with no keywords is still fully evaluated (`Pack::might_match`),
+    // but it costs the process its global quick-reject fast path — a runtime
+    // property an operator should be told about, so this is a warning rather
+    // than the performance "suggestion" it used to be (issue #402).
     if pack.keywords.is_empty()
         && (!pack.destructive_patterns.is_empty() || !pack.safe_patterns.is_empty())
     {
-        result.suggestions.push(PackValidationIssue {
+        result.warnings.push(PackValidationIssue {
             code: "S001".to_string(),
             message: "No keywords defined".to_string(),
             suggestion: Some(
-                "Adding keywords improves performance by enabling quick-reject filtering"
+                "This pack is evaluated on every command, which disables dcg's global \
+                 quick-reject fast path for the whole process. Declaring keywords restores \
+                 it and does not change which commands the pack can block."
                     .to_string(),
             ),
         });
@@ -4469,7 +4510,7 @@ fn log_interactive_allowlist_audit_event(
         return Ok(());
     }
 
-    let db_path = config.history.expanded_database_path();
+    let db_path = Some(ResolvedHistoryPath::resolve(&config.history).path);
     let db = HistoryDb::open_with_max_size(db_path, config.history.max_size_mb)?;
 
     let cwd = std::env::current_dir()
@@ -4507,11 +4548,8 @@ const fn should_record_robot_history(robot_mode: bool, history_enabled: bool) ->
     robot_mode && history_enabled
 }
 
-fn robot_history_db_path(config: &crate::config::HistoryConfig) -> Option<std::path::PathBuf> {
-    if let Ok(path) = std::env::var(ENV_HISTORY_DB_PATH) {
-        return Some(std::path::PathBuf::from(path));
-    }
-    config.expanded_database_path()
+fn robot_history_db_path(config: &crate::config::HistoryConfig) -> std::path::PathBuf {
+    ResolvedHistoryPath::resolve(config).path
 }
 
 fn build_robot_history_entry(
@@ -4922,7 +4960,7 @@ fn test_command(
                 |path| path.to_string_lossy().into_owned(),
             );
             let mut writer = HistoryWriter::new(
-                robot_history_db_path(&effective_config.history),
+                Some(robot_history_db_path(&effective_config.history)),
                 &effective_config.history,
             );
             if let Some(deadline) = evaluation_deadline.as_ref() {
@@ -6346,6 +6384,54 @@ fn config_sources_json(sources: &[ConfigSourceOutcome]) -> Vec<serde_json::Value
         .collect()
 }
 
+/// Every pack id the runtime will actually evaluate, plus the configured ids
+/// that never loaded.
+///
+/// `dcg config` used to print `config.enabled_pack_ids()` verbatim, which is
+/// the *requested* set. That answered a different question from `dcg packs`
+/// and `dcg doctor`, so three of dcg's own surfaces reported three different
+/// answers about the same configuration (issue #402): a pack enabled only via
+/// `packs.custom_paths` was omitted even though it was firing, and a pack whose
+/// YAML failed to parse was listed as enabled even though it contributed
+/// nothing. Both halves are answered here, from the loaded store.
+///
+/// Returns `(active, unloaded)`, each sorted. `active` includes external packs
+/// that loaded; `unloaded` holds configured ids that are neither a registry
+/// pack nor a loaded external pack.
+fn resolved_pack_listing(config: &Config) -> (Vec<String>, Vec<String>) {
+    let external = get_external_packs();
+    let requested = config.enabled_pack_ids();
+    // Registry categories expand to the leaves that actually evaluate, which is
+    // what `dcg packs` ticks and `dcg doctor` counts.
+    let mut active: Vec<String> = crate::packs::REGISTRY.expand_enabled_ordered(&requested);
+    let mut unloaded: Vec<String> = Vec::new();
+    for id in requested {
+        let known_to_registry = id == "core"
+            || crate::packs::REGISTRY.get_entry(&id).is_some()
+            || !crate::packs::REGISTRY.packs_in_category(&id).is_empty();
+        if known_to_registry {
+            continue;
+        }
+        if external.is_some_and(|store| store.get(&id).is_some()) {
+            active.push(id);
+        } else {
+            unloaded.push(id);
+        }
+    }
+    if let Some(store) = external {
+        for id in store.pack_ids() {
+            if !active.iter().any(|existing| existing == id) {
+                active.push(id.clone());
+            }
+        }
+    }
+    active.sort();
+    active.dedup();
+    unloaded.sort();
+    unloaded.dedup();
+    (active, unloaded)
+}
+
 /// Show the current configuration and the exact source outcomes that produced it.
 fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     println!("Current configuration:");
@@ -6371,9 +6457,30 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     println!("  Hook self-heal: {}", config.general.self_heal_hook);
     println!("  Fail closed: {}", config.general.fail_closed);
     println!();
+    let (active_packs, unloaded_packs) = resolved_pack_listing(config);
+    let keywordless: &[String] =
+        get_external_packs().map_or(&[], crate::packs::ExternalPackStore::keywordless_pack_ids);
     println!("Enabled packs:");
-    for pack in config.enabled_pack_ids() {
-        println!("  - {pack}");
+    for pack in &active_packs {
+        if keywordless.iter().any(|id| id == pack) {
+            println!("  - {pack} (external, no keywords: evaluated on every command)");
+        } else if get_external_packs().is_some_and(|store| store.get(pack).is_some()) {
+            println!("  - {pack} (external)");
+        } else {
+            println!("  - {pack}");
+        }
+    }
+    for pack in &unloaded_packs {
+        println!("  - {pack} (configured but NOT loaded - contributes no rules)");
+    }
+    if let Some(warnings) = get_external_packs().map(crate::packs::ExternalPackStore::warnings)
+        && !warnings.is_empty()
+    {
+        println!();
+        println!("Pack load warnings:");
+        for warning in warnings {
+            println!("  - {warning}");
+        }
     }
     println!();
     println!("Disabled packs:");
@@ -6467,8 +6574,16 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
     );
 
     // Sort enabled packs for deterministic JSON output (the set is unordered).
-    let mut enabled_packs: Vec<String> = config.enabled_pack_ids().into_iter().collect();
-    enabled_packs.sort();
+    // `resolved_pack_listing` reports what actually evaluates, so a custom pack
+    // reached only through `packs.custom_paths` appears and a pack that failed
+    // to load does not (issue #402).
+    let (enabled_packs, unloaded_packs) = resolved_pack_listing(config);
+    let pack_load_warnings: Vec<String> = get_external_packs()
+        .map(|store| store.warnings().to_vec())
+        .unwrap_or_default();
+    let keywordless_packs: Vec<String> = get_external_packs()
+        .map(|store| store.keywordless_pack_ids().to_vec())
+        .unwrap_or_default();
 
     // Echo the enforcement-relevant sections so an automated check can assert
     // what is actually loaded (#327): before this, `jq '.overrides'` returned
@@ -6504,6 +6619,9 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
         "packs": {
             "enabled": enabled_packs,
             "disabled": config.packs.disabled,
+            "configured_but_not_loaded": unloaded_packs,
+            "external_without_keywords": keywordless_packs,
+            "load_warnings": pack_load_warnings,
         },
         "heredoc": {
             "enabled": heredoc.enabled,
@@ -8552,7 +8670,7 @@ fn handle_stats_rules(
     use chrono::{Duration, Utc};
 
     // Open history database
-    let db_path = config.history.expanded_database_path();
+    let db_path = Some(ResolvedHistoryPath::resolve(&config.history).path);
     let db = match HistoryDb::open_with_max_size(db_path, config.history.max_size_mb) {
         Ok(db) => db,
         Err(err) => {
@@ -9019,7 +9137,7 @@ fn handle_suggest_allowlist_command(
     };
 
     // Open history database
-    let db_path = config.history.expanded_database_path();
+    let db_path = Some(ResolvedHistoryPath::resolve(&config.history).path);
     let db = match HistoryDb::open_with_max_size(db_path, config.history.max_size_mb) {
         Ok(db) => db,
         Err(err) => {
@@ -9622,7 +9740,7 @@ fn handle_history_command(
     config: &Config,
     action: HistoryAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = config.history.expanded_database_path();
+    let db_path = Some(ResolvedHistoryPath::resolve(&config.history).path);
     let db = match HistoryDb::open_with_max_size(db_path, config.history.max_size_mb) {
         Ok(db) => db,
         Err(err) => {
@@ -10660,6 +10778,46 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
+    // Check 3b1: Crush hook registration (#388). Crush reads hooks only from
+    // its own crush.json — there is no Claude-settings compatibility layer to
+    // fall back on — so an unregistered hook means the guard is not guarding.
+    //
+    // `collect_doctor_report` carries the same check (id `crush_hook`).
+    if crush_appears_in_use() {
+        print!("Checking Crush hook registration... ");
+        let config_path = crush_user_config_path();
+        match crush_user_config_registers_dcg() {
+            Ok(true) => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", config_path.display());
+            }
+            Ok(false) => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                if fix {
+                    println!("  Attempting install...");
+                    if install_crush_hook_at(&config_path, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!(
+                        "  → Run 'dcg install --crush' to register the hook in {}",
+                        config_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                println!("{}", "INVALID".red());
+                issues += 1;
+                println!("  {} cannot be parsed: {err}", config_path.display());
+                println!("  → Fix the JSON by hand, then run 'dcg install --crush'");
+            }
+        }
+    }
+
     // Check 3b2: Codex hook registration AND enablement (#368). Codex loads
     // PreToolUse hooks from ~/.codex/hooks.json but only RUNS a hook the user
     // has approved: a `[hooks.state."<file>:pre_tool_use:<i>:<j>"]` entry in
@@ -10713,21 +10871,83 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                     );
                 }
             }
+            CodexHookProbe::HooksFileMissing => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                println!("  Codex is in use but ~/.codex/hooks.json does not exist");
+                println!(
+                    "  → Re-run the dcg install script to register the hook, then start \
+                     Codex once to approve it"
+                );
+                println!("    (Codex shell commands are NOT guarded until then)");
+            }
             CodexHookProbe::NotRegistered => {
                 println!("{}", "NOT REGISTERED".yellow());
                 issues += 1;
-                println!("  Codex is in use but ~/.codex/hooks.json has no dcg PreToolUse hook");
+                println!(
+                    "  ~/.codex/hooks.json loads, but has no dcg PreToolUse command hook \
+                     that selects Bash"
+                );
                 println!(
                     "  → Re-run the dcg install script to register it, then start Codex \
                      once to approve the hook"
                 );
                 println!("    (Codex shell commands are NOT guarded until then)");
             }
+            CodexHookProbe::Misplaced(detail) => {
+                println!("{}", "MISPLACED".red());
+                issues += 1;
+                println!(
+                    "  A dcg hook is in ~/.codex/hooks.json but not where Codex runs it for \
+                     shell commands:"
+                );
+                println!("  {detail}");
+                println!(
+                    "  → Register it under hooks.PreToolUse as {{\"matcher\": \"Bash\", \
+                     \"hooks\": [{{\"type\": \"command\", \"command\": \"<path to dcg>\"}}]}}"
+                );
+                println!(
+                    "    (re-running the installer does this), then start Codex once to \
+                     approve it"
+                );
+            }
+            CodexHookProbe::CommandNotFound { state_key, command } => {
+                println!("{}", "COMMAND NOT FOUND".red());
+                issues += 1;
+                println!("  The dcg hook is registered ({state_key})");
+                println!("  but its command does not exist: {command}");
+                println!(
+                    "  → Re-run the dcg install script so hooks.json points at the installed \
+                     binary, or fix the path by hand"
+                );
+                println!(
+                    "    (a hook whose program is missing fails at run time, and Codex fails open)"
+                );
+            }
             CodexHookProbe::HooksFileInvalid(err) => {
                 println!("{}", "ERROR".red());
                 issues += 1;
-                println!("  ~/.codex/hooks.json cannot be parsed: {err}");
+                println!("  ~/.codex/hooks.json is not valid JSON: {err}");
+                println!("  Codex loads none of its hooks");
                 println!("  → Fix the JSON by hand, or move it aside and re-run the installer");
+            }
+            CodexHookProbe::HooksFileRejected(err) => {
+                println!("{}", "REJECTED BY CODEX".red());
+                issues += 1;
+                println!("  Codex rejects ~/.codex/hooks.json: {err}");
+                println!(
+                    "  It loads NONE of the file's hooks, so the dcg hook never reaches trust \
+                     review"
+                );
+                println!("  and there is no approval prompt to accept");
+                println!(
+                    "  → Make the file match Codex's schema: only a top-level \"hooks\" object \
+                     (plus an optional \"description\")"
+                );
+                println!(
+                    "    — remove keys such as \"version\" — then start Codex once and \
+                     approve the dcg hook"
+                );
             }
         }
     }
@@ -10995,13 +11215,51 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // `dcg packs --enabled` lists. `enabled_pack_ids` deliberately keeps the
     // bare `core` category marker for registry callers to expand, so counting
     // the raw set reported one fewer pack than the listing every time (#335).
-    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len();
-    println!("{} ({} enabled)", "OK".green(), enabled_leaf_count);
+    let external_store = {
+        let external_paths = config.packs.expand_custom_paths();
+        load_external_packs(&external_paths)
+    };
+    // `expand_enabled_ordered` filters to registry entries, so external packs
+    // were invisible here while `dcg packs` ticked them — one of the three
+    // disagreeing counts in issue #402.
+    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len() + external_store.len();
+    if external_store.warnings().is_empty() {
+        println!("{} ({} enabled)", "OK".green(), enabled_leaf_count);
+    } else {
+        issues += 1;
+        println!("{} ({} enabled)", "WARNING".yellow(), enabled_leaf_count);
+        for warning in external_store.warnings() {
+            println!("  {warning}");
+        }
+        println!("  A pack that fails to load contributes no rules.");
+    }
+    for pack_id in external_store.keywordless_pack_ids() {
+        println!(
+            "  Note: external pack '{pack_id}' declares no keywords, so it is evaluated on \
+             every command and the global quick-reject fast path is disabled."
+        );
+    }
     println!(
         "  Hook evaluation budget: {} ms ({})",
         config.effective_hook_timeout_ms(),
         config.hook_timeout_source()
     );
+
+    // Check 5b: History database location (#381)
+    print!("Checking history database... ");
+    let history = history_doctor_check(config);
+    match history.status {
+        DoctorCheckStatus::Ok | DoctorCheckStatus::Skipped => println!("{}", "OK".green()),
+        DoctorCheckStatus::Warning => println!("{}", "WARNING".yellow()),
+        DoctorCheckStatus::Error => {
+            issues += 1;
+            println!("{}", "ERROR".red());
+        }
+    }
+    println!("  {}", history.message);
+    if let Some(remediation) = &history.remediation {
+        println!("  → {remediation}");
+    }
 
     // Check 6: Smoke test
     print!("Running smoke test... ");
@@ -11231,6 +11489,99 @@ fn doctor_pass_summary(report: &DoctorReport) -> &'static str {
     } else {
         "All checks passed (guard not wired to any agent)"
     }
+}
+
+/// Outcome of the doctor's history-database check, shared by every renderer.
+struct HistoryDoctorCheck {
+    status: DoctorCheckStatus,
+    message: String,
+    remediation: Option<String>,
+}
+
+/// Report where the history database resolves to and whether the hook could
+/// write there (#381).
+///
+/// The probe is deliberately side-effect free: an existing file is opened for
+/// writing without touching its bytes, and a missing file is judged by its
+/// nearest existing ancestor's permission bits. Read-only bind mounts are only
+/// detectable once the file exists, which is exactly the upgrade case the
+/// legacy-location note covers.
+fn history_doctor_check(config: &Config) -> HistoryDoctorCheck {
+    let resolved = ResolvedHistoryPath::resolve(&config.history);
+    let location = format!(
+        "{} (via {})",
+        resolved.path.display(),
+        resolved.source.describe()
+    );
+    let relocate_hint = format!(
+        "Set DCG_HISTORY_DB or [history] database_path to a writable file, \
+         or move {} (with its -wal/-shm sidecars) to the default state directory",
+        resolved.path.display()
+    );
+
+    if crate::history::history_disabled_by_env() {
+        return HistoryDoctorCheck {
+            status: DoctorCheckStatus::Ok,
+            message: format!("disabled by {ENV_HISTORY_DISABLED}; would use {location}"),
+            remediation: None,
+        };
+    }
+    if !config.history.enabled {
+        return HistoryDoctorCheck {
+            status: DoctorCheckStatus::Ok,
+            message: format!("disabled ([history] enabled = false); would use {location}"),
+            remediation: None,
+        };
+    }
+
+    let legacy_note = if resolved.source == HistoryPathSource::LegacyConfigDir {
+        "; this is the pre-0.15 location and stays in use until the file is moved"
+    } else {
+        ""
+    };
+
+    match probe_history_path_writable(&resolved.path) {
+        Ok(()) => HistoryDoctorCheck {
+            status: DoctorCheckStatus::Ok,
+            message: format!("enabled; database {location}{legacy_note}"),
+            remediation: None,
+        },
+        Err(reason) => HistoryDoctorCheck {
+            status: DoctorCheckStatus::Warning,
+            message: format!("enabled but the hook cannot write {location}: {reason}{legacy_note}"),
+            remediation: Some(relocate_hint),
+        },
+    }
+}
+
+/// Non-destructive writability probe for the history database path.
+fn probe_history_path_writable(path: &std::path::Path) -> Result<(), String> {
+    if path.is_file() {
+        // Opening for write does not modify the file; SQLite needs exactly this.
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map(drop)
+            .map_err(|err| format!("existing file is not writable ({err})"));
+    }
+    if path.exists() {
+        return Err("path exists but is not a regular file".to_string());
+    }
+    let Some(existing_ancestor) = path.ancestors().skip(1).find(|dir| dir.exists()) else {
+        return Ok(());
+    };
+    let metadata = std::fs::metadata(existing_ancestor)
+        .map_err(|err| format!("cannot inspect {} ({err})", existing_ancestor.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{} is not a directory",
+            existing_ancestor.display()
+        ));
+    }
+    if metadata.permissions().readonly() {
+        return Err(format!("{} is read-only", existing_ancestor.display()));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
@@ -11541,6 +11892,17 @@ fn collect_doctor_report(
         fixed: false,
     });
 
+    // Check 5b: History database location (#381)
+    let history = history_doctor_check(config);
+    checks.push(DoctorCheck {
+        id: "history",
+        name: "History database",
+        status: history.status,
+        message: history.message,
+        remediation: history.remediation,
+        fixed: false,
+    });
+
     // Check 6: Smoke test
     if run_smoke_test(config) {
         checks.push(DoctorCheck {
@@ -11774,6 +12136,59 @@ fn collect_doctor_report(
         });
     }
 
+    // Crush hook registration (#388). Mirrored in `doctor_pretty`. Crush reads
+    // only its own crush.json (no Claude settings compatibility layer), so
+    // "not registered" means the guard is wired nowhere for it.
+    if crush_appears_in_use() {
+        let mut crush_fixed = false;
+        let config_path = crush_user_config_path();
+        let (status, message, remediation) = match crush_user_config_registers_dcg() {
+            Ok(true) => (
+                DoctorCheckStatus::Ok,
+                format!("Crush dcg hook registered in {}", config_path.display()),
+                None,
+            ),
+            Ok(false) => {
+                issues += 1;
+                if fix && install_crush_hook_at(&config_path, false).is_ok() {
+                    fixed += 1;
+                    crush_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!("Installed Crush dcg hook in {}", config_path.display()),
+                        None,
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        format!(
+                            "Crush is in use but {} has no dcg PreToolUse hook — its bash \
+                             tool calls are not guarded",
+                            config_path.display()
+                        ),
+                        Some("Run 'dcg install --crush'".to_string()),
+                    )
+                }
+            }
+            Err(err) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!("{} cannot be parsed: {err}", config_path.display()),
+                    Some("Fix the JSON by hand, then run 'dcg install --crush'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "crush_hook",
+            name: "Crush hook registration",
+            status,
+            message,
+            remediation,
+            fixed: crush_fixed,
+        });
+    }
+
     // Codex hook registration AND enablement (#368). Mirrored in
     // `doctor_pretty` — see the renderer-parity note above the Grok block. A
     // hook that is registered in hooks.json but untrusted (no [hooks.state]
@@ -11832,12 +12247,26 @@ fn collect_doctor_report(
                     )
                 }
             }
+            CodexHookProbe::HooksFileMissing => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    "Codex is in use but ~/.codex/hooks.json does not exist — its shell \
+                     commands are not guarded"
+                        .to_string(),
+                    Some(
+                        "Re-run the dcg install script to register the hook, then start \
+                         Codex once to approve it"
+                            .to_string(),
+                    ),
+                )
+            }
             CodexHookProbe::NotRegistered => {
                 issues += 1;
                 (
                     DoctorCheckStatus::Error,
-                    "Codex is in use but ~/.codex/hooks.json has no dcg PreToolUse hook — \
-                     its shell commands are not guarded"
+                    "~/.codex/hooks.json loads, but has no dcg PreToolUse command hook that \
+                     selects Bash — Codex shell commands are not guarded"
                         .to_string(),
                     Some(
                         "Re-run the dcg install script to register it, then start Codex \
@@ -11846,13 +12275,66 @@ fn collect_doctor_report(
                     ),
                 )
             }
+            CodexHookProbe::Misplaced(detail) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "A dcg hook is in ~/.codex/hooks.json but not where Codex runs it \
+                         for shell commands: {detail}"
+                    ),
+                    Some(
+                        "Register it under hooks.PreToolUse as {\"matcher\": \"Bash\", \
+                         \"hooks\": [{\"type\": \"command\", \"command\": \"<path to dcg>\"}]} \
+                         (re-running the installer does this), then start Codex once to \
+                         approve it"
+                            .to_string(),
+                    ),
+                )
+            }
+            CodexHookProbe::CommandNotFound { state_key, command } => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "Codex dcg hook is registered ({state_key}) but its command does not \
+                         exist: {command}"
+                    ),
+                    Some(
+                        "Re-run the dcg install script so hooks.json points at the installed \
+                         binary, or fix the path by hand (a hook whose program is missing \
+                         fails at run time, and Codex fails open)"
+                            .to_string(),
+                    ),
+                )
+            }
             CodexHookProbe::HooksFileInvalid(err) => {
                 issues += 1;
                 (
                     DoctorCheckStatus::Error,
-                    format!("~/.codex/hooks.json cannot be parsed: {err}"),
+                    format!(
+                        "~/.codex/hooks.json is not valid JSON ({err}); Codex loads none of \
+                         its hooks"
+                    ),
                     Some(
                         "Fix the JSON by hand, or move it aside and re-run the installer"
+                            .to_string(),
+                    ),
+                )
+            }
+            CodexHookProbe::HooksFileRejected(err) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "Codex rejects ~/.codex/hooks.json ({err}), so it loads NONE of the \
+                         file's hooks — the dcg hook never reaches trust review and there is \
+                         no approval prompt to accept"
+                    ),
+                    Some(
+                        "Make the file match Codex's schema: only a top-level \"hooks\" object \
+                         (plus an optional \"description\") — remove keys such as \
+                         \"version\" — then start Codex once and approve the dcg hook"
                             .to_string(),
                     ),
                 )
@@ -12086,7 +12568,6 @@ fn current_dcg_executable() -> std::io::Result<std::path::PathBuf> {
     Ok(executable)
 }
 
-#[cfg(unix)]
 fn posix_quote_hook_program(program: &str) -> String {
     if program.chars().all(|character| {
         character.is_ascii_alphanumeric()
@@ -12916,6 +13397,361 @@ fn project_antigravity_hooks_path() -> Result<std::path::PathBuf, Box<dyn std::e
     Ok(repo_root.join(".gemini").join("config").join("hooks.json"))
 }
 
+/// Regex Crush tests against the tool name; its shell tool is `bash` on
+/// every platform (Crush runs an embedded POSIX shell, so there is no
+/// PowerShell variant to match).
+const CRUSH_SHELL_MATCHER: &str = "^bash$";
+
+/// Canonical Crush hook event key. Crush also accepts case- and
+/// separator-insensitive spellings (`pretooluse`, `pre_tool_use`, …) and folds
+/// them onto this one at load time; see [`is_crush_pre_tool_use_key`].
+const CRUSH_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
+
+/// Keys dcg owns on its Crush hook entry. Everything else (`name`, `timeout`)
+/// is host-owned and survives a reinstall, mirroring [`DCG_OWNED_HOOK_KEYS`]
+/// for Claude-shaped hooks (#345).
+const DCG_OWNED_CRUSH_HOOK_KEYS: &[&str] = &["command", "matcher"];
+
+/// Path to the user-level Crush config Crush reads on every platform:
+/// `$CRUSH_GLOBAL_CONFIG/crush.json` when that override is set, else
+/// `$XDG_CONFIG_HOME/crush/crush.json`, else `~/.config/crush/crush.json`
+/// (Crush uses `~/.config` on Windows too). Verified against
+/// `internal/config/load.go` (`GlobalConfig`) in charmbracelet/crush.
+///
+/// `~/.local/share/crush/crush.json` is Crush's machine-written *data* file
+/// (`GlobalConfigData`) and is deliberately left alone.
+fn crush_user_config_path() -> std::path::PathBuf {
+    crush_user_config_path_for(
+        std::env::var_os("CRUSH_GLOBAL_CONFIG"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        dirs::home_dir().unwrap_or_default(),
+    )
+}
+
+/// Pure resolver behind [`crush_user_config_path`]: `CRUSH_GLOBAL_CONFIG` is
+/// a *directory* override, `XDG_CONFIG_HOME` replaces `~/.config`.
+fn crush_user_config_path_for(
+    global_config_dir: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: std::path::PathBuf,
+) -> std::path::PathBuf {
+    if let Some(dir) = global_config_dir.filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(dir).join("crush.json");
+    }
+    let config_home = xdg_config_home
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.join(".config"), std::path::PathBuf::from);
+    config_home.join("crush").join("crush.json")
+}
+
+/// Path to the project-level Crush config. Crush walks from the working
+/// directory up to the Git root looking for `.crush.json` and `crush.json`
+/// (the hidden name wins on conflict, and every file's `hooks` arrays are
+/// concatenated). An existing file at the repo root is edited in place —
+/// `crush.json` first, then `.crush.json` — and the documented `crush.json`
+/// name is created when neither exists.
+///
+/// Returns `Err` if the current directory is not inside a git repository.
+fn project_crush_config_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    let visible = repo_root.join("crush.json");
+    if visible.exists() {
+        return Ok(visible);
+    }
+    let hidden = repo_root.join(".crush.json");
+    if hidden.exists() {
+        return Ok(hidden);
+    }
+    Ok(visible)
+}
+
+/// Whether a `hooks` key is one of Crush's accepted spellings of `PreToolUse`.
+fn is_crush_pre_tool_use_key(key: &str) -> bool {
+    key.chars()
+        .filter(|character| !matches!(character, '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .eq("pretooluse".chars())
+}
+
+/// The `hooks.PreToolUse[]` entry dcg writes into `crush.json`.
+///
+/// Crush executes `command` through its embedded POSIX shell on every OS, so
+/// the absolute dcg path is POSIX-quoted even on Windows (never the
+/// PowerShell `& '…'` form Claude's installer uses there). Crush pipes the
+/// tool call to the hook's stdin; dcg recognizes the envelope on its own, so
+/// no arguments are needed. The timeout matches the Grok installer and is far
+/// above dcg's hook fast path.
+fn crush_dcg_hook_entry_for_executable(
+    executable: &std::path::Path,
+) -> std::io::Result<serde_json::Value> {
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "dcg hook executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dcg hook executable path is not valid UTF-8: {}",
+                executable.display()
+            ),
+        )
+    })?;
+    Ok(serde_json::json!({
+        "name": "dcg",
+        "matcher": CRUSH_SHELL_MATCHER,
+        "command": posix_quote_hook_program(executable),
+        "timeout": 5
+    }))
+}
+
+fn crush_dcg_hook_entry() -> std::io::Result<serde_json::Value> {
+    crush_dcg_hook_entry_for_executable(&current_dcg_executable()?)
+}
+
+fn crush_hook_entry_is_dcg(entry: &serde_json::Value) -> bool {
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_dcg_command)
+}
+
+/// Remove every dcg entry from every `PreToolUse` spelling in a Crush
+/// config's `hooks` object, returning the first one removed (the template for
+/// host-owned fields on reinstall).
+///
+/// # Errors
+///
+/// Returns an error if `hooks` is not an object or a `PreToolUse` value is
+/// not an array; dcg never rewrites a shape it does not understand.
+fn remove_dcg_hooks_from_crush_hooks(
+    hooks: &mut serde_json::Value,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or("Invalid hooks format in crush.json (expected JSON object)")?;
+    let mut previous = None;
+    for (key, value) in hooks_obj.iter_mut() {
+        if !is_crush_pre_tool_use_key(key) {
+            continue;
+        }
+        let entries = value.as_array_mut().ok_or_else(|| {
+            format!("Invalid hooks.{key} format in crush.json (expected JSON array)")
+        })?;
+        entries.retain(|entry| {
+            let is_dcg = crush_hook_entry_is_dcg(entry);
+            if is_dcg && previous.is_none() {
+                previous = Some(entry.clone());
+            }
+            !is_dcg
+        });
+    }
+    Ok(previous)
+}
+
+/// Install (or refresh) dcg's hook entry in an in-memory Crush config.
+///
+/// Stale dcg entries under any spelling of the event key are removed, the
+/// fresh entry is inserted at the front of `hooks.PreToolUse` (Crush resolves
+/// hooks in config order; first deny wins), and host-owned fields from the
+/// entry being replaced are kept. Returns `Ok(true)` when the config changed
+/// (always `true` with `force`).
+///
+/// # Errors
+///
+/// Returns an error if the config, its `hooks`, or a `PreToolUse` value has an
+/// unexpected JSON shape.
+fn install_crush_hook_into_config(
+    config: &mut serde_json::Value,
+    force: bool,
+    desired_entry: serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let config_obj = config
+        .as_object_mut()
+        .ok_or("Invalid crush.json format (expected JSON object)")?;
+    let hooks = config_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let original = hooks.clone();
+
+    let previous = remove_dcg_hooks_from_crush_hooks(hooks)?;
+    let mut merged = match previous.as_ref().and_then(serde_json::Value::as_object) {
+        Some(previous) => {
+            let mut merged = previous.clone();
+            for key in DCG_OWNED_CRUSH_HOOK_KEYS {
+                merged.remove(*key);
+            }
+            merged
+        }
+        None => serde_json::Map::new(),
+    };
+    if let serde_json::Value::Object(desired) = desired_entry {
+        for (key, value) in desired {
+            // dcg-owned keys are always refreshed; host-owned defaults
+            // (`name`, `timeout`) only fill gaps so user edits survive.
+            if DCG_OWNED_CRUSH_HOOK_KEYS.contains(&key.as_str()) || !merged.contains_key(&key) {
+                merged.insert(key, value);
+            }
+        }
+    }
+
+    let entries = hooks
+        .as_object_mut()
+        .expect("validated above")
+        .entry(CRUSH_PRE_TOOL_USE_EVENT)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse format in crush.json (expected JSON array)")?;
+    entries.insert(0, serde_json::Value::Object(merged));
+
+    Ok(force || *hooks != original)
+}
+
+/// Remove dcg's hook entries from an in-memory Crush config. Returns
+/// `Ok(true)` when at least one entry was removed.
+fn uninstall_dcg_hook_from_crush_config(
+    config: &mut serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(hooks) = config.get_mut("hooks") else {
+        return Ok(false);
+    };
+    if hooks.is_null() {
+        return Ok(false);
+    }
+    Ok(remove_dcg_hooks_from_crush_hooks(hooks)?.is_some())
+}
+
+fn read_crush_config(
+    path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    Ok(serde_json::from_str(&content)?)
+}
+
+/// Install the dcg hook into Crush's config (#388).
+///
+/// Merges a `hooks.PreToolUse` entry into `~/.config/crush/crush.json`
+/// (user-level) or the repo's `crush.json` (with `--project`), preserving
+/// everything else in the file. Crush deep-merges its config files and
+/// concatenates `hooks` arrays, so a user-level entry coexists with any
+/// project hooks.
+///
+/// Returns `Err` if the file cannot be read/written, has an unexpected shape,
+/// or, for project installs, if the current directory is not inside a git
+/// repository.
+fn install_crush_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let config_path = if project {
+        project_crush_config_path()?
+    } else {
+        crush_user_config_path()
+    };
+
+    if !install_crush_hook_at(&config_path, force)? {
+        println!("{}", "Hook already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+
+    let level = if project { "project" } else { "user" };
+    println!("{}", "Crush hook installed successfully!".green().bold());
+    println!("Config updated ({level}): {}", config_path.display());
+    println!();
+    println!(
+        "{}",
+        "Restart Crush (or start a new session) for the change to take effect.".yellow()
+    );
+
+    Ok(())
+}
+
+/// Merge dcg's hook entry into the Crush config at `config_path` without
+/// printing (shared by `dcg install --crush` and `dcg doctor --fix`). Returns
+/// `Ok(true)` when the file was (re)written.
+fn install_crush_hook_at(
+    config_path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut config = if config_path.exists() {
+        read_crush_config(config_path)?
+    } else {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        serde_json::json!({})
+    };
+
+    let changed = install_crush_hook_into_config(&mut config, force, crush_dcg_hook_entry()?)?;
+    if changed {
+        let content = serde_json::to_string_pretty(&config)?;
+        std::fs::write(config_path, content)?;
+    }
+    Ok(changed)
+}
+
+/// Remove the dcg hook entry from Crush's user-level config (#388).
+fn uninstall_crush_hook() -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let config_path = crush_user_config_path();
+    if !config_path.exists() {
+        println!(
+            "{} {}",
+            "No Crush config found at".yellow(),
+            config_path.display()
+        );
+        return Ok(());
+    }
+
+    let mut config = read_crush_config(&config_path)?;
+    let removed = uninstall_dcg_hook_from_crush_config(&mut config)?;
+    if removed {
+        let content = serde_json::to_string_pretty(&config)?;
+        std::fs::write(&config_path, content)?;
+        println!("{}", "Crush hook removed successfully!".green().bold());
+        println!("Config updated: {}", config_path.display());
+    } else {
+        println!("{}", "No dcg hook found in Crush config.".yellow());
+    }
+
+    Ok(())
+}
+
+/// Whether the user-level Crush config registers a dcg `PreToolUse` hook.
+/// `Err` means the file exists but cannot be parsed.
+fn crush_user_config_registers_dcg() -> Result<bool, String> {
+    let path = crush_user_config_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let config = read_crush_config(&path).map_err(|error| error.to_string())?;
+    let Some(hooks) = config.get("hooks").and_then(serde_json::Value::as_object) else {
+        return Ok(false);
+    };
+    Ok(hooks.iter().any(|(key, value)| {
+        is_crush_pre_tool_use_key(key)
+            && value
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(crush_hook_entry_is_dcg))
+    }))
+}
+
+/// Whether Crush is plausibly in use on this machine: dcg was spawned by
+/// Crush (`CRUSH=1`) or Crush's config directory exists.
+fn crush_appears_in_use() -> bool {
+    std::env::var_os("CRUSH").is_some()
+        || crush_user_config_path()
+            .parent()
+            .is_some_and(std::path::Path::is_dir)
+}
+
 /// Ownership marker embedded in the generated OpenCode plugin (#318).
 ///
 /// The installer refuses to overwrite a plugin file that lacks this marker
@@ -13143,17 +13979,217 @@ enum CodexHookState {
 }
 
 /// Result of probing the Codex dcg hook.
+///
+/// The file-level states are ordered the way Codex's own loader fails
+/// (`codex-rs/hooks/src/engine/discovery.rs::load_hooks_json`): no file, then
+/// not JSON, then JSON that its `HooksFile` schema rejects. Only a loadable
+/// file gets as far as hook lookup and trust review, so each state needs a
+/// different remedy — a schema-rejected file in particular has NO trust
+/// prompt to approve, which is why it must never be reported as "registered
+/// but untrusted" (#391).
 #[derive(Debug, PartialEq, Eq)]
 enum CodexHookProbe {
-    /// hooks.json is missing or contains no dcg PreToolUse Bash hook.
-    NotRegistered,
-    /// hooks.json exists but cannot be parsed.
+    /// `~/.codex/hooks.json` does not exist (or cannot be read).
+    HooksFileMissing,
+    /// hooks.json exists but is not valid JSON.
     HooksFileInvalid(String),
+    /// hooks.json is valid JSON that Codex's `HooksFile` schema rejects (for
+    /// example a stray top-level `"version"` key: the struct is
+    /// `deny_unknown_fields`). Codex logs "failed to parse hooks config" and
+    /// loads NONE of the file's hooks.
+    HooksFileRejected(String),
+    /// Loadable file, but no `type: "command"` dcg hook under `PreToolUse`
+    /// with a matcher that selects `Bash`.
+    NotRegistered,
+    /// A dcg command hook exists, but not where Codex runs it for shell
+    /// commands (under another event, or under a `PreToolUse` matcher that
+    /// excludes `Bash`). The payload describes where it was found.
+    Misplaced(String),
+    /// The dcg hook is registered under the right event and matcher, but the
+    /// program its `command` names does not exist, so it can never run.
+    CommandNotFound { state_key: String, command: String },
     /// The dcg hook is registered; `state_key` is its `[hooks.state]` key.
     Registered {
         state_key: String,
         state: CodexHookState,
     },
+}
+
+/// Mirror of Codex's `HooksFile` (`codex-rs/config/src/hook_config.rs`).
+///
+/// The top level is `deny_unknown_fields` with exactly `description` and
+/// `hooks`, so any other key (`"version": 1`, say) makes Codex reject the
+/// WHOLE file. Event names are fixed fields (unknown event names are ignored,
+/// as in Codex); handlers are tagged by `type`. Fields dcg does not read are
+/// kept so the mirror rejects the same shapes Codex rejects (a string where
+/// `timeout` must be a number, an unknown handler `type`, …).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct CodexHooksFile {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    hooks: CodexHookEvents,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CodexHookEvents {
+    #[serde(rename = "PreToolUse", default)]
+    pre_tool_use: Vec<CodexMatcherGroup>,
+    #[serde(rename = "PermissionRequest", default)]
+    permission_request: Vec<CodexMatcherGroup>,
+    #[serde(rename = "PostToolUse", default)]
+    post_tool_use: Vec<CodexMatcherGroup>,
+    #[serde(rename = "PreCompact", default)]
+    pre_compact: Vec<CodexMatcherGroup>,
+    #[serde(rename = "PostCompact", default)]
+    post_compact: Vec<CodexMatcherGroup>,
+    #[serde(rename = "SessionStart", default)]
+    session_start: Vec<CodexMatcherGroup>,
+    #[serde(rename = "SessionEnd", default)]
+    session_end: Vec<CodexMatcherGroup>,
+    #[serde(rename = "UserPromptSubmit", default)]
+    user_prompt_submit: Vec<CodexMatcherGroup>,
+    #[serde(rename = "SubagentStart", default)]
+    subagent_start: Vec<CodexMatcherGroup>,
+    #[serde(rename = "SubagentStop", default)]
+    subagent_stop: Vec<CodexMatcherGroup>,
+    #[serde(rename = "Stop", default)]
+    stop: Vec<CodexMatcherGroup>,
+    #[serde(rename = "Interrupt", default)]
+    interrupt: Vec<CodexMatcherGroup>,
+}
+
+impl CodexHookEvents {
+    /// Every event other than `PreToolUse`, for the misplaced-hook search.
+    fn other_events(&self) -> [(&'static str, &[CodexMatcherGroup]); 11] {
+        [
+            ("PermissionRequest", &self.permission_request),
+            ("PostToolUse", &self.post_tool_use),
+            ("PreCompact", &self.pre_compact),
+            ("PostCompact", &self.post_compact),
+            ("SessionStart", &self.session_start),
+            ("SessionEnd", &self.session_end),
+            ("UserPromptSubmit", &self.user_prompt_submit),
+            ("SubagentStart", &self.subagent_start),
+            ("SubagentStop", &self.subagent_stop),
+            ("Stop", &self.stop),
+            ("Interrupt", &self.interrupt),
+        ]
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CodexMatcherGroup {
+    #[serde(default)]
+    matcher: Option<String>,
+    #[serde(default)]
+    hooks: Vec<CodexHookHandler>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type")]
+#[allow(dead_code)]
+enum CodexHookHandler {
+    #[serde(rename = "command")]
+    Command {
+        command: String,
+        #[serde(default, rename = "commandWindows", alias = "command_windows")]
+        command_windows: Option<String>,
+        #[serde(default, rename = "timeout")]
+        timeout_sec: Option<u64>,
+        #[serde(default)]
+        r#async: bool,
+        #[serde(default, rename = "statusMessage")]
+        status_message: Option<String>,
+        #[serde(default, rename = "additionalContextLimit")]
+        additional_context_limit: Option<usize>,
+    },
+    #[serde(rename = "mcp_tool")]
+    McpTool {
+        server: String,
+        tool: String,
+        #[serde(default)]
+        input: serde_json::Map<String, serde_json::Value>,
+        #[serde(default, rename = "timeout")]
+        timeout_sec: Option<u64>,
+        #[serde(default, rename = "statusMessage")]
+        status_message: Option<String>,
+    },
+    #[serde(rename = "prompt")]
+    Prompt {},
+    #[serde(rename = "agent")]
+    Agent {},
+}
+
+impl CodexHookHandler {
+    /// The command line Codex would run on this platform, for command hooks.
+    fn effective_command(&self) -> Option<&str> {
+        match self {
+            Self::Command {
+                command,
+                command_windows,
+                ..
+            } => Some(if cfg!(windows) {
+                command_windows.as_deref().unwrap_or(command)
+            } else {
+                command
+            }),
+            Self::McpTool { .. } | Self::Prompt {} | Self::Agent {} => None,
+        }
+    }
+}
+
+/// Whether a Codex matcher selects the `Bash` tool, mirroring Codex's own
+/// rules (`codex-rs/hooks/src/events/common.rs::matches_matcher`): absent,
+/// empty, or `*` matches every tool; a matcher made only of
+/// `[A-Za-z0-9_|]` is an exact `|`-separated list; anything else is a regex.
+fn codex_matcher_selects_bash(matcher: Option<&str>) -> bool {
+    match matcher {
+        None => true,
+        Some(matcher) if matcher.is_empty() || matcher == "*" => true,
+        Some(matcher)
+            if matcher
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '|') =>
+        {
+            matcher.split('|').any(|candidate| candidate == "Bash")
+        }
+        Some(matcher) => regex::Regex::new(matcher).is_ok_and(|re| re.is_match("Bash")),
+    }
+}
+
+/// The program word of a hook command line: the first token, honoring a
+/// leading double-quoted path (`"C:\Program Files\dcg\dcg.exe" --flag`).
+fn codex_hook_program(command: &str) -> Option<&str> {
+    let trimmed = command.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        return rest.split('"').next();
+    }
+    trimmed.split_whitespace().next()
+}
+
+/// Whether the program a Codex hook names exists: a path with a separator
+/// (or `~/`) must be a file; a bare name must resolve on PATH, which is how
+/// the shell Codex runs hooks through would find it.
+fn codex_hook_command_exists(command: &str) -> bool {
+    let Some(program) = codex_hook_program(command) else {
+        return false;
+    };
+    if program.is_empty() {
+        return false;
+    }
+    if let Some(rest) = program.strip_prefix("~/") {
+        return dirs::home_dir().is_some_and(|home| home.join(rest).is_file());
+    }
+    if program.contains(['/', '\\']) {
+        return std::path::Path::new(program).is_file();
+    }
+    let stem = program
+        .strip_suffix(std::env::consts::EXE_SUFFIX)
+        .unwrap_or(program);
+    which_executable(stem).is_some()
 }
 
 /// Whether a Codex hook `command` string invokes the dcg binary (first-token
@@ -13173,58 +14209,88 @@ fn codex_command_is_dcg(command: &str) -> bool {
 
 /// Probe the user-level Codex hook registration and enablement.
 fn probe_codex_dcg_hook() -> CodexHookProbe {
-    probe_codex_dcg_hook_at(&codex_hooks_json_path(), &codex_config_toml_path())
+    probe_codex_dcg_hook_at(
+        &codex_hooks_json_path(),
+        &codex_config_toml_path(),
+        codex_hook_command_exists,
+    )
 }
 
-/// Testable core of [`probe_codex_dcg_hook`]: explicit file locations.
+/// Testable core of [`probe_codex_dcg_hook`]: explicit file locations and an
+/// injectable "does this hook command's program exist" check.
 fn probe_codex_dcg_hook_at(
     hooks_path: &std::path::Path,
     config_path: &std::path::Path,
+    command_exists: impl Fn(&str) -> bool,
 ) -> CodexHookProbe {
     let raw = match std::fs::read_to_string(hooks_path) {
         Ok(raw) => raw,
-        Err(_) => return CodexHookProbe::NotRegistered,
+        Err(_) => return CodexHookProbe::HooksFileMissing,
     };
-    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(parsed) => parsed,
+    // Two-stage parse so a syntax error and a schema rejection get different
+    // remedies: the first is a broken file, the second is a well-formed file
+    // Codex refuses to load.
+    let json: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(json) => json,
         Err(err) => return CodexHookProbe::HooksFileInvalid(err.to_string()),
+    };
+    let parsed: CodexHooksFile = match serde_json::from_value(json) {
+        Ok(parsed) => parsed,
+        Err(err) => return CodexHookProbe::HooksFileRejected(err.to_string()),
     };
 
     // The state key indexes the PreToolUse array as loaded, so `entry_index`
     // counts EVERY element (including non-Bash matchers), not just Bash ones.
-    let mut found: Option<(usize, usize)> = None;
-    if let Some(entries) = parsed
-        .get("hooks")
-        .and_then(|hooks| hooks.get("PreToolUse"))
-        .and_then(serde_json::Value::as_array)
-    {
-        'outer: for (entry_index, entry) in entries.iter().enumerate() {
-            if entry.get("matcher").and_then(serde_json::Value::as_str) != Some("Bash") {
-                continue;
-            }
-            let Some(hooks) = entry.get("hooks").and_then(serde_json::Value::as_array) else {
+    let mut found: Option<(usize, usize, &str)> = None;
+    let mut misplaced: Option<String> = None;
+    'outer: for (entry_index, group) in parsed.hooks.pre_tool_use.iter().enumerate() {
+        let selects_bash = codex_matcher_selects_bash(group.matcher.as_deref());
+        for (hook_index, hook) in group.hooks.iter().enumerate() {
+            let Some(command) = hook.effective_command() else {
                 continue;
             };
-            for (hook_index, hook) in hooks.iter().enumerate() {
-                if hook
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(codex_command_is_dcg)
-                {
-                    found = Some((entry_index, hook_index));
-                    break 'outer;
+            if !codex_command_is_dcg(command) {
+                continue;
+            }
+            if selects_bash {
+                found = Some((entry_index, hook_index, command));
+                break 'outer;
+            }
+            misplaced.get_or_insert_with(|| {
+                format!(
+                    "PreToolUse entry {entry_index} has matcher {:?}, which does not select Bash",
+                    group.matcher.as_deref().unwrap_or_default()
+                )
+            });
+        }
+    }
+    if found.is_none() {
+        for (event, groups) in parsed.hooks.other_events() {
+            for (entry_index, group) in groups.iter().enumerate() {
+                for hook in &group.hooks {
+                    if hook.effective_command().is_some_and(codex_command_is_dcg) {
+                        misplaced.get_or_insert_with(|| {
+                            format!("found under {event} entry {entry_index} instead of PreToolUse")
+                        });
+                    }
                 }
             }
         }
     }
-    let Some((entry_index, hook_index)) = found else {
-        return CodexHookProbe::NotRegistered;
+    let Some((entry_index, hook_index, command)) = found else {
+        return misplaced.map_or(CodexHookProbe::NotRegistered, CodexHookProbe::Misplaced);
     };
 
     let state_key = format!(
         "{}:pre_tool_use:{entry_index}:{hook_index}",
         hooks_path.display()
     );
+    if !command_exists(command) {
+        return CodexHookProbe::CommandNotFound {
+            state_key,
+            command: command.to_string(),
+        };
+    }
 
     let state = match std::fs::read_to_string(config_path)
         .ok()
@@ -15680,7 +16746,7 @@ fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
 pub fn ensure_hook_registered() {
     if let Err(e) = ensure_hook_registered_inner() {
         // Fail-open: log warning but never block the hook pipeline.
-        eprintln!("[dcg] Warning: self-heal check failed: {e}");
+        crate::emit_stderr!("[dcg] Warning: self-heal check failed: {e}");
     }
 }
 
@@ -19535,6 +20601,203 @@ mod tests {
         assert!(!is_dcg_command(r"& 'C:\unterminated\dcg.exe"));
     }
 
+    // ---- Crush installer (#388) -------------------------------------------
+
+    fn crush_entry_for(path: &str) -> serde_json::Value {
+        crush_dcg_hook_entry_for_executable(std::path::Path::new(path)).expect("entry")
+    }
+
+    fn crush_pre_tool_use(config: &serde_json::Value) -> &Vec<serde_json::Value> {
+        config["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("hooks.PreToolUse array")
+    }
+
+    #[test]
+    fn crush_hook_entry_is_flat_and_posix_quoted() {
+        let entry = crush_entry_for("/opt/tools/dcg");
+        assert_eq!(entry["name"], "dcg");
+        assert_eq!(entry["matcher"], "^bash$");
+        assert_eq!(entry["command"], "/opt/tools/dcg");
+        assert_eq!(entry["timeout"], 5);
+        // Crush's entry is flat: no Claude-style nested `hooks`/`type`.
+        assert!(entry.get("hooks").is_none());
+        assert!(entry.get("type").is_none());
+
+        // Crush runs `command` through its embedded POSIX shell on every OS,
+        // so a path with spaces or backslashes is POSIX-quoted (never the
+        // PowerShell `& '…'` form) and round-trips through the dcg-command
+        // parser used to find stale entries. `is_absolute` is host-specific,
+        // so the Windows spelling is only exercised on Windows.
+        let path = if cfg!(windows) {
+            r"C:\Users\Jane Doe\.local\bin\dcg.exe"
+        } else {
+            "/Users/Jane Doe/.local/bin/dcg"
+        };
+        let entry = crush_entry_for(path);
+        let command = entry["command"].as_str().unwrap();
+        assert!(command.starts_with('"'), "quoted: {command}");
+        assert!(
+            !command.starts_with("& "),
+            "no PowerShell call operator: {command}"
+        );
+        assert_eq!(dcg_command_program(command).as_deref(), Some(path));
+
+        assert!(
+            crush_dcg_hook_entry_for_executable(std::path::Path::new("relative/dcg")).is_err(),
+            "relative executable paths are rejected"
+        );
+    }
+
+    #[test]
+    fn crush_pre_tool_use_key_spellings() {
+        for key in ["PreToolUse", "pretooluse", "PRE_TOOL_USE", "pre-tool-use"] {
+            assert!(is_crush_pre_tool_use_key(key), "{key}");
+        }
+        for key in ["PostToolUse", "PreToolUsed", "hooks", ""] {
+            assert!(!is_crush_pre_tool_use_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn install_crush_creates_hooks_structure() {
+        let mut config = serde_json::json!({ "$schema": "https://charm.land/crush.json" });
+        let changed =
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .expect("install ok");
+        assert!(changed);
+        assert_eq!(config["$schema"], "https://charm.land/crush.json");
+        let entries = crush_pre_tool_use(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], crush_entry_for("/opt/dcg"));
+    }
+
+    #[test]
+    fn install_crush_is_idempotent_without_force() {
+        let mut config = serde_json::json!({
+            "hooks": { "PreToolUse": [ crush_entry_for("/opt/dcg") ] }
+        });
+        let changed =
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .expect("install ok");
+        assert!(!changed, "identical entry must be a no-op");
+        assert_eq!(crush_pre_tool_use(&config).len(), 1);
+
+        let changed =
+            install_crush_hook_into_config(&mut config, true, crush_entry_for("/opt/dcg"))
+                .expect("install ok");
+        assert!(changed, "--force always reports a rewrite");
+        assert_eq!(crush_pre_tool_use(&config).len(), 1);
+    }
+
+    #[test]
+    fn install_crush_replaces_stale_entries_and_keeps_host_owned_fields() {
+        // A stale entry under an alternate event spelling, with a user-chosen
+        // name and timeout, plus an unrelated user hook that must survive.
+        let mut config = serde_json::json!({
+            "hooks": {
+                "pre_tool_use": [
+                    { "name": "my-guard", "matcher": "bash", "command": "/old/path/dcg", "timeout": 30 }
+                ],
+                "PreToolUse": [
+                    { "matcher": "^bash$", "command": "./hooks/no-haskell.sh" }
+                ]
+            }
+        });
+        let changed =
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/new/dcg"))
+                .expect("install ok");
+        assert!(changed);
+
+        let entries = crush_pre_tool_use(&config);
+        assert_eq!(entries.len(), 2, "dcg first, then the user's hook");
+        assert_eq!(entries[0]["command"], "/new/dcg", "dcg-owned: refreshed");
+        assert_eq!(entries[0]["matcher"], "^bash$", "dcg-owned: refreshed");
+        assert_eq!(entries[0]["name"], "my-guard", "host-owned: preserved");
+        assert_eq!(entries[0]["timeout"], 30, "host-owned: preserved");
+        assert_eq!(entries[1]["command"], "./hooks/no-haskell.sh");
+        assert_eq!(
+            config["hooks"]["pre_tool_use"],
+            serde_json::json!([]),
+            "stale dcg entry removed from the alternate spelling"
+        );
+    }
+
+    #[test]
+    fn install_crush_rejects_unexpected_shapes() {
+        let mut config = serde_json::json!([]);
+        assert!(
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .is_err()
+        );
+        let mut config = serde_json::json!({ "hooks": [] });
+        assert!(
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .is_err()
+        );
+        let mut config = serde_json::json!({ "hooks": { "PreToolUse": {} } });
+        assert!(
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn uninstall_crush_removes_only_dcg_entries() {
+        let mut config = serde_json::json!({
+            "options": { "debug": true },
+            "hooks": {
+                "PreToolUse": [
+                    crush_entry_for("/opt/dcg"),
+                    { "matcher": "^bash$", "command": "./hooks/no-haskell.sh" },
+                    { "command": "\"/Users/Jane Doe/.local/bin/dcg\"" }
+                ]
+            }
+        });
+        assert!(uninstall_dcg_hook_from_crush_config(&mut config).expect("uninstall ok"));
+        let entries = crush_pre_tool_use(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], "./hooks/no-haskell.sh");
+        assert_eq!(config["options"]["debug"], true);
+
+        assert!(
+            !uninstall_dcg_hook_from_crush_config(&mut config).expect("uninstall ok"),
+            "second pass finds nothing"
+        );
+        let mut config = serde_json::json!({});
+        assert!(!uninstall_dcg_hook_from_crush_config(&mut config).expect("no hooks key"));
+        let mut config = serde_json::json!({ "hooks": "nope" });
+        assert!(uninstall_dcg_hook_from_crush_config(&mut config).is_err());
+    }
+
+    #[test]
+    fn crush_user_config_path_follows_crush_precedence() {
+        use std::ffi::OsString;
+        let home = std::path::PathBuf::from("/home/jane");
+        assert_eq!(
+            crush_user_config_path_for(None, None, home.clone()),
+            std::path::PathBuf::from("/home/jane/.config/crush/crush.json")
+        );
+        assert_eq!(
+            crush_user_config_path_for(None, Some(OsString::from("/xdg")), home.clone()),
+            std::path::PathBuf::from("/xdg/crush/crush.json")
+        );
+        // CRUSH_GLOBAL_CONFIG names the directory and beats XDG.
+        assert_eq!(
+            crush_user_config_path_for(
+                Some(OsString::from("/override/crush")),
+                Some(OsString::from("/xdg")),
+                home.clone()
+            ),
+            std::path::PathBuf::from("/override/crush/crush.json")
+        );
+        // Empty values are treated as unset, as Crush does.
+        assert_eq!(
+            crush_user_config_path_for(Some(OsString::new()), Some(OsString::new()), home),
+            std::path::PathBuf::from("/home/jane/.config/crush/crush.json")
+        );
+    }
+
     #[test]
     fn install_into_settings_creates_structure() {
         let mut settings = serde_json::json!({});
@@ -20469,6 +21732,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20477,6 +21741,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20492,6 +21757,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(force);
@@ -20500,6 +21766,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20515,6 +21782,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20523,6 +21791,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20538,6 +21807,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20546,6 +21816,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20561,6 +21832,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20569,6 +21841,7 @@ if ($errors.Count -ne 0) {
             assert!(agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20584,6 +21857,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20592,6 +21866,7 @@ if ($errors.Count -ne 0) {
             assert!(agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20607,6 +21882,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20615,6 +21891,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20630,6 +21907,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(force);
@@ -20638,6 +21916,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20653,6 +21932,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(force);
@@ -20661,9 +21941,49 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
+    }
+
+    #[test]
+    fn test_cli_parse_install_crush_with_project_and_force() {
+        let cli = Cli::parse_from(["dcg", "install", "--crush", "--project", "--force"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+            opencode,
+            omp,
+            crush,
+        }) = cli.command
+        {
+            assert!(force);
+            assert!(project);
+            assert!(!grok);
+            assert!(!agy);
+            assert!(!opencode);
+            assert!(!omp);
+            assert!(crush);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_uninstall_crush_excludes_purge() {
+        let cli = Cli::parse_from(["dcg", "uninstall", "--crush"]);
+        if let Some(Command::Uninstall { purge, crush }) = cli.command {
+            assert!(!purge);
+            assert!(crush);
+        } else {
+            unreachable!("Expected Uninstall command");
+        }
+        // `--purge` removes dcg's own config dir; it has nothing to do with
+        // Crush's file, so the pairing is rejected rather than half-honored.
+        assert!(Cli::try_parse_from(["dcg", "uninstall", "--crush", "--purge"]).is_err());
     }
 
     #[test]
@@ -20675,6 +21995,10 @@ if ($errors.Count -ne 0) {
             ("--agy", "--opencode"),
             ("--agy", "--omp"),
             ("--opencode", "--omp"),
+            ("--crush", "--grok"),
+            ("--crush", "--agy"),
+            ("--crush", "--opencode"),
+            ("--crush", "--omp"),
         ] {
             assert!(
                 Cli::try_parse_from(["dcg", "install", left, right]).is_err(),
@@ -20696,8 +22020,9 @@ if ($errors.Count -ne 0) {
             std::fs::write(&config_path, raw).expect("write config.toml");
         }
         // Rewrite the state key to be location-independent for assertions:
-        // callers compare against the returned key when needed.
-        probe_codex_dcg_hook_at(&hooks_path, &config_path)
+        // callers compare against the returned key when needed. The fixture
+        // paths are fictional, so the program-exists check is stubbed true.
+        probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true)
     }
 
     const CODEX_HOOKS_DCG_FIRST: &str = r#"{
@@ -20723,7 +22048,7 @@ if ($errors.Count -ne 0) {
         )
         .expect("write");
         assert_eq!(
-            probe_codex_dcg_hook_at(&hooks_path, &config_path),
+            probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true),
             CodexHookProbe::Registered {
                 state_key: key,
                 state: CodexHookState::Enabled,
@@ -20769,7 +22094,7 @@ if ($errors.Count -ne 0) {
         )
         .expect("write");
         assert_eq!(
-            probe_codex_dcg_hook_at(&hooks_path, &config_path),
+            probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true),
             CodexHookProbe::Registered {
                 state_key: key,
                 state: CodexHookState::Disabled,
@@ -20797,7 +22122,7 @@ if ($errors.Count -ne 0) {
         let hooks_path = dir.path().join("hooks.json");
         std::fs::write(&hooks_path, hooks_json).expect("write");
         let config_path = dir.path().join("config.toml");
-        match probe_codex_dcg_hook_at(&hooks_path, &config_path) {
+        match probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true) {
             CodexHookProbe::Registered { state_key, .. } => {
                 assert!(
                     state_key.ends_with(":pre_tool_use:1:1"),
@@ -20817,11 +22142,239 @@ if ($errors.Count -ne 0) {
             codex_fixture(Some(stub), None),
             CodexHookProbe::NotRegistered
         );
-        assert_eq!(codex_fixture(None, None), CodexHookProbe::NotRegistered);
+        assert_eq!(codex_fixture(None, None), CodexHookProbe::HooksFileMissing);
         assert!(matches!(
             codex_fixture(Some("{not json"), None),
             CodexHookProbe::HooksFileInvalid(_)
         ));
+    }
+
+    // ---- #391: file-level and placement states --------------------------
+
+    /// The reporter's exact file: a top-level `"version": 1` next to a
+    /// perfectly good dcg hook. Codex's `HooksFile` is `deny_unknown_fields`,
+    /// so it rejects the whole file and never reaches trust review — doctor
+    /// used to call this "registered but untrusted" and point at an approval
+    /// prompt that cannot exist.
+    #[test]
+    fn codex_probe_schema_rejected_file_is_not_untrusted_391() {
+        let reporter = r#"{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Fleet\\bin\\dcg.exe"
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+        match codex_fixture(Some(reporter), Some("[hooks.state]\n")) {
+            CodexHookProbe::HooksFileRejected(err) => {
+                assert!(
+                    err.contains("unknown field `version`"),
+                    "rejection must name the offending key: {err}"
+                );
+            }
+            other => panic!("expected HooksFileRejected, got {other:?}"),
+        }
+
+        // Control: the same file without `version` is a registered hook
+        // awaiting trust (exactly what the reporter observed after the edit).
+        let fixed = reporter.replace("  \"version\": 1,\n", "");
+        assert!(matches!(
+            codex_fixture(Some(&fixed), Some("[hooks.state]\n")),
+            CodexHookProbe::Registered {
+                state: CodexHookState::NoStateEntry,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_probe_distinguishes_invalid_json_from_schema_rejection_391() {
+        // Syntax errors: a broken file.
+        assert!(matches!(
+            codex_fixture(Some("{\"hooks\": {\"PreToolUse\": [}"), None),
+            CodexHookProbe::HooksFileInvalid(_)
+        ));
+        // Well-formed JSON in shapes Codex's loader refuses.
+        for rejected in [
+            // Event value must be a matcher-group list.
+            r#"{"hooks":{"PreToolUse":"not a list"}}"#,
+            // Unknown handler type.
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"bogus","command":"dcg"}]}]}}"#,
+            // Missing handler type tag.
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"command":"dcg"}]}]}}"#,
+            // `timeout` must be a number.
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg","timeout":"30"}]}]}}"#,
+            // Second unknown top-level key spelling.
+            r#"{"schema":"v1","hooks":{}}"#,
+        ] {
+            assert!(
+                matches!(
+                    codex_fixture(Some(rejected), None),
+                    CodexHookProbe::HooksFileRejected(_)
+                ),
+                "must be HooksFileRejected: {rejected}"
+            );
+        }
+        // Shapes Codex accepts: optional description, unknown event names
+        // ignored, extra handler fields tolerated.
+        let accepted = r#"{
+  "description": "fleet hooks",
+  "hooks": {
+    "FutureEvent": [],
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "/opt/dcg", "timeout": 30, "statusMessage": "guard", "extra": true } ] }
+    ]
+  }
+}"#;
+        assert!(matches!(
+            codex_fixture(Some(accepted), None),
+            CodexHookProbe::Registered { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_probe_honors_codex_matcher_semantics_391() {
+        let with_matcher = |matcher: &str| {
+            format!(
+                r#"{{"hooks":{{"PreToolUse":[{{"matcher":{matcher},"hooks":[{{"type":"command","command":"/opt/dcg"}}]}}]}}}}"#
+            )
+        };
+        // Selects Bash: exact list, wildcard, absent, empty, regex.
+        for matcher in [
+            r#""Bash""#,
+            r#""Bash|Edit""#,
+            r#""*""#,
+            r#""""#,
+            r#""^Bash$""#,
+            "null",
+        ] {
+            assert!(
+                matches!(
+                    codex_fixture(Some(&with_matcher(matcher)), None),
+                    CodexHookProbe::Registered { .. }
+                ),
+                "matcher {matcher} selects Bash"
+            );
+        }
+        // Does not select Bash: exact list without it, non-matching regex.
+        for matcher in [r#""Edit|Write""#, r#""^Write$""#, r#""BashOutput""#] {
+            match codex_fixture(Some(&with_matcher(matcher)), None) {
+                CodexHookProbe::Misplaced(detail) => {
+                    assert!(
+                        detail.contains("does not select Bash"),
+                        "detail names the matcher problem: {detail}"
+                    );
+                }
+                other => panic!("matcher {matcher}: expected Misplaced, got {other:?}"),
+            }
+        }
+        let group_without_matcher_field =
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"/opt/dcg"}]}]}}"#;
+        assert!(matches!(
+            codex_fixture(Some(group_without_matcher_field), None),
+            CodexHookProbe::Registered { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_probe_reports_dcg_under_the_wrong_event_as_misplaced_391() {
+        let post_only = r#"{"hooks":{"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/dcg"}]}]}}"#;
+        match codex_fixture(Some(post_only), None) {
+            CodexHookProbe::Misplaced(detail) => {
+                assert!(detail.contains("PostToolUse"), "{detail}");
+            }
+            other => panic!("expected Misplaced, got {other:?}"),
+        }
+        // A correct PreToolUse hook alongside a PostToolUse one is simply
+        // registered — the extra hook is not a defect.
+        let both = r#"{"hooks":{
+  "PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/dcg"}]}],
+  "PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/dcg"}]}]}}"#;
+        assert!(matches!(
+            codex_fixture(Some(both), None),
+            CodexHookProbe::Registered { .. }
+        ));
+        // A non-command handler is not a dcg registration at all.
+        let prompt_only =
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"prompt"}]}]}}"#;
+        assert_eq!(
+            codex_fixture(Some(prompt_only), None),
+            CodexHookProbe::NotRegistered
+        );
+    }
+
+    #[test]
+    fn codex_probe_reports_missing_program_as_command_not_found_391() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join("hooks.json");
+        std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
+        let config_path = dir.path().join("config.toml");
+        let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        std::fs::write(
+            &config_path,
+            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\n"),
+        )
+        .expect("write");
+        // Trusted and enabled, yet the program is gone: that outranks the
+        // trust state because nothing can run.
+        assert_eq!(
+            probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| false),
+            CodexHookProbe::CommandNotFound {
+                state_key: key,
+                command: "/home/u/.local/bin/dcg".to_string(),
+            }
+        );
+
+        // The real resolver against the filesystem: a path that exists passes,
+        // a path that does not fails, a bare name goes through PATH lookup.
+        let real = dir.path().join("dcg");
+        std::fs::write(&real, b"#!/bin/sh\n").expect("write stub");
+        assert!(codex_hook_command_exists(&real.display().to_string()));
+        assert!(codex_hook_command_exists(&format!(
+            "\"{}\" --some-flag",
+            real.display()
+        )));
+        assert!(!codex_hook_command_exists(
+            &dir.path().join("missing").join("dcg").display().to_string()
+        ));
+        assert!(!codex_hook_command_exists(""));
+        assert!(!codex_hook_command_exists(
+            "definitely-not-a-real-program-name-dcg-391"
+        ));
+    }
+
+    #[test]
+    fn codex_matcher_and_program_helpers_391() {
+        assert!(codex_matcher_selects_bash(None));
+        assert!(codex_matcher_selects_bash(Some("")));
+        assert!(codex_matcher_selects_bash(Some("*")));
+        assert!(codex_matcher_selects_bash(Some("Bash")));
+        assert!(codex_matcher_selects_bash(Some("Edit|Bash")));
+        assert!(codex_matcher_selects_bash(Some("^Bash$")));
+        assert!(codex_matcher_selects_bash(Some("Ba.h")));
+        assert!(!codex_matcher_selects_bash(Some("Edit|Write")));
+        assert!(!codex_matcher_selects_bash(Some("BashOutput")));
+        assert!(
+            !codex_matcher_selects_bash(Some("[")),
+            "invalid regex never matches"
+        );
+
+        assert_eq!(codex_hook_program("/opt/dcg"), Some("/opt/dcg"));
+        assert_eq!(codex_hook_program("  /opt/dcg --flag"), Some("/opt/dcg"));
+        assert_eq!(
+            codex_hook_program(r#""C:\Program Files\dcg\dcg.exe" --flag"#),
+            Some(r"C:\Program Files\dcg\dcg.exe")
+        );
+        assert_eq!(codex_hook_program(""), None);
     }
 
     #[test]
