@@ -16,7 +16,7 @@ package_version = re.search(r'^version = "([^"]+)"$', (root / "Cargo.toml").read
 
 assert manifest["name"] == "destructive-command-guard"
 assert manifest["version"] == package_version
-assert marketplace["name"] == "pimpmuckl-dcg"
+assert marketplace["name"] == "jjliebig-dcg"
 assert marketplace["plugins"][0]["source"]["path"] == "./plugins/destructive-command-guard"
 handler = hooks["hooks"]["PreToolUse"][0]
 assert handler["matcher"] == "Bash"

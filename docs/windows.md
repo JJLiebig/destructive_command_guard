@@ -11,7 +11,7 @@ Windows-specific behavior, paths, default protection, and honest limitations.
 Install with PowerShell:
 
 ```powershell
-& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.ps1"))) -EasyMode -Verify
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/install.ps1"))) -EasyMode -Verify
 ```
 
 - `-EasyMode` adds the install directory (`%USERPROFILE%\.local\bin` by default)
@@ -53,7 +53,7 @@ the binary while preserving all existing agent-hook wiring.
 Uninstall:
 
 ```powershell
-irm https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/uninstall.ps1 | iex
 ```
 
 `uninstall.ps1` removes `dcg.exe`, the exact User `PATH` entry the installer

@@ -25,8 +25,8 @@ teardown() {
 # Platform Detection Tests
 # ============================================================================
 
-@test "installer defaults to the Pimpmuckl release repository" {
-    [ "$OWNER" = "Pimpmuckl" ]
+@test "installer defaults to the JJLiebig release repository" {
+    [ "$OWNER" = "JJLiebig" ]
     [ "$REPO" = "destructive_command_guard" ]
 }
 
