@@ -3,10 +3,10 @@
 # dcg installer
 #
 # One-liner install (with cache buster):
-#   curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash
+#   curl -fsSL "https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/install.sh?$(date +%s)" | bash
 #
 # Or without cache buster:
-#   curl -fsSL https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/install.sh | bash
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
@@ -28,7 +28,7 @@ umask 022
 shopt -s lastpipe 2>/dev/null || true
 
 VERSION="${VERSION:-}"
-OWNER="${OWNER:-Pimpmuckl}"
+OWNER="${OWNER:-JJLiebig}"
 REPO="${REPO:-destructive_command_guard}"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
@@ -3621,7 +3621,7 @@ PYEOF
     # Brand-new config.yaml. Write a minimal, well-commented config.
     cat > "$settings_file" <<EOFSET
 # Hermes Agent configuration
-# Created by dcg installer (https://github.com/Pimpmuckl/destructive_command_guard)
+# Created by dcg installer (https://github.com/JJLiebig/destructive_command_guard)
 #
 # pre_tool_call hooks fire before any tool invocation. dcg blocks
 # destructive shell commands by emitting {"decision":"block",...} on stdout.

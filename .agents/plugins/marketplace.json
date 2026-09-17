@@ -1,14 +1,14 @@
 {
   "name": "pimpmuckl-dcg",
   "interface": {
-    "displayName": "Pimpmuckl DCG"
+    "displayName": "JJLiebig DCG"
   },
   "plugins": [
     {
       "name": "destructive-command-guard",
       "source": {
         "source": "url",
-        "url": "https://github.com/Pimpmuckl/destructive_command_guard.git",
+        "url": "https://github.com/JJLiebig/destructive_command_guard.git",
         "path": "plugins/destructive-command-guard",
         "ref": "main"
       },

@@ -37,8 +37,8 @@ HOSTS_OVERRIDE=""
 JSON_OUTPUT=false
 INCLUDE_WINDOWS=true
 LOCAL_ONLY=false
-REPO_RAW="https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard"
-REPO_RELEASE="https://github.com/Pimpmuckl/destructive_command_guard/releases/download"
+REPO_RAW="https://raw.githubusercontent.com/JJLiebig/destructive_command_guard"
+REPO_RELEASE="https://github.com/JJLiebig/destructive_command_guard/releases/download"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -54,7 +54,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$VERSION" ]]; then
-  VERSION="$(gh release view -R Pimpmuckl/destructive_command_guard \
+  VERSION="$(gh release view -R JJLiebig/destructive_command_guard \
     --json tagName --jq .tagName 2>/dev/null)"
   [[ -z "$VERSION" ]] && { echo "error: --version required (could not query latest)" >&2; exit 2; }
 fi
