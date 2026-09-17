@@ -1019,7 +1019,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guar
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.14.3-codexpp.2
+curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.14.4-codexpp.1
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -1088,7 +1088,7 @@ repository's known-good `nightly-2026-08-25` pin; the included
 rustup toolchain install nightly-2026-08-25
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-08-25 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.14.3-codexpp.2 destructive_command_guard
+cargo +nightly-2026-08-25 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.14.4-codexpp.1 destructive_command_guard
 ```
 
 ### Manual build
@@ -1112,7 +1112,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.14.3-codexpp.2
+dcg update --version v0.14.4-codexpp.1
 dcg update --system
 dcg update --verify
 dcg update --verify --no-configure  # binary only; preserve existing hook wiring
@@ -1466,9 +1466,27 @@ dcg explain --verbose "rm -rf /tmp/build"
 dcg explain --format json "kubectl delete namespace production"
 ```
 
-JSON output is versioned via `schema_version` (currently 2). v2 adds
+JSON output is versioned via `schema_version` (currently 4). v2 added
 `matched_span`, `matched_text_preview`, and `explanation` in the `match`
-object when a pattern is detected.
+object when a pattern is detected. v3 added the conservative `indeterminate`
+decision. v4 added `mode` and `outcome`.
+
+**`decision` is the evaluator's finding; `outcome` is what the hook does.** A
+rule set to `warn`, `ask`, or `log` in `[policy.rules]`/`[policy.packs]` still
+produces `decision: "deny"` — the pattern did match — and `mode` names the
+configured policy that decides what happens next. `outcome` collapses the two
+into the one answer to gate on:
+
+| `decision` | `mode` | `outcome` | Command runs? |
+|------------|--------|-----------|---------------|
+| `deny` | `deny` | `deny` | No |
+| `deny` | `ask` | `ask` | Only after operator review |
+| `deny` | `warn` | `warn` | Yes, with a warning |
+| `deny` | `log` | `log` | Yes, silently recorded |
+| `allow` | absent | `allow` | Yes |
+
+The human-readable output reports the same resolved outcome, so
+`dcg explain`, `dcg test`, and the live hook agree on every rule.
 
 **Example Output**:
 

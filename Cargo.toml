@@ -1,6 +1,6 @@
 [package]
 name = "destructive_command_guard"
-version = "0.14.3-codexpp.2"
+version = "0.14.4-codexpp.1"
 edition = "2024"
 resolver = "2"
 authors = [
@@ -47,7 +47,7 @@ memchr = "2.8"
 aho-corasick = "1.1"        # Multi-pattern string matching for keyword quick-reject
 smallvec = "1.15.1"
 colored = "3.1"
-dirs = "6.0"
+dirs = "7.0"
 glob = "0.3"                # Glob pattern expansion for custom pack paths
 shell-words = "1.1"         # Quote-aware tokenization for static stdin data-flow analysis
 libc = "0.2"                # Nonblocking, no-follow opens for inspected stdin files on Unix
