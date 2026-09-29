@@ -70,6 +70,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
+are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+
+- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
+  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
+  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
+  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
+  conformance metastasis, dependency smuggling, bench-path hardcoding.
+- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
+  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
+  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+
+The three that most often decide whether a number here is real: a **self-speedup is
+MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
+weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
+standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
+success** — one line, revert, next lever, no retraction narrative.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -233,9 +255,15 @@ platform-sensitive, follow these conventions:
 - **`.exe` suffix.** When constructing a path to the dcg binary, use
   `env!("CARGO_BIN_EXE_dcg")` / `assert_cmd::cargo::cargo_bin("dcg")` in tests, or
   `std::env::consts::EXE_SUFFIX` in `src`. **Never** a bare `push("dcg")` — the
-  Windows CI job greps for it and fails. Use `dirs::home_dir()` (not `HOME`,
-  which is unset on Windows) and set `USERPROFILE`/`TEMP`/`TMP` alongside `HOME`
-  in test isolation.
+  Windows CI job greps for it and fails. Resolve per-user paths only through
+  `config::home_dir()` / `user_config_dir()` / `user_data_dir()` /
+  `user_data_local_dir()` / `user_cache_dir()` — never `dirs::*` (clippy's
+  `disallowed-methods` rejects it) and never raw `HOME` (unset on Windows).
+  `dirs` resolves the Windows profile via the known-folder API and ignores
+  `USERPROFILE`, so a sandboxed Windows test run used to rewrite the operator's
+  real `~\.claude\settings.json` and allow-once store (bd-b2b1). Set
+  `USERPROFILE`/`TEMP`/`TMP` alongside `HOME` in test isolation; `USERPROFILE`
+  alone now relocates `%APPDATA%`/`%LOCALAPPDATA%` too when those are unset.
 - **Verify Windows branches from Linux** without a Windows box: `mingw` + the
   `x86_64-pc-windows-gnu` target are installed, so
   `cargo check --target x86_64-pc-windows-gnu --lib` (or `--bin dcg` / `--tests`)
@@ -302,6 +330,24 @@ cargo test safe_pattern_tests
 cargo test destructive_pattern_tests
 ```
 
+**Prefer `cargo nextest run` when touching anything that mutates the
+environment.** CI runs `cargo nextest run --profile ci`, and nextest gives each
+test its own process — verified by observation, not assumption: sampling a
+`--lib` run showed up to 128 concurrent per-test `--exact` invocations. That
+process isolation is what makes the `unsafe { env::set_var }` sites in test code
+sound, because it removes the concurrent reader.
+
+Under plain `cargo test` every test shares one process and runs on threads, and
+the crate has ~109 `env::var` call sites against ~22 `EnvVarGuard` uses, none of
+the readers taking the lock — plus native code (bundled SQLite reading `TMPDIR`)
+that cannot take a Rust lock even in principle. So `cargo test` is the
+configuration the single crate-wide `ENV_LOCK` cannot actually make safe (#445).
+No failure has been observed from this; the race is available, not active.
+
+`cargo test` stays documented above because filter and `--ignored` syntax differ
+between the two runners (nextest wants `--run-ignored`), and several workflows in
+this file depend on the `cargo test` spelling.
+
 ### The Three Release-Blocking E2E Suites (read before touching perf or protocols)
 
 `cargo test` cannot catch the failure modes that have actually broken users.
@@ -338,10 +384,11 @@ Rules:
   front. Assert `general.hook_timeout_source` too — a bare `>= 1000` check
   cannot tell the shipped default from an inherited 5000.
 - **Set `DCG_SELF_HEAL_HOOK=0` before the installer runs, not after.** dcg
-  repairs a missing/stale hook entry whenever it runs in hook mode, and native
-  Windows resolves the settings path via the Win32 known-folder API, which
-  `USERPROFILE` cannot redirect — so a late disable can rewrite a real
-  machine's agent config.
+  repairs a missing/stale hook entry whenever it runs in hook mode, and
+  released binaries up to v0.14.4 resolve the Windows settings path via the
+  Win32 known-folder API, which `USERPROFILE` cannot redirect — so a late
+  disable can rewrite a real machine's agent config. Current source honors
+  `USERPROFILE` (bd-b2b1), but the installer may still fetch an older release.
 - **Never hard-code the budget in `.github/workflows/ci.yml`.** It is grepped
   out of `HOOK_EVALUATION_BUDGET_MS`; `perf::tests::ci_enforces_absolute_latency_gate_against_shipped_budget`
   fails if that wiring is removed or the margin is loosened past 60%.
@@ -556,7 +603,7 @@ When a command is blocked, dcg outputs JSON to stdout:
     "ruleId": "core.git:reset-hard",
     "packId": "core.git",
     "severity": "critical",
-    "confidence": 0.95,
+    "confidence": 1.0,
     "allowOnceCode": "a1b2c3",
     "allowOnceFullHash": "sha256:abc123...",
     "remediation": {
@@ -575,7 +622,7 @@ When a command is blocked, dcg outputs JSON to stdout:
 | `ruleId` | `string` | Stable pattern ID (e.g., `"core.git:reset-hard"`) for allowlisting |
 | `packId` | `string` | Pack that matched (e.g., `"core.git"`) |
 | `severity` | `string` | `"critical"`, `"high"`, `"medium"`, or `"low"` |
-| `confidence` | `number` | Match confidence 0.0-1.0 |
+| `confidence` | `number?` | Match confidence 0.0–1.0 (two decimals) from `crate::confidence::compute_match_confidence`, the score the `[confidence]` warn threshold reads: 1.0 when the matched span is executed (command word, wrapper-invoked command, redirection target), lower when it sits in quoted data, a comment, or an inert command's arguments. Omitted when the match has no source span (e.g. inside `$(…)`, structural verdicts). |
 | `allowOnceCode` | `string` | Short code for `dcg allow-once` |
 | `remediation.safeAlternative` | `string?` | Suggested safe command |
 
@@ -713,7 +760,8 @@ DCG_BYPASS=1 <command>
 | `core.git:clean-force` | `git clean -f`, `git clean -fd` | High |
 | `core.git:force-push` | `git push --force`, `git push -f` | High |
 | `core.git:branch-force-delete` | `git branch -d`, `--delete`, `-D`, `-f`, `-M`, `-C` | High |
-| `core.git:stash-drop` | `git stash drop`, `git stash clear` | High |
+| `core.git:stash-drop` | `git stash drop` — Medium, so the default policy **warns and lets it run** (the dropped stash stays recoverable via `git fsck` until gc) | Medium |
+| `core.git:stash-clear` | `git stash clear` | Critical |
 
 ### Core Filesystem Patterns (Always Enabled)
 

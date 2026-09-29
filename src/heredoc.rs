@@ -49,6 +49,16 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace, warn};
 
+/// Options a POSIX shell accepts after `-c` and before the command string:
+/// `bash -c -e '<cmd>'`, `sh -c -- '<cmd>'`, `sh -c - '<cmd>'`,
+/// `bash -c -o errexit '<cmd>'`, `bash -c +e '<cmd>'`. The first operand is
+/// the command string, not the first word after the flag.
+macro_rules! shell_option_after_c_re {
+    () => {
+        r"(?:[-+][oO]\s+[A-Za-z_]+|[-+][A-Za-z]+|--?)"
+    };
+}
+
 /// Tier 1 trigger patterns for heredoc and inline script detection.
 ///
 /// These patterns are designed for maximum recall (zero false negatives).
@@ -63,7 +73,7 @@ use tracing::{debug, instrument, trace, warn};
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 21] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -92,13 +102,42 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 21] = [
     r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // Bun's `exec` subcommand hands its argument to a shell, so it is an inline
     // shell payload under a subcommand rather than a flag (issue #397).
-    r"\bbun[0-9.]*(?:\.exe)?\s+exec\b",
+    // The optional quote matches `subcommand_inline_payload`, which dequotes the
+    // subcommand because quoting it does not change the argv Bun receives.
+    // Without it, tier 1 rejected `bun "exec" '<payload>'` and the tier-2
+    // walker that handles that spelling was unreachable.
+    r#"\bbun[0-9.]*(?:\.exe)?\s+['"]?exec\b"#,
+    // Deno's inline form is the `eval` subcommand, not a flag, so the
+    // flag-shaped Bun/Deno trigger above never saw `deno eval "<code>"`.
+    r#"\bdeno[0-9.]*(?:\.exe)?\s+['"]?eval\b"#,
+    // awk hands `system(…)` and its two command-pipe forms to /bin/sh (#399).
+    // Keyed on the awk-program shapes, not the executable, so an ordinary
+    // `awk '{print $1}' file.txt` never reaches extraction.
+    r"\bsystem\s*\(",
+    r"\|\s*&?\s*getline\b",
+    // awk's `print … | "cmd"`. A POSIX pipeline names a command after `|`, not
+    // a quoted string, so this shape is awk's command pipe in practice; tier 1
+    // deliberately over-matches and costs only a tier-2 extraction attempt.
+    // The optional `\\` covers the shell-double-quoted spelling, where the awk
+    // program's own quotes arrive escaped: `awk "BEGIN{ print 1 | \"cmd\" }"`.
+    // Without it tier 1 rejected that command and the tier-2 extractor that
+    // handles it was never reached.
+    r#"\|\s*&?\s*\\?""#,
+    // osascript's AppleScript and JXA shell sinks (#398). `doShellScript` is
+    // the Standard Additions method every JXA example uses, so it needs its own
+    // trigger: the spaced AppleScript keywords above do not match it.
+    r"(?i)\bdo\s+shell\s+script\b",
+    r"\$\.system\s*\(",
+    r"\.doShellScript\s*\(",
     // PHP inline execution
     r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
     // Lua inline execution
     r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
-    // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.)
-    r#"\b(?:sh|bash|zsh|fish)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
+    // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.).
+    // dash/ksh/mksh are ordinary POSIX shells: without them `dash -c "git
+    // reset --hard"` was never unwrapped, and command-position rules such as
+    // core.git never saw the payload.
+    r#"\b(?:sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?\b(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
     // PowerShell inline execution (powershell -Command '...', pwsh -c "...",
     // and Windows full-path forms like
     //   "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '...'
@@ -122,6 +161,9 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 21] = [
     // PowerShell Invoke-Expression / its `iex` alias: executes a string as code. Tier 2
     // extracts the quoted argument and re-evaluates it.
     r"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b",
+    // PowerShell Start-Process (`saps`) with an argument list runs
+    // `<file> <args>`; Tier 2 reconstructs that line and re-evaluates it.
+    r"(?i)(?:^|[\s;|&({])(?:start-process|saps)\b[^\n]*\s(?:-ArgumentList|-Args)\b",
     // Piped execution to interpreters (versioned, with optional .exe)
     r"\|\s*(?:python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(?:js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)(?:\.exe)?\b",
     // Piped to xargs (can execute arbitrary commands)
@@ -150,7 +192,19 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 21] = [
     // so Tier 2 only needs to run when quoting or expansion is present).
     // `[\s;|&(/]` before `ssh` keeps `ssh-keygen`/`ssh-add`/`autossh` from
     // triggering while still matching path-qualified `/usr/bin/ssh`.
-    r#"(?i)(?:^|[\s;|&(/])ssh(?:\.exe)?\s[^\n;|&]*['"$]"#,
+    //
+    // A quoted or escaped name (`\ssh`, `'ssh'`) is the same program, and a
+    // descriptor duplication (`2>&1`) does not end the segment.
+    r#"(?i)(?:^|[\s;|&(/\\'"])ssh(?:\.exe)?['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
+    // `watch '<cmd>'`, `parallel ::: '<cmd>'` / `parallel '<cmd>' ::: …`,
+    // `env -S'<cmd>'`, `su -c '<cmd>'` and the other runners in
+    // `COMMAND_STRING_RUNNERS` hand a command STRING to a shell (or, for
+    // `env -S`, split it into argv), so they are inline-script wrappers like
+    // `sh -c`. Superset of `command_string_runner_payloads`, which validates;
+    // as for ssh, only a quote or `$` makes the payload invisible to raw
+    // matching.
+    // A name split by quoting (`w\atch`) is `names_a_runner_through_quoting`.
+    r#"(?:^|[\s;|&(/\\'"])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine)['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();
@@ -468,7 +522,11 @@ pub enum TriggerResult {
 #[must_use]
 #[instrument(skip(command), fields(cmd_len = command.len()))]
 pub fn check_triggers(command: &str) -> TriggerResult {
-    if contains_active_heredoc_operator(command) || HEREDOC_TRIGGERS.is_match(command) {
+    if contains_active_heredoc_operator(command)
+        || HEREDOC_TRIGGERS.is_match(command)
+        || names_a_runner_through_quoting(command)
+        || blank_local_redirects(command).is_some_and(|view| HEREDOC_TRIGGERS.is_match(&view))
+    {
         debug!("tier1_trigger: heredoc/inline script indicator detected");
         TriggerResult::Triggered
     } else {
@@ -483,10 +541,190 @@ pub fn check_triggers(command: &str) -> TriggerResult {
 #[must_use]
 pub fn matched_triggers(command: &str) -> Vec<usize> {
     let mut matches: Vec<usize> = HEREDOC_TRIGGERS.matches(command).into_iter().collect();
-    if contains_active_heredoc_operator(command) {
+    if let Some(view) = blank_local_redirects(command) {
+        for index in &HEREDOC_TRIGGERS.matches(&view) {
+            if !matches.contains(&index) {
+                matches.push(index);
+            }
+        }
+        matches.sort_unstable();
+    }
+    if contains_active_heredoc_operator(command) || names_a_runner_through_quoting(command) {
         matches.push(MANUAL_HEREDOC_TRIGGER_INDEX);
     }
     matches
+}
+
+/// `command` with each unquoted local redirect word blank-filled, or `None`
+/// when it has none. The shell removes a redirect from the argv wherever it
+/// stands, so `sh 2>/dev/null -c '<cmd>'`, `sh -c 2>/dev/null '<cmd>'` and
+/// `python3 &>log -c '<cmd>'` run `<cmd>`, while the inline-interpreter
+/// patterns expect options and the flag to follow one another. They also
+/// read this view (sixth review of GH #498); repeating a redirect fragment in
+/// each pattern instead made the tier-1 set, which every hook call compiles,
+/// about a millisecond slower to build.
+///
+/// A redirect word starts a word (or follows one directly, operator first):
+/// optional descriptor digits or `{name}`, then `>`, `<`, `>>`, `<>`, `>|`,
+/// `>&`, `<&`, `&>` or `&>>`, then its target, glued or after blanks
+/// (`2> /dev/null`, `2>& 1`). A here-string (`<<<word`) is a redirect too
+/// (`sh <<<x -c '<cmd>'` runs `<cmd>`); a heredoc (`<<`), a process
+/// substitution (`<(`) and a word without a target are left alone. A target's
+/// `$(…)`, `${…}` and backquoted parts belong to it (`2>$(mktemp) -c`). Text
+/// inside quotes is never taken for a redirect, so a quoted payload reads the
+/// same in both. Length
+/// preserving (every blanked byte becomes a space, so the view stays UTF-8
+/// and every range in it is the same range in `command`); linear.
+fn blank_local_redirects(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    memchr::memchr2(b'<', b'>', bytes)?;
+    let len = bytes.len();
+    let mut view: Option<Vec<u8>> = None;
+    let mut index = 0usize;
+    let mut word_start = true;
+    while index < len {
+        let byte = bytes[index];
+        if matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'(' | b')'
+        ) || (byte == b'&' && bytes.get(index + 1) != Some(&b'>'))
+        {
+            word_start = true;
+            index += 1;
+            continue;
+        }
+        // A redirect may also follow a word directly (`sh>/dev/null -c …`
+        // is `sh` and `>/dev/null`); its operator then starts it.
+        if (word_start || matches!(byte, b'<' | b'>' | b'&'))
+            && let Some(end) = local_redirect_word_end(bytes, index)
+        {
+            view.get_or_insert_with(|| bytes.to_vec())[index..end].fill(b' ');
+            index = end;
+            continue;
+        }
+        word_start = false;
+        index = match byte {
+            b'\\' => (index + 2).min(len),
+            // `<<`, `<<-`, `<<<`: a heredoc or here-string operator, whose
+            // second `<` must not be read as a redirect of the delimiter.
+            b'<' => index + bytes[index..].iter().take_while(|&&b| b == b'<').count(),
+            // `$'…'` takes backslash escapes, so `\'` does not close it.
+            b'$' if bytes.get(index + 1) == Some(&b'\'') => {
+                let mut at = index + 2;
+                while at < len && bytes[at] != b'\'' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                (at + 1).min(len)
+            }
+            b'\'' => memchr(b'\'', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
+            b'"' => skip_double_quoted(bytes, index + 1),
+            _ => index + 1,
+        };
+    }
+    view.map(|view| String::from_utf8(view).expect("blank-filling whole characters keeps UTF-8"))
+}
+
+/// End of the local redirect word starting at `start` (see
+/// [`blank_local_redirects`]), target included, or `None`.
+fn local_redirect_word_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut index = start;
+    if bytes[index] == b'{' {
+        // `{name}`: stop at the first byte that is not part of a name, so a
+        // run of `{` is not rescanned to its end at each one.
+        let name = bytes[index + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+            .count();
+        let close = index + 1 + name;
+        if name == 0 || bytes[index + 1].is_ascii_digit() || bytes.get(close) != Some(&b'}') {
+            return None;
+        }
+        index = close + 1;
+    } else {
+        while index < len && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    let rest = &bytes[index..];
+    let operator = if rest.starts_with(b"&>>") || rest.starts_with(b"<<<") {
+        3
+    } else if rest.starts_with(b"&>")
+        || rest.starts_with(b">>")
+        || rest.starts_with(b"<>")
+        || rest.starts_with(b">|")
+        || rest.starts_with(b">&")
+        || rest.starts_with(b"<&")
+    {
+        2
+    } else if matches!(rest.first(), Some(b'>' | b'<')) {
+        1
+    } else {
+        return None;
+    };
+    if matches!(rest.get(operator), Some(b'(' | b'<')) {
+        // `<(…)`/`>(…)`, `<<`, `<<<<`, `>>(…)`: not a plain redirect.
+        return None;
+    }
+    index += operator;
+    while index < len && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    let target_start = index;
+    while index < len {
+        index = match bytes[index] {
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' => break,
+            b'\\' => (index + 2).min(len),
+            b'\'' => memchr(b'\'', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
+            b'"' => skip_double_quoted(bytes, index + 1),
+            b'`' => memchr(b'`', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                crate::normalize::consume_shell_paren_construct(bytes, index + 2, len)
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'{') => {
+                memchr(b'}', &bytes[index + 2..]).map_or(len, |at| index + 3 + at)
+            }
+            _ => index + 1,
+        };
+    }
+    (index > target_start).then_some(index)
+}
+
+/// Index just past the double-quoted string whose body starts at `start`.
+fn skip_double_quoted(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return index + 1,
+            b'\\' => index += 2,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Whether quoting inside a word hides a command-string runner's or `ssh`'s
+/// name from the trigger patterns: `w\atch '<cmd>'`, `wat$'c'h '<cmd>'` and
+/// `s'sh' h '<cmd>'` run `watch` and `ssh`, but no pattern sees the name.
+/// Superset of what Tier 2 validates; linear.
+fn names_a_runner_through_quoting(command: &str) -> bool {
+    if !command
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'\'' | b'"'))
+    {
+        return false;
+    }
+    let unquoted: String = command
+        .chars()
+        .filter(|ch| !matches!(ch, '\\' | '\'' | '"' | '$'))
+        .collect();
+    // Dequoting never removes an occurrence (no name holds a quote), so a
+    // name the quoting hid shows as one more occurrence, even when the same
+    // name also stands plainly elsewhere (`echo watch; w\atch '<cmd>'`).
+    COMMAND_STRING_RUNNERS
+        .iter()
+        .copied()
+        .chain(["ssh"])
+        .any(|name| unquoted.matches(name).count() > command.matches(name).count())
 }
 
 // ============================================================================
@@ -515,6 +753,39 @@ impl Default for ExtractionLimits {
             max_body_lines: 10_000,
             max_heredocs: 10,
             timeout_ms: 50,
+        }
+    }
+}
+
+impl ExtractionLimits {
+    /// Limits for the helpers that answer a *structural* question — which
+    /// heredoc bodies exist, and where one body begins and ends — rather than
+    /// doing hot-path extraction work.
+    ///
+    /// `pub(crate)` for the four evaluator classification helpers that ask the
+    /// same kind of question: is this a literal heredoc producer, is this
+    /// offset inside a quoted body, does this range intersect interpreter
+    /// input. Each turns a non-`Extracted` result straight into a
+    /// classification — `Unverified`, `None`, `false` — so the wall clock
+    /// decided the answer there too (#443).
+    ///
+    /// Same size caps as [`Self::default`], because those are what actually bound
+    /// the work: the caller has already limited the input to 256 KiB, and a body
+    /// is capped at 1 MiB / 10k lines / 10 heredocs. Only the wall clock differs,
+    /// and it is generous deliberately. At 50 ms it expired under parallel load,
+    /// the helper answered "no content", and the recovery declined — so a
+    /// data-sink heredoc body that masks on an idle machine was re-scanned as
+    /// live shell instead. The failing direction is over-blocking, so it was
+    /// fail-safe, but "does this command contain one heredoc" is a property of
+    /// the command and must not depend on how busy the machine is (#443).
+    ///
+    /// The budget is kept rather than removed so a pathological input still
+    /// terminates; it is sized so that only descheduling, never ordinary work,
+    /// could reach it.
+    pub(crate) fn structural_scan() -> Self {
+        Self {
+            timeout_ms: 5_000,
+            ..Self::default()
         }
     }
 }
@@ -579,6 +850,9 @@ impl ScriptLanguage {
             || matches_interpreter("bash")
             || matches_interpreter("zsh")
             || matches_interpreter("fish")
+            || matches_interpreter("dash")
+            || matches_interpreter("ksh")
+            || matches_interpreter("mksh")
             // PowerShell (`powershell`, `powershell.exe`, `pwsh`) running an
             // inner command via `-Command`/`-c`. We re-check the body as a
             // shell command: destructive command names (git, rm, etc.) are
@@ -942,6 +1216,37 @@ pub enum SkipReason {
     MalformedInput { reason: String },
 }
 
+impl SkipReason {
+    /// Whether this reason means the reading stopped early, so payloads that
+    /// are present in the command were never read (#427).
+    ///
+    /// Every budget and abort qualifies: the extractor gave up with work left
+    /// to do, which is what makes the result an incomplete reading and the
+    /// caller's problem rather than the extractor's.
+    ///
+    /// `UnterminatedHeredoc` deliberately does not. It reports a shape — a
+    /// `<<` with no terminator line — and nothing was dropped on account of
+    /// it; the text is still in the command every pattern is matched against.
+    /// It is also routinely a *misread* of ordinary data, because the operator
+    /// appears in arithmetic (`$((1<<3))`), in prose that a rule is documented
+    /// with (`git commit -m "explain <<EOF"`), and historically in the tail of
+    /// a here-string. Treating it as an incomplete reading would put all of
+    /// those on the bounded-fallback path and deny them outright under
+    /// `fallback_on_parse_error=false`.
+    #[must_use]
+    pub fn stopped_early(&self) -> bool {
+        match self {
+            Self::ExceededSizeLimit { .. }
+            | Self::ExceededLineLimit { .. }
+            | Self::ExceededHeredocLimit { .. }
+            | Self::BinaryContent { .. }
+            | Self::Timeout { .. }
+            | Self::MalformedInput { .. } => true,
+            Self::UnterminatedHeredoc { .. } => false,
+        }
+    }
+}
+
 impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1042,7 +1347,7 @@ static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // `(?i:powershell|pwsh)` matches the Windows PowerShell host case-insensitively;
     // `["']?` after the interpreter swallows the closing quote of a quoted full
     // path (e.g. `"...\powershell.exe" -Command '...'`) before flags (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
         .expect("inline script single-quote regex compiles")
 });
 
@@ -1054,8 +1359,49 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
     // PowerShell host + quoted-path closing quote handled as in the single-quote
     // variant above (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
+});
+
+/// A POSIX shell `-c` whose operand is UNQUOTED and is a single expansion or
+/// command substitution: `sh -c $CMD`, `bash -c $(cat f)`, `` dash -c `x` ``.
+/// Only this dynamic shape is extracted; an unquoted literal operand runs just
+/// its first word (`bash -c rm -rf /` runs `rm` with `-rf` as `$0`), which the
+/// quoted patterns' semantics do not describe. The extracted source is wholly
+/// dynamic, so the evaluator fails it closed like the quoted forms (bd-vweh).
+/// Groups match the quoted patterns: (1) shell, (2) unused, (3) flag, (4) operand.
+static INLINE_SCRIPT_UNQUOTED_DYNAMIC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*c[A-Za-z]*)(?:\s+", shell_option_after_c_re!(), r")*\s+(\$\{[^}\s]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|\$\([^()]*\)|`[^`]*`)(?:\s|$|[;&|)])"))
+        .expect("inline script unquoted-dynamic regex compiles")
+});
+
+/// A POSIX shell whose `-c` is followed by options before the quoted command
+/// string: `sh -c -- '<cmd>'`, `sh -c - '<cmd>'`, `bash -c -e '<cmd>'`,
+/// `bash -c -o errexit '<cmd>'`. The shell takes its first operand as the
+/// command string, so the payload is that quoted word; the quoted patterns
+/// above expect it right after the flag, so at least one option is required
+/// here and a command both read is not read twice. Groups match the quoted
+/// patterns: (1) shell, (2) unused, (3) flag, (4) content.
+static INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b['\x22]?(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*",
+        r"\s+(-[A-Za-z]*c[A-Za-z]*)(?:\s+",
+        shell_option_after_c_re!(),
+        r")+\s+'([^']*)'"
+    ))
+    .expect("inline shell options-after-c single-quote regex compiles")
+});
+
+/// [`INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE`] for a double-quoted command
+/// string.
+static INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b['\x22]?(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*",
+        r"\s+(-[A-Za-z]*c[A-Za-z]*)(?:\s+",
+        shell_option_after_c_re!(),
+        r")+\s+\x22([^\x22]*)\x22"
+    ))
+    .expect("inline shell options-after-c double-quote regex compiles")
 });
 
 /// Regex for `cmd /c "..."` / `cmd /k ...` inline execution (the Windows analog of
@@ -1075,6 +1421,17 @@ static CMD_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
 static IEX_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b\s*(?:"([^"]*)"|'([^']*)')"#)
         .expect("iex inline script regex compiles")
+});
+
+/// Regex for `Start-Process [-FilePath] <file> -ArgumentList '<args>'` (or
+/// `saps`, `-Args`, `-FilePath:`/`-ArgumentList:` colon forms). Group 1 = the
+/// file, group 2/3 = the double/single-quoted argument string. A comma list
+/// or a variable is not reconstructed (no extraction, no change).
+static START_PROCESS_INLINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(?:^|[\s;|&({])(?:start-process|saps)\s+(?:-FilePath\s*:?\s*)?['"]?([^\s'",;|$()]+)['"]?\s+(?:-ArgumentList|-Args)\s*:?\s*(?:"([^"]*)"|'([^']*)')(?:\s|$|[;|&)])"#,
+    )
+    .expect("start-process inline regex compiles")
 });
 
 /// Regex for `powershell -EncodedCommand <base64>` (flag abbreviates to any prefix
@@ -1199,6 +1556,11 @@ fn record_timeout_if_needed(
 ///
 /// - Bounded memory usage (never allocate >`max_body_bytes` per heredoc)
 /// - Graceful degradation on malformed input (fail-open with warning)
+/// - `Extracted` means nothing was dropped. A budget or an abort that stops an
+///   extractor — see [`SkipReason::stopped_early`] — yields `Partial` instead,
+///   even when other payloads were read successfully, because the caller
+///   decides what an incomplete reading is worth and cannot decide that if it
+///   is told the reading was complete (#427).
 ///
 /// # Examples
 ///
@@ -1218,6 +1580,37 @@ fn record_timeout_if_needed(
 #[must_use]
 #[instrument(skip(command, limits), fields(cmd_len = command.len(), timeout_ms = limits.timeout_ms))]
 pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionResult {
+    // Inline-script extraction scans a view whose *data* heredoc bodies are
+    // blanked, while heredoc extraction keeps the raw text (#420).
+    //
+    // Both were scanning the raw command, so a quoted body destined for a data
+    // sink was masked for pattern matching and simultaneously mined for inline
+    // scripts: `git commit -F - <<'EOF'` whose message *describes*
+    // `bash -c "rm -rf ~/x"` was denied, and so was a `cat > notes.md` heredoc
+    // documenting the same thing. The text is data by every test the masker
+    // applies — quoted delimiter, non-shell data sink, target not rebindable —
+    // and `evaluate_heredoc`'s own skip already says so; it just never reached
+    // the payload the extractor had already mined out of it.
+    //
+    // The mask is blank-fill and length preserving, so every `byte_range` an
+    // extractor computes against the view is the same range in the original.
+    let scan_view = mask_non_expanding_data_heredocs(command);
+    extract_content_with_scan_view(command, scan_view.as_ref(), limits)
+}
+
+/// [`extract_content`], with the view that inline-script extraction scans given
+/// explicitly.
+///
+/// `active_single_heredoc_fallback` calls this with `scan_view == command` to
+/// break a cycle: masking asks `active_heredocs` where the bodies are, that
+/// falls back to this extractor when the parse is ambiguous, and computing the
+/// mask again there would not terminate. Scanning the raw text in that one
+/// place is the conservative direction — it is what every caller did before.
+fn extract_content_with_scan_view(
+    command: &str,
+    scan_view: &str,
+    limits: &ExtractionLimits,
+) -> ExtractionResult {
     let start_time = Instant::now();
     let timeout = Duration::from_millis(limits.timeout_ms);
     let mut skip_reasons: Vec<SkipReason> = Vec::new();
@@ -1250,9 +1643,13 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return ExtractionResult::Skipped(skip_reasons);
     }
 
-    // Extract inline scripts (-c/-e flags)
+    // Extract inline scripts (-c/-e flags). These and the six extractors after
+    // them read the scan view, so a payload quoted inside a data heredoc's body
+    // is not mined out of it as a live invocation (#420). The heredoc and
+    // here-string extractors below keep the raw command: their whole job is to
+    // find those bodies.
     extract_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1263,13 +1660,16 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
     // Extract Windows inline wrappers (cmd /c|/k, iex/Invoke-Expression, -EncodedCommand)
     extract_windows_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1280,13 +1680,16 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
     // Extract `mise exec -c/--command` inline shell payloads (#259)
     extract_mise_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1297,13 +1700,25 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
     // Extract `bun exec <payload>` inline shell payloads (#397)
     extract_bun_exec_inline_scripts(
-        command,
+        scan_view,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    // Extract `deno eval <code>` inline JavaScript/TypeScript payloads
+    extract_deno_eval_inline_scripts(
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1314,13 +1729,56 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
+        };
+    }
+
+    // Extract awk `system()` / command-pipe shell payloads (#399)
+    extract_awk_inline_scripts(
+        scan_view,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, &mut skip_reasons) {
+        return if extracted.is_empty() {
+            ExtractionResult::Skipped(skip_reasons)
+        } else {
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
+        };
+    }
+
+    // Extract `osascript -e 'do shell script "…"'` payloads (#398)
+    extract_osascript_inline_scripts(
+        scan_view,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, &mut skip_reasons) {
+        return if extracted.is_empty() {
+            ExtractionResult::Skipped(skip_reasons)
+        } else {
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
     // Extract `ssh … destination <command…>` remote payloads (#326)
     extract_ssh_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1331,7 +1789,30 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
+        };
+    }
+
+    // `watch '<cmd>'`, `parallel ::: '<cmd>'`, `env -S'<cmd>'`
+    extract_command_string_runner_scripts(
+        scan_view,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, &mut skip_reasons) {
+        return if extracted.is_empty() {
+            ExtractionResult::Skipped(skip_reasons)
+        } else {
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1348,7 +1829,10 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1386,14 +1870,39 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
             ExtractionResult::Extracted(extracted)
         }
         (false, false) => {
-            // Partial extraction with some skips - return what we got
+            // Something was extracted and something was skipped. When the skip
+            // means the reading stopped early — a budget or an abort, see
+            // `SkipReason::stopped_early` — this is not a complete reading of
+            // the command and must not be reported as one (#427).
+            // `Extracted` told the evaluator "here is all of
+            // the embedded code", which skipped the bounded fallback and let
+            // ten benign payloads hide an eleventh: `awk` with ten
+            // `system("echo N")` calls followed by one `system("rm -rf ~/Documents")`
+            // filled `max_heredocs` and was allowed, while nine pads were
+            // blocked. The same padding starved the ssh/herestring/heredoc
+            // extractors that run after the awk one.
+            //
+            // `Partial` is the case the evaluator already models: it analyses
+            // what was extracted, then runs the bounded fallback over the whole
+            // command because a source was skipped, and honours
+            // `fallback_on_timeout` / `fallback_on_parse_error` for callers who
+            // want an incomplete reading to be a denial outright.
             debug!(
                 elapsed_us,
                 count = extracted.len(),
                 skip_count = skip_reasons.len(),
                 "tier2_complete: partial extraction with skips"
             );
-            ExtractionResult::Extracted(extracted)
+            if skip_reasons.iter().any(SkipReason::stopped_early) {
+                ExtractionResult::Partial {
+                    extracted,
+                    skipped: skip_reasons,
+                }
+            } else {
+                // Only shape observations, nothing dropped — see
+                // `SkipReason::stopped_early`.
+                ExtractionResult::Extracted(extracted)
+            }
         }
     }
 }
@@ -1417,10 +1926,18 @@ fn extract_inline_scripts(
         return;
     }
 
-    // Helper to extract from a given regex pattern
+    // Helper to extract from a given regex pattern. The patterns read the
+    // command and then its redirect view (`sh 2>/dev/null -c '…'`); the view
+    // is length preserving, so a payload found in both is the same range and
+    // is read once.
+    let redirect_view = blank_local_redirects(command);
+    let option_after_c_flag = std::iter::once(command)
+        .chain(redirect_view.as_deref())
+        .any(may_have_option_after_c_flag);
     let mut hit_limit = false;
     let mut extract_from_pattern = |pattern: &Regex| {
-        for cap in pattern.captures_iter(command) {
+        let views = std::iter::once(command).chain(redirect_view.as_deref());
+        for cap in views.flat_map(|view| pattern.captures_iter(view)) {
             if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
                 return;
             }
@@ -1433,7 +1950,10 @@ fn extract_inline_scripts(
             let flag = cap.get(3).map_or("", |m| m.as_str());
             // Content is in group 4: (1) interpreter, (2) optional "js", (3) flag, (4) content
             let content_match = cap.get(4);
-            let content = content_match.map_or("", |m| m.as_str());
+            // From `command`, not the view the match came from (same range).
+            let content = content_match
+                .and_then(|m| command.get(m.start()..m.end()))
+                .unwrap_or("");
 
             // The regex covers multiple interpreters; validate that the matched flag actually
             // implies inline code for this interpreter (e.g. bash needs -c, perl needs -e/-E).
@@ -1479,12 +1999,20 @@ fn extract_inline_scripts(
             }
 
             let full_match = cap.get(0).unwrap();
+            let content_range = content_match.map(|m| m.start()..m.end());
+            if content_range.is_some()
+                && extracted
+                    .iter()
+                    .any(|seen| seen.content_range == content_range)
+            {
+                continue;
+            }
             extracted.push(ExtractedContent {
                 content: content.to_string(),
                 language: ScriptLanguage::from_command(cmd_name),
                 delimiter: None,
                 byte_range: full_match.start()..full_match.end(),
-                content_range: content_match.map(|m| m.start()..m.end()),
+                content_range,
                 quoted: true, // -c/-e content is always in quotes
                 heredoc_type: None,
                 target_command: Some(cmd_name.to_string()), // -c/-e content is executed by the interpreter
@@ -1495,12 +2023,33 @@ fn extract_inline_scripts(
     // Extract from both single-quoted and double-quoted patterns
     extract_from_pattern(&INLINE_SCRIPT_SINGLE_QUOTE);
     extract_from_pattern(&INLINE_SCRIPT_DOUBLE_QUOTE);
+    extract_from_pattern(&INLINE_SCRIPT_UNQUOTED_DYNAMIC);
+    // Built and run only when some flag ending in `c` is followed by an
+    // option, which few commands have; building them costs every other one
+    // about a millisecond.
+    if option_after_c_flag {
+        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE);
+        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE);
+    }
 
     if hit_limit {
         skip_reasons.push(SkipReason::ExceededHeredocLimit {
             limit: limits.max_heredocs,
         });
     }
+}
+
+/// Whether a `c` is followed by blanks and then `-` or `+`: a superset of a
+/// shell's `-c` followed by an option (`sh -c -- '…'`), the only commands
+/// [`INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE`] and its double-quote twin
+/// can match. Linear: each blank run follows one `c`.
+fn may_have_option_after_c_flag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    memchr::memchr_iter(b'c', bytes).any(|at| {
+        let rest = &bytes[at + 1..];
+        let blanks = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        blanks > 0 && matches!(rest.get(blanks), Some(b'-' | b'+'))
+    })
 }
 
 /// Push one extracted Windows inner command (re-evaluated as a shell command).
@@ -1561,8 +2110,18 @@ fn extract_windows_inline_scripts(
         return;
     }
 
+    // Each pattern also reads the redirect view (`pwsh 2>$null -enc …`,
+    // `cmd 2>nul /c …`; see `blank_local_redirects`). The view is length
+    // preserving, so payload text is taken from `command` by range and a
+    // payload both readings find is read once.
+    let redirect_view = blank_local_redirects(command);
+    let views: Vec<&str> = std::iter::once(command)
+        .chain(redirect_view.as_deref())
+        .collect();
+    let text = |m: regex::Match<'_>| command.get(m.start()..m.end()).unwrap_or("");
+
     // cmd /c | /k  (double-quoted, single-quoted, or unquoted rest-of-line)
-    for cap in CMD_INLINE_SCRIPT.captures_iter(command) {
+    for cap in windows_view_captures(&CMD_INLINE_SCRIPT, &views, &[1, 2, 3]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
@@ -1572,7 +2131,7 @@ fn extract_windows_inline_scripts(
                 extracted,
                 skip_reasons,
                 limits,
-                m.as_str(),
+                text(m),
                 full.start()..full.end(),
                 Some(m.start()..m.end()),
                 "cmd",
@@ -1583,7 +2142,7 @@ fn extract_windows_inline_scripts(
     }
 
     // iex / Invoke-Expression "<code>"
-    for cap in IEX_INLINE_SCRIPT.captures_iter(command) {
+    for cap in windows_view_captures(&IEX_INLINE_SCRIPT, &views, &[1, 2]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
@@ -1593,7 +2152,7 @@ fn extract_windows_inline_scripts(
                 extracted,
                 skip_reasons,
                 limits,
-                m.as_str(),
+                text(m),
                 full.start()..full.end(),
                 Some(m.start()..m.end()),
                 "iex",
@@ -1603,13 +2162,39 @@ fn extract_windows_inline_scripts(
         }
     }
 
+    // Start-Process <file> -ArgumentList '<args>': the process runs `<file>
+    // <args>`, so `Start-Process cmd -ArgumentList '/c rd /s /q C:\src'` is the
+    // same deletion as the denied `cmd /c rd /s /q C:\src`. The reconstructed
+    // line is not a substring of the command, so there is no content_range.
+    for cap in windows_view_captures(&START_PROCESS_INLINE, &views, &[2, 3]) {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        let (Some(file), Some(args)) = (cap.get(1), cap.get(2).or_else(|| cap.get(3))) else {
+            continue;
+        };
+        let full = cap.get(0).expect("group 0 always present");
+        let line = format!("{} {}", text(file), text(args));
+        if !push_windows_inner(
+            extracted,
+            skip_reasons,
+            limits,
+            &line,
+            full.start()..full.end(),
+            None,
+            "start-process",
+        ) {
+            return;
+        }
+    }
+
     // powershell -EncodedCommand <base64>  (decode base64 UTF-16LE, then re-evaluate)
-    for cap in POWERSHELL_ENCODED_COMMAND.captures_iter(command) {
+    for cap in windows_view_captures(&POWERSHELL_ENCODED_COMMAND, &views, &[1]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
         let Some(b64) = cap.get(1) else { continue };
-        let Some(decoded) = decode_powershell_encoded_command(b64.as_str()) else {
+        let Some(decoded) = decode_powershell_encoded_command(text(b64)) else {
             continue; // fail-open on invalid base64
         };
         let full = cap.get(0).expect("group 0 always present");
@@ -1627,6 +2212,28 @@ fn extract_windows_inline_scripts(
             return;
         }
     }
+}
+
+/// `pattern`'s captures in each of `views` (the command, then its redirect
+/// view), dropping a capture whose payload (the first of `payload_groups`
+/// that matched) was already captured at the same range: the views are the
+/// same length, so that is the same payload read twice. Lazy, so a caller
+/// that stops at the extraction limit stops the scan too.
+fn windows_view_captures<'a>(
+    pattern: &'a Regex,
+    views: &'a [&'a str],
+    payload_groups: &'a [usize],
+) -> impl Iterator<Item = regex::Captures<'a>> + 'a {
+    let mut seen = std::collections::HashSet::new();
+    views
+        .iter()
+        .flat_map(move |view| pattern.captures_iter(view))
+        .filter(move |cap| {
+            payload_groups
+                .iter()
+                .find_map(|&group| cap.get(group))
+                .is_none_or(|m| seen.insert((m.start(), m.end())))
+        })
 }
 
 /// Byte spans of one `mise exec -c/--command` inline shell payload.
@@ -1922,6 +2529,129 @@ fn dequoted_flag_word(text: &str, start: usize, end: usize) -> (&str, usize, usi
     (text, start, end)
 }
 
+/// The basename an executable token actually launches: one layer of whole-token
+/// quoting removed, directories stripped, and a trailing `.exe` removed in any
+/// case. Callers compare the result with `eq_ignore_ascii_case`.
+///
+/// Quoting an executable is invisible to the kernel — `"awk" 'prog'` and
+/// `awk 'prog'` produce identical argv — and macOS, the only platform that
+/// ships `osascript`, is case-insensitive by default, so `OSASCRIPT` really
+/// does run. Matching the raw token missed every one of those spellings.
+/// An executable word with shell quoting removed throughout, not only at its
+/// ends.
+///
+/// The shell resolves `a"wk"`, `aw\k` and `$'awk'` to the same program as a
+/// bare `awk`, and dcg's `sh`/`python`/`node`/`perl` paths already see through
+/// those spellings. Stripping only whole-token quotes left the awk and
+/// osascript extractors inconsistent with the rest of the file, so
+/// `a"wk" 'BEGIN{ system("…") }'` extracted nothing while `"awk" '…'` worked.
+fn dequoted_executable_word(word: &str) -> std::borrow::Cow<'_, str> {
+    if !word
+        .bytes()
+        .any(|b| matches!(b, b'"' | b'\'' | b'\\' | b'$'))
+    {
+        return std::borrow::Cow::Borrowed(word);
+    }
+    let bytes = word.as_bytes();
+    let mut out = String::with_capacity(word.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            // The backslash is syntax; whatever it escapes is a literal.
+            b'\\' if index + 1 < bytes.len() => {
+                let next = index + 1;
+                let end = word[next..]
+                    .chars()
+                    .next()
+                    .map_or(next, |c| next + c.len_utf8());
+                out.push_str(&word[next..end]);
+                index = end;
+            }
+            // `$'…'` and `$"…"` are quoting forms, so the `$` is syntax too.
+            b'$' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => index += 1,
+            b'\'' | b'"' => index += 1,
+            _ => {
+                let Some(c) = word[index..].chars().next() else {
+                    break;
+                };
+                out.push(c);
+                index += c.len_utf8();
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+fn interpreter_basename(word: &str) -> &str {
+    let (word, _, _) = dequoted_flag_word(word, 0, word.len());
+    let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    if basename.len() > 4 {
+        let split = basename.len() - 4;
+        if basename.is_char_boundary(split) {
+            let (stem, extension) = basename.split_at(split);
+            if extension.eq_ignore_ascii_case(".exe") {
+                return stem;
+            }
+        }
+    }
+    basename
+}
+
+/// Whether `haystack` contains `needle` (ASCII) ignoring case.
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return needle.is_empty();
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Whether `command` could name the interpreter `needle`, allowing for shell
+/// quoting spliced anywhere into the word and for any letter case.
+///
+/// This is the inline-script extractors' cheap pre-gate, and a plain substring
+/// test was wrong in two directions. A case-varied `AWK` skipped it, and so did
+/// every spelling that splits the name with quoting: `a"wk"`, `aw\k` and
+/// `$'awk'` contain no contiguous `awk`, so the gate rejected them before
+/// tokenization even though `dequoted_executable_word` behind it resolves all
+/// three. The gate has to be at least as permissive as the matcher it guards.
+///
+/// The contiguous test runs first because it is both the common case and the
+/// cheaper one. The quoting-aware walk runs only when that fails, and is bounded
+/// by `general.max_command_bytes` times the single-digit needle length.
+fn names_interpreter(command: &str, needle: &str) -> bool {
+    if contains_ascii_case_insensitive(command, needle) {
+        return true;
+    }
+    let bytes = command.as_bytes();
+    let needle = needle.as_bytes();
+    // A `$` is quoting syntax only in `$'…'`/`$"…"`, but treating every `$` as
+    // skippable merely widens this gate, and the executable matcher behind it
+    // still has to agree before anything is extracted.
+    let is_quoting = |b: u8| matches!(b, b'"' | b'\'' | b'\\' | b'$');
+    (0..bytes.len()).any(|start| {
+        if is_quoting(bytes[start]) {
+            return false;
+        }
+        let mut matched = 0usize;
+        let mut index = start;
+        while index < bytes.len() && matched < needle.len() {
+            let byte = bytes[index];
+            index += 1;
+            if is_quoting(byte) {
+                continue;
+            }
+            if !byte.eq_ignore_ascii_case(&needle[matched]) {
+                return false;
+            }
+            matched += 1;
+        }
+        matched == needle.len()
+    })
+}
+
 /// Whether a `Word` token actually opens a redirection of the *local* command
 /// (`>file`, `2>`, `>>out`, `&>log`, `<in`).
 ///
@@ -1930,9 +2660,11 @@ fn dequoted_flag_word(text: &str, start: usize, end: usize) -> (&str, usize, usi
 /// means the glyph is data, not syntax, so only a bare operator counts.
 fn word_token_starts_local_redirect(text: &str) -> bool {
     let bytes = text.as_bytes();
-    let mut index = 0usize;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
+    let mut index = redirect_descriptor_prefix_len(text);
+    if index == 0 {
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
     }
     match bytes.get(index) {
         Some(b'>' | b'<') => true,
@@ -1943,15 +2675,109 @@ fn word_token_starts_local_redirect(text: &str) -> bool {
     }
 }
 
+/// Length of a `{name}` descriptor-variable prefix (`{fd}>file`, bash 4.1+),
+/// or 0. It allocates a descriptor and stores its number in `name`; like a
+/// numbered descriptor it belongs to the redirect, not to the argv.
+fn redirect_descriptor_prefix_len(text: &str) -> usize {
+    let Some(rest) = text.strip_prefix('{') else {
+        return 0;
+    };
+    let Some(close) = rest.find('}') else {
+        return 0;
+    };
+    let name = &rest[..close];
+    let valid = name
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if valid && matches!(rest.as_bytes().get(close + 1), Some(b'>' | b'<')) {
+        close + 2
+    } else {
+        0
+    }
+}
+
 /// Byte spans of one `ssh … destination <command…>` remote payload.
 struct SshRemotePayload {
     /// Payload text: for a single payload word, one layer of matching
     /// surrounding quotes removed; for multiple words, the raw span from the
-    /// first payload byte to the last (per-word quoting left intact, exactly
-    /// as the remote shell will see it after the local shell's one decode).
+    /// first payload byte to the last, per-word quoting intact (see `joined`
+    /// for the line the program actually hands on).
     content: Range<usize>,
     /// Full `ssh … <payload>` span, for span attribution.
     full: Range<usize>,
+    /// The content is several argv words that the program joins with spaces
+    /// before a shell parses the result (`ssh`, `watch`, a `parallel`
+    /// template, `env -S` plus its trailing words). The local shell removes
+    /// each word's quoting first, so `ssh h 'git reset' --hard` runs
+    /// `git reset --hard` remotely while the raw span still reads as one
+    /// quoted word; see [`joined_payload_words`].
+    joined: bool,
+}
+
+/// A multi-word payload as the program that joins its argv hands it on: each
+/// word with one round of shell quoting removed, joined with spaces. `None`
+/// when that is the raw text already, or when the span is not a plain run of
+/// words.
+fn joined_payload_words(raw: &str) -> Option<String> {
+    let tokens = crate::normalize::tokenize_for_normalization(raw);
+    let mut out = String::with_capacity(raw.len());
+    for token in &tokens {
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            return None;
+        }
+        let text = token.text(raw)?;
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&crate::normalize::decode_posix_syntax_token(text));
+    }
+    (out != raw).then_some(out)
+}
+
+/// Push a runner or `ssh` payload for re-evaluation: the raw span, and for a
+/// joined multi-word payload also the joined command line (which is not a
+/// substring of the command, so it carries no content range). `false` when
+/// the extraction limit stopped it.
+fn push_joined_payload(
+    command: &str,
+    payload: SshRemotePayload,
+    limits: &ExtractionLimits,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+    target: &str,
+) -> bool {
+    let Some(content) = command.get(payload.content.clone()) else {
+        return true;
+    };
+    if !push_windows_inner(
+        extracted,
+        skip_reasons,
+        limits,
+        content,
+        payload.full.clone(),
+        Some(payload.content.clone()),
+        target,
+    ) {
+        return false;
+    }
+    if payload.joined
+        && let Some(joined) = joined_payload_words(content)
+    {
+        return push_windows_inner(
+            extracted,
+            skip_reasons,
+            limits,
+            &joined,
+            payload.full,
+            None,
+            target,
+        );
+    }
+    true
 }
 
 /// ssh short options that consume a value (OpenSSH `getopt` string; the value
@@ -2050,7 +2876,7 @@ fn extract_bun_exec_inline_scripts(
         if basename != "bun" {
             continue;
         }
-        let Some(payload) = bun_exec_inline_payload(command, &tokens, index) else {
+        let Some(payload) = subcommand_inline_payload(command, &tokens, index, "exec", &[]) else {
             continue;
         };
         let Some(content) = command.get(payload.content.clone()) else {
@@ -2070,20 +2896,106 @@ fn extract_bun_exec_inline_scripts(
     }
 }
 
-/// Locate the shell payload of the `bun exec` invocation whose executable token
-/// is at `start`. See [`extract_bun_exec_inline_scripts`] for the grammar.
-fn bun_exec_inline_payload(
+/// `deno eval [options] "<code>"` runs `<code>` as JavaScript/TypeScript: the
+/// Deno counterpart of `node -e`. Deno has no `-e` flag, so the flag-shaped
+/// inline extraction never saw it and `deno eval "Deno.removeSync('src',
+/// {recursive: true})"` was allowed while the `node -e` spelling of the same
+/// deletion denied. Same conservative walk as `bun exec`, with Deno's
+/// no-value options modeled (see [`DENO_EVAL_OPTIONS`]).
+fn extract_deno_eval_inline_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons)
+        || !command.contains("deno")
+    {
+        return;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    for index in 0..tokens.len() {
+        let token = &tokens[index];
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            continue;
+        }
+        let Some(word) = token.text(command) else {
+            continue;
+        };
+        let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+        let basename = basename
+            .strip_suffix(".exe")
+            .or_else(|| basename.strip_suffix(".EXE"))
+            .unwrap_or(basename);
+        if basename != "deno" {
+            continue;
+        }
+        let Some(payload) =
+            subcommand_inline_payload(command, &tokens, index, "eval", DENO_EVAL_OPTIONS)
+        else {
+            continue;
+        };
+        let Some(content) = command.get(payload.content.clone()) else {
+            continue;
+        };
+        if extracted.len() >= limits.max_heredocs {
+            skip_reasons.push(SkipReason::ExceededHeredocLimit {
+                limit: limits.max_heredocs,
+            });
+            return;
+        }
+        if content.len() > limits.max_body_bytes {
+            continue;
+        }
+        extracted.push(ExtractedContent {
+            content: content.to_string(),
+            language: ScriptLanguage::from_command("deno"),
+            delimiter: None,
+            byte_range: payload.full,
+            content_range: Some(payload.content),
+            quoted: true,
+            heredoc_type: None,
+            target_command: Some("deno".to_string()),
+        });
+    }
+}
+
+/// Options `deno eval` accepts that take no separate value word. `--name=value`
+/// spellings are accepted generically by the walker; anything else (a
+/// value-taking option spelled `--config file`) ends the walk unextracted.
+const DENO_EVAL_OPTIONS: &[&str] = &[
+    "-p",
+    "--print",
+    "-T",
+    "--ts",
+    "-A",
+    "--allow-all",
+    "-q",
+    "--quiet",
+];
+
+/// Locate the payload of a `<executable> <subcommand> [options] <payload>`
+/// invocation whose executable token is at `start` (`bun exec`, `deno eval`).
+/// `options` lists the no-value options allowed between the subcommand and
+/// the payload; `--name=value` and Deno's `--allow-*`/`--deny-*`/`--unstable*`
+/// families are also skipped when any options are modeled.
+fn subcommand_inline_payload(
     command: &str,
     tokens: &[crate::normalize::NormalizeToken],
     start: usize,
+    subcommand: &str,
+    options: &[&str],
 ) -> Option<MiseInlinePayload> {
     use crate::normalize::NormalizeTokenKind;
 
     let full_start = tokens.get(start)?.byte_range.start;
     let mut index = start + 1;
 
-    // Phase 1: reach the `exec` subcommand. Quoting a subcommand does not change
-    // the argv Bun receives, so `bun "exec" '<payload>'` walks the same grammar.
+    // Phase 1: reach the subcommand. Quoting a subcommand does not change the
+    // argv the program receives, so `bun "exec" '<payload>'` walks the same
+    // grammar.
     let token = tokens.get(index)?;
     if token.kind != NormalizeTokenKind::Word {
         return None;
@@ -2095,25 +3007,926 @@ fn bun_exec_inline_payload(
     );
     // Any other word is a different subcommand (`bun run`, `bun install`), and
     // any option before the subcommand has unmodeled arity.
-    if word != "exec" {
+    if word != subcommand {
         return None;
     }
     index += 1;
 
-    // Phase 2: the payload is the next word. An option token there is unmodeled
-    // grammar, so extract nothing rather than guess.
+    // Phase 2: skip the modeled no-value options, then the payload is the next
+    // word. Any other option is unmodeled grammar, so extract nothing rather
+    // than guess.
+    loop {
+        let value = tokens.get(index)?;
+        if value.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let text = command.get(value.byte_range.clone())?;
+        if !text.starts_with('-') {
+            break;
+        }
+        let modeled = !options.is_empty()
+            && (options.contains(&text)
+                || (text.starts_with("--") && text.contains('='))
+                || ["--allow-", "--deny-", "--unstable"]
+                    .iter()
+                    .any(|family| text.starts_with(family)));
+        if !modeled {
+            return None;
+        }
+        index += 1;
+    }
     let value = tokens.get(index)?;
-    if value.kind != NormalizeTokenKind::Word {
-        return None;
-    }
     let text = command.get(value.byte_range.clone())?;
-    if text.starts_with('-') {
-        return None;
-    }
     Some(MiseInlinePayload {
         content: unquoted_payload_range(text, value.byte_range.start),
         full: full_start..value.byte_range.end,
     })
+}
+
+/// Executable names whose first non-option argument is an awk program.
+/// `original-awk` is the Debian/Ubuntu package name for onetrueawk, which is
+/// also what macOS ships as `/usr/bin/awk`. `goawk` and `frawk` are drop-in
+/// reimplementations that honour `system()` and the command pipes identically.
+const AWK_EXECUTABLES: &[&str] = &[
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "original-awk",
+    "goawk",
+    "frawk",
+    "busybox",
+];
+
+/// Extract the shell payloads an awk program hands to `/bin/sh` (issue #399).
+///
+/// awk's `system("…")` runs its argument through the shell, and awk's two
+/// command-pipe forms (`print … | "cmd"` and `"cmd" | getline`) do the same.
+/// `awk 'BEGIN{ system("rm -rf ~/Documents") }'` is therefore the denied
+/// `sh -c "rm -rf ~/Documents"` behind an awk program, and awk appears
+/// constantly in agent-written pipelines.
+///
+/// Keyed on those three shapes inside the program text, never on the awk
+/// executable alone, so ordinary programs (`awk '{print $1}' file.txt`,
+/// `awk '$3 > $4 { print }'`) extract nothing — including ones that merely
+/// *print* a dangerous-looking string, which awk does not execute.
+fn extract_awk_inline_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
+    }
+    if !names_interpreter(command, "awk") {
+        return;
+    }
+
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    // `busybox awk 'prog'` resolves to the same program from two token
+    // positions — once from `busybox` consuming its applet name, and once from
+    // `awk` itself — so without this the payload is extracted twice and burns
+    // two of the `max_heredocs` slots for one sink.
+    let mut seen: Vec<Range<usize>> = Vec::new();
+    for index in 0..tokens.len() {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        for program in awk_program_tokens(command, &tokens, index) {
+            if seen.contains(&program) {
+                continue;
+            }
+            seen.push(program.clone());
+            let Some(program_text) = command.get(program.clone()) else {
+                continue;
+            };
+            for payload in awk_shell_payload_ranges(program_text, program.start) {
+                let Some(content) = command.get(payload.clone()) else {
+                    continue;
+                };
+                if !push_windows_inner(
+                    extracted,
+                    skip_reasons,
+                    limits,
+                    content,
+                    program.clone(),
+                    Some(payload),
+                    "awk",
+                ) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Byte ranges of the awk program text when the executable token at `start` is
+/// an awk, or an empty vector.
+///
+/// awk's option grammar decides what its operands mean, so this walks the
+/// grammar rather than giving up at the first flag it does not recognise:
+///
+/// - `-e 'prog'` / `--source 'prog'` supply the program **as the flag value**.
+///   That is gawk's documented way to pass a program on the command line, and
+///   it may be repeated, so every value is collected.
+/// - `-f progfile` / `-E progfile` read the program from a FILE dcg will not
+///   open, and they also change what the remaining operands mean: every operand
+///   becomes a data file or a `var=value` assignment rather than program text.
+///   They contribute no inline program and suppress the positional one, so a
+///   data file whose *name* looks like a program is never mined for sinks.
+/// - `-F`, `-v`, `-i`, `-l`, `-W` and their long forms take a separate value
+///   that is not program text; both words are skipped.
+/// - Anything else starting with `-` is an unmodeled option.
+///
+/// That last case is why this function exists in this shape. It used to
+/// `return None` — abandoning the scan — so one `-F:`, the single most common
+/// awk flag there is, turned `awk -F: 'BEGIN{ system("rm -rf …") }'` from
+/// blocked into allowed. Giving up is the one unrecoverable direction for a
+/// guard, so an unmodeled option is now assumed to take no separate value and
+/// the walk continues. If such an option really does take one, its value is
+/// mistaken for the program; `saw_unmodeled_option` therefore also admits the
+/// operand after it, so the real program is still scanned. Both effects are
+/// over-extraction, which costs a wasted scan and nothing else.
+fn awk_program_tokens(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+) -> Vec<Range<usize>> {
+    use crate::normalize::NormalizeTokenKind;
+
+    let mut programs = Vec::new();
+    let Some(token) = tokens.get(start) else {
+        return programs;
+    };
+    if token.kind != NormalizeTokenKind::Word {
+        return programs;
+    }
+    let Some(word) = token.text(command) else {
+        return programs;
+    };
+    let dequoted = dequoted_executable_word(word);
+    let basename = interpreter_basename(&dequoted);
+    if !AWK_EXECUTABLES
+        .iter()
+        .any(|executable| basename.eq_ignore_ascii_case(executable))
+    {
+        return programs;
+    }
+
+    let mut index = start + 1;
+    // `busybox awk …` needs its applet name consumed first.
+    if basename.eq_ignore_ascii_case("busybox") {
+        match tokens.get(index) {
+            Some(applet)
+                if applet.kind == NormalizeTokenKind::Word
+                    && applet.text(command).is_some_and(|text| {
+                        dequoted_executable_word(text).eq_ignore_ascii_case("awk")
+                    }) => {}
+            _ => return programs,
+        }
+        index += 1;
+    }
+
+    // Set by `-f`/`-E`: the program lives in a file, so no operand is one.
+    let mut program_is_in_a_file = false;
+    let mut saw_unmodeled_option = false;
+
+    let value_range = |at: usize| -> Option<Range<usize>> {
+        let value = tokens.get(at)?;
+        if value.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let text = command.get(value.byte_range.clone())?;
+        Some(unquoted_payload_range(text, value.byte_range.start))
+    };
+
+    loop {
+        let Some(token) = tokens.get(index) else {
+            return programs;
+        };
+        if token.kind != NormalizeTokenKind::Word {
+            return programs;
+        }
+        let Some(raw) = token.text(command) else {
+            return programs;
+        };
+        let (word, word_start, word_end) =
+            dequoted_flag_word(raw, token.byte_range.start, token.byte_range.end);
+        match word {
+            // The program comes from a file; operands are data from here on.
+            // The separated spellings are safe to treat this way even on an awk
+            // that does not recognise the long forms, because such an awk
+            // ignores the option and then takes the FOLLOWING word — the
+            // progfile name — as its program, so the operand after that is
+            // still data either way.
+            "-f" | "--file" | "-E" | "--exec" => {
+                program_is_in_a_file = true;
+                index += 2;
+            }
+            // POSIX `-f` glued. Every awk knows `-f`, so this one really does
+            // read the program from a file.
+            _ if word.starts_with("-f") && word != "-f" => {
+                program_is_in_a_file = true;
+                index += 1;
+            }
+            // Glued spellings of the long forms, which are a GNU extension.
+            // gawk 5.3.2 reads each as a source file (verified: `awk -Ex` and
+            // `awk --file=x` both fail with "cannot open source file `x'"), so
+            // on gawk the operand after them really is data. onetrueawk —
+            // macOS's `/usr/bin/awk`, the very platform the sibling `osascript`
+            // rules target — does not implement them, and an awk that does not
+            // recognise an option leaves the following operand as its program.
+            //
+            // So consume the flag word but leave the positional operand
+            // admissible. On gawk that is an over-block costing one wasted scan
+            // of a data filename; on an awk that ignores the option it is the
+            // difference between seeing `awk -Ex 'BEGIN{ system("…") }'` and
+            // missing it. Over-block is the recoverable direction.
+            _ if word.starts_with("--file=")
+                || word.starts_with("--exec=")
+                || (word.starts_with("-E") && word != "-E") =>
+            {
+                index += 1;
+            }
+
+            // The flag VALUE is program text.
+            "-e" | "--source" => {
+                if let Some(range) = value_range(index + 1) {
+                    programs.push(range);
+                }
+                index += 2;
+            }
+            "--" => {
+                index += 1;
+                break;
+            }
+            // A glued value still carries its own shell quoting — the separate
+            // spelling gets that stripped by `unquoted_payload_range` via
+            // `value_range`, and skipping it here meant `awk -e"BEGIN{…}"`
+            // handed the scanner a program whose very first byte was a quote,
+            // so the whole program was read as one string literal and the sink
+            // inside it never seen.
+            _ if word.starts_with("--source=") => {
+                if let Some(equals) = word.find('=') {
+                    let value_start = word_start + equals + 1;
+                    if let Some(text) = command.get(value_start..word_end) {
+                        programs.push(unquoted_payload_range(text, value_start));
+                    }
+                }
+                index += 1;
+            }
+            _ if word.starts_with("-e") => {
+                if let Some(text) = command.get(word_start + 2..word_end) {
+                    programs.push(unquoted_payload_range(text, word_start + 2));
+                }
+                index += 1;
+            }
+
+            // A separate value that is never program text.
+            "-F" | "--field-separator" | "-v" | "--assign" | "-i" | "--include" | "-l"
+            | "--load" | "-W" => index += 2,
+            _ if word.starts_with("--field-separator=")
+                || word.starts_with("--assign=")
+                || word.starts_with("--include=")
+                || word.starts_with("--load=")
+                || word.starts_with("-F")
+                || word.starts_with("-v")
+                || word.starts_with("-i")
+                || word.starts_with("-l")
+                || word.starts_with("-W") =>
+            {
+                index += 1;
+            }
+
+            _ if word.starts_with('-') && word != "-" => {
+                saw_unmodeled_option = true;
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+
+    if !program_is_in_a_file {
+        if let Some(range) = value_range(index) {
+            programs.push(range);
+        }
+        // An unmodeled option may really have taken a separate value, in which
+        // case that value was mistaken for the program above and the real one
+        // is further along. Admit every remaining operand rather than just the
+        // next one: two unmodeled value-taking options would otherwise push the
+        // program past a single extra probe. Bounded by the token count, and
+        // scanning an operand that turns out to be a data filename costs
+        // nothing but the scan.
+        if saw_unmodeled_option {
+            let mut extra = index + 1;
+            while let Some(range) = value_range(extra) {
+                programs.push(range);
+                extra += 1;
+            }
+        }
+    }
+    programs
+}
+
+/// Byte ranges (in whole-command coordinates) of every shell command an awk
+/// program hands to `/bin/sh`.
+///
+/// Recognizes `system(<string>)`, `… | <string>` (print redirected into a
+/// command), and `<string> | getline`. Only a literal awk string supplies a
+/// payload: a concatenation or a variable is not statically known, and guessing
+/// at one would evaluate text that never reaches a shell.
+fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
+    let bytes = program.as_bytes();
+    let mut payloads = Vec::new();
+    let mut index = 0usize;
+    // Byte offset of the `/` that closed the most recently skipped regex
+    // literal. `awk_slash_opens_regex` needs it to tell a regex CLOSE (a value,
+    // so the next `/` divides) from the division OPERATOR (after which a regex
+    // may legally open). The previous byte alone cannot distinguish them.
+    let mut last_regex_close: Option<usize> = None;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            // An awk comment runs to end of line and executes nothing — but
+            // only a `#` in statement position starts one. A `#` inside a regex
+            // literal (`/x#/`, `!/^#/` — both ordinary awk idioms for matching
+            // a literal hash) is data, and treating it as a comment swallowed
+            // the rest of the line, hiding a real `system()` call after it.
+            // That is an under-block, so the test is deliberately narrow: an
+            // unrecognised `#` just means the scanner keeps reading, which can
+            // only over-extract.
+            b'#' if awk_hash_starts_comment(bytes, index) => {
+                index = program[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+            }
+            b'"' => {
+                let Some(end) = awk_string_literal_end(program, index) else {
+                    // An unpaired `"` means this scanner's idea of where
+                    // strings begin has desynchronized from awk's — the usual
+                    // cause is a quote inside a regex literal, as in the very
+                    // ordinary `gsub(/"/, "")`. Abandoning the scan here threw
+                    // away every sink later in the program, which is an
+                    // under-block. Skip the one byte and keep reading instead:
+                    // the worst case is that a span of code is read as a string
+                    // (or the reverse), which can only over-extract.
+                    index += 1;
+                    continue;
+                };
+                let literal = index + 1..end;
+                // `"cmd" | getline` executes the string on the left.
+                if awk_next_operator_is_pipe_getline(program, end + 1) {
+                    payloads.push(offset + literal.start..offset + literal.end);
+                }
+                index = end + 1;
+            }
+            // The same literal, in a program that arrived inside shell double
+            // quotes and therefore spells its own strings `\"…\"`. The
+            // `| getline` sink is decided by pairing that literal, so without
+            // this arm `awk "BEGIN{ \"cmd\" | getline x }"` paired nothing and
+            // the sink was invisible — `inline_string_literal_at` had learned
+            // the escaped spelling for the call sinks, but the scanner loop
+            // that drives the pipe sinks had not.
+            b'\\' if bytes.get(index + 1) == Some(&b'"') => {
+                match escaped_string_literal_end(program, index + 2) {
+                    Some(end) => {
+                        if awk_next_operator_is_pipe_getline(program, end + 2) {
+                            payloads.push(offset + index + 2..offset + end);
+                        }
+                        index = end + 2;
+                    }
+                    None => index += 2,
+                }
+            }
+            // An awk regex literal. Its bytes are data, so a `"` inside one —
+            // `gsub(/"/, "")`, `/["]/`, both everyday awk — must not be paired
+            // with a real string quote later in the program. When it was, every
+            // literal after it shifted by one and the `system()` call that
+            // followed was read as string content instead of a sink.
+            b'/' if awk_slash_opens_regex(bytes, index, last_regex_close) => {
+                match awk_regex_literal_end(program, index) {
+                    // Refuse to skip a span that carries a sink keyword. Such a
+                    // span is proof this `/` was misread — either an
+                    // unterminated regex whose "closing" slash was really a
+                    // path separator inside the payload, or a division the
+                    // heuristic called a regex — and skipping it would hide the
+                    // one thing this scanner exists to find. Reading the span as
+                    // code instead can only over-extract.
+                    //
+                    // `get` returning None would mean a non-boundary index,
+                    // which cannot happen here (both ends are ASCII `/`), but
+                    // default it to "carries a sink" so the fail direction is
+                    // the scanning one rather than the skipping one.
+                    Some(end)
+                        if program
+                            .get(index..=end)
+                            .is_some_and(|span| !awk_span_carries_a_sink(span)) =>
+                    {
+                        // Remember where this literal closed. That is the only
+                        // `/` a following `/` may treat as a value.
+                        last_regex_close = Some(end);
+                        index = end + 1;
+                    }
+                    // Not a terminated regex after all. Treat the byte as
+                    // ordinary code rather than abandoning the rest.
+                    _ => index += 1,
+                }
+            }
+            // `||` is logical or, not a command pipe.
+            b'|' if bytes.get(index + 1) == Some(&b'|') => index += 2,
+            b'|' => {
+                // `|&` is gawk's coprocess operator, which also runs a command.
+                let after = if bytes.get(index + 1) == Some(&b'&') {
+                    index + 2
+                } else {
+                    index + 1
+                };
+                if let Some(literal) = awk_leading_string_literal(program, after) {
+                    payloads.push(offset + literal.start..offset + literal.end);
+                    index = literal.end + 1;
+                } else {
+                    index = after;
+                }
+            }
+            _ => {
+                if let Some(rest) = program.get(index..)
+                    && rest.starts_with("system")
+                    && !index
+                        .checked_sub(1)
+                        .and_then(|i| bytes.get(i))
+                        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                {
+                    let after_name = index + "system".len();
+                    let open = program[after_name..]
+                        .find(|c: char| !c.is_ascii_whitespace())
+                        .map(|skip| after_name + skip);
+                    if let Some(open) = open
+                        && bytes.get(open) == Some(&b'(')
+                        && let Some(literal) = awk_leading_string_literal(program, open + 1)
+                    {
+                        payloads.push(offset + literal.start..offset + literal.end);
+                        index = literal.end + 1;
+                        continue;
+                    }
+                }
+                index += 1;
+            }
+        }
+    }
+    payloads
+}
+
+/// Whether the `/` at `index` opens an awk regex literal rather than being the
+/// division operator.
+///
+/// awk resolves this the way every language with bare regex literals does: a
+/// `/` opens a regex where an operand is expected and divides where a value has
+/// just been produced. The nearest preceding non-blank byte settles it, because
+/// division can only follow a name, a number, `)`, `]`, or a closing quote.
+///
+/// Misreading a division as a regex costs at most the rest of that line, since
+/// `awk_regex_literal_end` refuses to cross a newline; misreading a regex as
+/// code is what desynchronized the string walk in the first place.
+fn awk_slash_opens_regex(bytes: &[u8], index: usize, last_regex_close: Option<usize>) -> bool {
+    bytes[..index]
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .is_none_or(|position| {
+            let previous = bytes[position];
+            // `.` is here for a trailing decimal point: `x = 1. / 2` is
+            // division, and awk has no operator that would put a bare `.`
+            // before a regex.
+            if previous.is_ascii_alphanumeric()
+                || matches!(previous, b')' | b']' | b'"' | b'_' | b'.')
+            {
+                return false;
+            }
+            // A preceding `/` is ambiguous and the byte alone cannot settle it:
+            //
+            //   n = /a/ / 2      the `/` before is a regex CLOSE — a value — so
+            //                    this one divides.
+            //   x = 4 / /re/     the `/` before is the division OPERATOR, so
+            //                    this one opens a regex.
+            //
+            // Treating every preceding `/` as a value got the first right and
+            // the second exactly backwards: the regex body was then scanned as
+            // code, an odd `"` inside it paired with a later string quote, and
+            // the desync hid every sink after it. `awk '{ x = 4 / /^|"/ ;
+            // system("rm -rf …") }'` runs on gawk, mawk and busybox awk.
+            //
+            // `last_regex_close` is the only `/` this scanner actually proved
+            // to be a close, so it is the only one that counts as a value.
+            if previous == b'/' {
+                return last_regex_close != Some(position);
+            }
+            // `x++ / 2` and `x-- / 2` are division: the operand is the value the
+            // increment produced. A single `+` or `-` is not, because awk reads
+            // a bare regex in expression position as `$0 ~ /re/`, so `a + /re/`
+            // is ordinary awk. Only the doubled form settles it.
+            if matches!(previous, b'+' | b'-')
+                && position
+                    .checked_sub(1)
+                    .and_then(|earlier| bytes.get(earlier))
+                    == Some(&previous)
+            {
+                return false;
+            }
+            true
+        })
+}
+
+/// Whether a candidate awk regex body carries a shell-sink keyword.
+///
+/// Used to veto a regex skip. A genuine regex literal almost never spells
+/// `system` or `getline`; a span that does is evidence the scanner misread the
+/// opening `/`, and skipping it would hide the sink.
+/// Deliberately keyed on the two sink KEYWORDS and nothing else.
+///
+/// A "pipe and a quote together" clause was tried here, to reach the third sink
+/// (`print … | "cmd"`, which names no keyword). It made things worse: a real awk
+/// regex can carry both characters — `/["|]/`, `/[|"]/` and `/"|,/` are all
+/// ordinary, and gawk runs them — so the veto fired on genuine regexes, refused
+/// the skip, and let the body be scanned as code. Its `"` then paired with a
+/// later string quote and the desync that regex tracking exists to prevent came
+/// back, losing the sink that followed. Three confirmed under-blocks, against
+/// zero cases it saved once `awk_slash_opens_regex` learned that a `/` after a
+/// regex literal is division.
+fn awk_span_carries_a_sink(span: &str) -> bool {
+    span.contains("system") || span.contains("getline")
+}
+
+/// Index of the `/` closing the awk regex literal that opens at `start`.
+///
+/// A regex literal cannot contain a raw newline, so an unterminated one stops
+/// at the end of its line rather than swallowing the rest of the program.
+fn awk_regex_literal_end(program: &str, start: usize) -> Option<usize> {
+    let bytes = program.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\n' | b'\r' => return None,
+            b'/' => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Whether the `#` at `index` begins an awk comment rather than being a literal
+/// hash inside a regex or a string.
+///
+/// True only at the start of a line: the nearest preceding byte that is not a
+/// space or tab must be a newline, or there must be none.
+///
+/// This is not merely conservative, it is exact in the one direction that
+/// matters. Neither an awk regex literal nor an awk string literal may contain
+/// a raw newline, so a `#` that opens a line cannot be inside either — it is
+/// always a comment. Every other position is ambiguous without lexing awk, and
+/// guessing there is what caused the bug this replaced: `;`, `{` and `}` were
+/// also accepted as statement markers, so the perfectly ordinary regexes
+/// `/;#/` and `/{#/` put a `#` in "statement position", swallowed the rest of
+/// the line, and hid a real `system()` call behind it.
+///
+/// The cost is that a trailing comment after code (`print 1 # note`) is not
+/// recognised, so the scanner keeps reading it. That can only over-extract,
+/// which is the recoverable direction; mistaking regex data for a comment
+/// hides whatever follows, which is not.
+fn awk_hash_starts_comment(bytes: &[u8], index: usize) -> bool {
+    bytes[..index]
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t'))
+        .is_none_or(|position| matches!(bytes[position], b'\n' | b'\r'))
+}
+
+/// End index (the closing quote) of the awk string literal opening at `start`.
+fn awk_string_literal_end(program: &str, start: usize) -> Option<usize> {
+    let bytes = program.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Index of the `\` opening the closing `\"` of an escaped string literal whose
+/// content begins at `start`.
+fn escaped_string_literal_end(program: &str, start: usize) -> Option<usize> {
+    let bytes = program.as_bytes();
+    let mut index = start;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'\\' {
+            if bytes[index + 1] == b'"' {
+                return Some(index);
+            }
+            // `\\` is an escaped backslash, not the start of a closing quote.
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+/// The first string literal at or after `start`, skipping only whitespace.
+///
+/// Handles both spellings an interpreter can receive. A program written inside
+/// shell *single* quotes keeps its double quotes bare, while the same program
+/// written inside shell *double* quotes arrives with every inner quote
+/// backslash-escaped — `awk "BEGIN{ system(\"rm -rf …\") }"` and
+/// `osascript -e "do shell script \"rm -rf …\""`. The shell strips those
+/// backslashes before the interpreter runs, so `\"` opens a literal here just
+/// as `"` does. Requiring a bare quote missed the escaped spelling entirely,
+/// which is the spelling you are forced into whenever the payload interpolates
+/// a shell variable.
+fn inline_string_literal_at(program: &str, start: usize) -> Option<Range<usize>> {
+    let rest = program.get(start..)?;
+    let skip = rest.find(|c: char| !c.is_ascii_whitespace())?;
+    let quote = start + skip;
+    let bytes = program.as_bytes();
+    match bytes.get(quote) {
+        Some(b'"') => {
+            let end = awk_string_literal_end(program, quote)?;
+            Some(quote + 1..end)
+        }
+        Some(b'\\') if bytes.get(quote + 1) == Some(&b'"') => {
+            let end = escaped_string_literal_end(program, quote + 2)?;
+            Some(quote + 2..end)
+        }
+        _ => None,
+    }
+}
+
+/// The first awk string literal at or after `start`, skipping only whitespace.
+fn awk_leading_string_literal(program: &str, start: usize) -> Option<Range<usize>> {
+    inline_string_literal_at(program, start)
+}
+
+/// Whether the tokens after `start` are `| getline`, making the string literal
+/// before them a command awk runs.
+fn awk_next_operator_is_pipe_getline(program: &str, start: usize) -> bool {
+    let Some(rest) = program.get(start..) else {
+        return false;
+    };
+    let trimmed = rest.trim_start();
+    let Some(after_pipe) = trimmed.strip_prefix('|') else {
+        return false;
+    };
+    // `||` is logical or, not a command pipe.
+    if after_pipe.starts_with('|') {
+        return false;
+    }
+    let after_pipe = after_pipe.strip_prefix('&').unwrap_or(after_pipe);
+    let after_pipe = after_pipe.trim_start();
+    // Whole word only: `getlinefoo` is an ordinary variable name, not awk's
+    // `getline` keyword, so it is not a command pipe. Matches the `\bgetline\b`
+    // tier-1 trigger rather than being looser than it.
+    after_pipe.strip_prefix("getline").is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+    })
+}
+
+/// Extract the shell payloads an `osascript` program hands to `/bin/sh`
+/// (issue #398).
+///
+/// AppleScript's `do shell script "…"` and JavaScript-for-Automation's
+/// `$.system("…")` both run their argument through the shell, so
+/// `osascript -e 'do shell script "rm -rf ~/Documents"'` is the denied
+/// `sh -c` spelling behind an AppleScript wrapper. osascript ships on every
+/// macOS machine and agents reach for it for notifications and Finder
+/// automation, which makes it a natural place for a destructive payload to sit
+/// unnoticed.
+///
+/// Keyed on those two shapes inside the program text, so ordinary automation
+/// (`osascript -e 'display notification "done"'`) extracts nothing.
+fn extract_osascript_inline_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
+    }
+    if !names_interpreter(command, "osascript") {
+        return;
+    }
+
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    for index in 0..tokens.len() {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        let token = &tokens[index];
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            continue;
+        }
+        let Some(word) = token.text(command) else {
+            continue;
+        };
+        if !interpreter_basename(&dequoted_executable_word(word)).eq_ignore_ascii_case("osascript")
+        {
+            continue;
+        }
+        for program in osascript_program_ranges(command, &tokens, index) {
+            let Some(program_text) = command.get(program.clone()) else {
+                continue;
+            };
+            for payload in osascript_shell_payload_ranges(program_text, program.start) {
+                let Some(content) = command.get(payload.clone()) else {
+                    continue;
+                };
+                if !push_windows_inner(
+                    extracted,
+                    skip_reasons,
+                    limits,
+                    content,
+                    program.clone(),
+                    Some(payload),
+                    "osascript",
+                ) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Every `-e <program>` payload of the osascript invocation at `start`.
+///
+/// osascript concatenates multiple `-e` statements into one program, and `-l`
+/// selects the language; neither changes that each `-e` value is program text.
+fn osascript_program_ranges(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+) -> Vec<Range<usize>> {
+    use crate::normalize::NormalizeTokenKind;
+
+    let mut programs = Vec::new();
+    let mut index = start + 1;
+    while let Some(token) = tokens.get(index) {
+        if token.kind != NormalizeTokenKind::Word {
+            break;
+        }
+        let Some(raw) = token.text(command) else {
+            break;
+        };
+        let (word, word_start, word_end) =
+            dequoted_flag_word(raw, token.byte_range.start, token.byte_range.end);
+        match word {
+            "-e" => {
+                let Some(value) = tokens.get(index + 1) else {
+                    break;
+                };
+                if value.kind != NormalizeTokenKind::Word {
+                    break;
+                }
+                let Some(text) = command.get(value.byte_range.clone()) else {
+                    break;
+                };
+                programs.push(unquoted_payload_range(text, value.byte_range.start));
+                index += 2;
+            }
+            // `-l <language>` and `-s <flags>` take a separate value.
+            "-l" | "-s" => index += 2,
+            // Glued `-e<program>`. getopt accepts it, so osascript does too,
+            // and it used to fall through to the skip-any-option arm below —
+            // the program was never collected and the sink never seen.
+            _ if word.starts_with("-e") => {
+                programs.push(word_start + 2..word_end);
+                index += 1;
+            }
+            _ if word.starts_with('-') && word != "-" => index += 1,
+            // The first bare word is a script FILE, which dcg will not open.
+            _ => break,
+        }
+    }
+    programs
+}
+
+/// Byte ranges (in whole-command coordinates) of every shell command an
+/// osascript program hands to `/bin/sh`.
+fn osascript_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
+    let mut payloads = Vec::new();
+    let lowered = program.to_ascii_lowercase();
+    let mut search = 0usize;
+
+    // AppleScript: `do shell script "<command>"`. Whitespace between the three
+    // keywords is flexible and the keywords are case-insensitive, so a fixed
+    // `"do shell script"` literal would miss `do  shell  script` — trivially
+    // evadable, and inconsistent with the `\bdo\s+shell\s+script\b` tier-1
+    // trigger that got the command here in the first place.
+    while let Some(after) = find_applescript_do_shell_script(&lowered, search) {
+        if let Some(literal) = applescript_leading_string_literal(program, after) {
+            payloads.push(offset + literal.start..offset + literal.end);
+            search = literal.end;
+        } else {
+            search = after;
+        }
+        if search >= program.len() {
+            break;
+        }
+    }
+
+    // JXA call sinks: `$.system("<command>")` reaches libc directly, and
+    // `app.doShellScript("<command>")` is the Standard Additions bridge to the
+    // same `do shell script` AppleScript command. The latter is the idiom every
+    // JXA example uses (`Application.currentApplication()` with
+    // `includeStandardAdditions = true`), so covering only `$.system` left the
+    // documented spelling unguarded. The receiver is an arbitrary expression,
+    // so match on the method name and require the call parenthesis.
+    for name in ["$.system", ".doShellScript"] {
+        let mut search = 0usize;
+        while let Some(found) = program[search..].find(name) {
+            let after = search + found + name.len();
+            let open = program[after..]
+                .find(|c: char| !c.is_ascii_whitespace())
+                .map(|skip| after + skip);
+            if let Some(open) = open
+                && program.as_bytes().get(open) == Some(&b'(')
+                && let Some(literal) = applescript_leading_string_literal(program, open + 1)
+            {
+                payloads.push(offset + literal.start..offset + literal.end);
+                search = literal.end;
+            } else {
+                search = after;
+            }
+            if search >= program.len() {
+                break;
+            }
+        }
+    }
+
+    payloads.sort_by_key(|range| range.start);
+    payloads.dedup();
+    payloads
+}
+
+/// Index just past the next `do shell script` keyword sequence in `lowered`
+/// (already ASCII-lowercased), searching from `from`.
+///
+/// Whitespace between the three keywords is flexible, matching AppleScript and
+/// the tier-1 trigger. Word boundaries are required so `redo`, `doshell`, and
+/// `scripted` cannot satisfy it.
+fn find_applescript_do_shell_script(lowered: &str, from: usize) -> Option<usize> {
+    const WORDS: [&str; 3] = ["do", "shell", "script"];
+    let bytes = lowered.as_bytes();
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut search = from;
+    loop {
+        let rest = lowered.get(search..)?;
+        let found = search + rest.find(WORDS[0])?;
+        let mut cursor = found;
+        let mut matched = true;
+        for (position, word) in WORDS.iter().enumerate() {
+            if position > 0 {
+                let skipped = lowered
+                    .get(cursor..)
+                    .and_then(|tail| tail.find(|c: char| !c.is_ascii_whitespace()))?;
+                if skipped == 0 {
+                    // The keywords must be separated by whitespace.
+                    matched = false;
+                    break;
+                }
+                cursor += skipped;
+            }
+            if !lowered.get(cursor..).is_some_and(|t| t.starts_with(word)) {
+                matched = false;
+                break;
+            }
+            cursor += word.len();
+        }
+        let starts_on_boundary = found
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .is_none_or(|b| !is_word_byte(*b));
+        let ends_on_boundary = bytes.get(cursor).is_none_or(|b| !is_word_byte(*b));
+        if matched && starts_on_boundary && ends_on_boundary {
+            return Some(cursor);
+        }
+        search = found + WORDS[0].len();
+    }
+}
+
+/// The first double-quoted literal at or after `start`, skipping whitespace.
+///
+/// AppleScript and JXA both use `\` escapes inside double quotes, so the same
+/// scanner serves both.
+fn applescript_leading_string_literal(program: &str, start: usize) -> Option<Range<usize>> {
+    inline_string_literal_at(program, start)
 }
 
 /// `ssh [options] destination [command [argument …]]` concatenates every argv
@@ -2142,51 +3955,812 @@ fn extract_ssh_inline_scripts(
     if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
         return;
     }
-    if !command.contains("ssh") && !command.contains("SSH") {
+    if !may_name_a_command(command, &["ssh", "SSH"]) {
         return;
     }
 
-    let tokens = crate::normalize::tokenize_for_normalization(command);
-    for index in 0..tokens.len() {
-        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
-            return;
-        }
-        let token = &tokens[index];
-        if token.kind != crate::normalize::NormalizeTokenKind::Word {
-            continue;
-        }
-        let Some(word) = token.text(command) else {
-            continue;
-        };
-        // Path-qualified spellings (`/usr/bin/ssh`, `C:\…\ssh.exe`) are the
-        // same program; `ssh-keygen`/`ssh-add`/`autossh` are not.
-        let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
-        let basename = basename
-            .strip_suffix(".exe")
-            .or_else(|| basename.strip_suffix(".EXE"))
-            .unwrap_or(basename);
-        if !basename.eq_ignore_ascii_case("ssh") {
-            continue;
-        }
-        let Some(payload) = ssh_remote_payload(command, &tokens, index) else {
-            continue;
-        };
-        let Some(content) = command.get(payload.content.clone()) else {
-            continue;
-        };
-        if !push_windows_inner(
-            extracted,
-            skip_reasons,
-            limits,
-            content,
-            payload.full,
-            Some(payload.content),
-            "ssh",
-        ) {
-            return;
+    // Process substitution bodies too: `cat <(ssh h '<cmd>')`.
+    let (views, complete) = command_token_views(command, MAX_COMMAND_STRING_RUNNERS);
+    if !complete {
+        skip_reasons.push(SkipReason::ExceededHeredocLimit {
+            limit: MAX_COMMAND_STRING_RUNNERS,
+        });
+    }
+    for tokens in &views {
+        for index in 0..tokens.len() {
+            if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+                return;
+            }
+            let token = &tokens[index];
+            if token.kind != crate::normalize::NormalizeTokenKind::Word {
+                continue;
+            }
+            let Some(word) = token.text(command) else {
+                continue;
+            };
+            // Path-qualified spellings (`/usr/bin/ssh`, `C:\…\ssh.exe`) are
+            // the same program, and so are quoted ones (`\ssh`, `"ssh"`);
+            // `ssh-keygen`/`ssh-add`/`autossh` are not.
+            let names_ssh = |word: &str| {
+                let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+                basename
+                    .strip_suffix(".exe")
+                    .or_else(|| basename.strip_suffix(".EXE"))
+                    .unwrap_or(basename)
+                    .eq_ignore_ascii_case("ssh")
+            };
+            if !names_ssh(word) && !names_ssh(&dequoted_executable_word(word)) {
+                continue;
+            }
+            let Some(payload) = ssh_remote_payload(command, tokens, index) else {
+                continue;
+            };
+            if !push_joined_payload(command, payload, limits, extracted, skip_reasons, "ssh") {
+                return;
+            }
         }
     }
 }
+
+/// Extract the command strings `watch`, `parallel` and `env -S` run.
+///
+/// `watch` joins its operands and runs them with `sh -c` (unless `-x`),
+/// `parallel` runs its command template (or, with none, each `:::` argument)
+/// through a shell, and `env -S` splits one word into the command it runs.
+/// Quoted, those commands were argv data to every rule: `watch 'rm -rf ./b'`,
+/// `parallel ::: 'git reset --hard'` and `env -S'git reset --hard'` were
+/// allowed while the unquoted spellings denied. Each payload is re-evaluated
+/// as a shell command, as the `ssh` remote command is.
+fn extract_command_string_runner_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
+    }
+    if !may_name_a_command(command, COMMAND_STRING_RUNNERS) {
+        return;
+    }
+    let (views, complete) = command_token_views(command, MAX_COMMAND_STRING_RUNNERS);
+    if !complete {
+        skip_reasons.push(SkipReason::ExceededHeredocLimit {
+            limit: MAX_COMMAND_STRING_RUNNERS,
+        });
+    }
+    let mut runners = 0usize;
+    for tokens in &views {
+        let positions = command_word_positions(command, tokens);
+        for index in 0..tokens.len() {
+            if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+                return;
+            }
+            if !positions[index] {
+                continue;
+            }
+            let Some(name) = command_string_runner_name(command, &tokens[index]) else {
+                continue;
+            };
+            // Each runner reads the rest of its segment; a command that is
+            // nothing but runners is not read runner by runner (quadratic), it
+            // is an incomplete reading the caller judges by the bounded
+            // fallback.
+            runners += 1;
+            if runners > MAX_COMMAND_STRING_RUNNERS {
+                skip_reasons.push(SkipReason::ExceededHeredocLimit {
+                    limit: MAX_COMMAND_STRING_RUNNERS,
+                });
+                return;
+            }
+            for payload in command_string_runner_payloads(command, tokens, index, name) {
+                if !push_joined_payload(command, payload, limits, extracted, skip_reasons, name) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `command` may name one of `names` as a program: a plain substring
+/// test, or the same test with shell quoting removed when the command has any
+/// (`\watch`, `w\atch`, `"watch"`, `w'at'ch` all run `watch`). Linear.
+fn may_name_a_command(command: &str, names: &[&str]) -> bool {
+    if names.iter().any(|name| command.contains(name)) {
+        return true;
+    }
+    if !command
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'\'' | b'"'))
+    {
+        return false;
+    }
+    let unquoted: String = command
+        .chars()
+        .filter(|ch| !matches!(ch, '\\' | '\'' | '"' | '$'))
+        .collect();
+    names.iter().any(|name| unquoted.contains(name))
+}
+
+/// The command's word tokens, then those of each process substitution body
+/// (`<(…)`, `>(…)`, nested ones too): each body is a command line of its own
+/// whose first word is a command, while the outer tokenizer keeps the whole
+/// substitution as one word (`cat <(watch '…')`, `cat --x=<(watch '…')`).
+/// Token ranges index `command`. `false` when more than `limit` bodies were
+/// found, the rest unread.
+fn command_token_views(
+    command: &str,
+    limit: usize,
+) -> (Vec<crate::normalize::NormalizeTokens>, bool) {
+    let mut views = vec![crate::normalize::tokenize_for_normalization(command)];
+    let mut next = 0usize;
+    while next < views.len() {
+        let mut bodies = Vec::new();
+        for token in &views[next] {
+            if token.kind != crate::normalize::NormalizeTokenKind::Word {
+                continue;
+            }
+            let Some(text) = token.text(command) else {
+                continue;
+            };
+            let offset = token.byte_range.start;
+            bodies.extend(
+                process_substitution_bodies(text)
+                    .into_iter()
+                    .map(|body| body.start + offset..body.end + offset),
+            );
+        }
+        for body in bodies {
+            if views.len() > limit {
+                return (views, false);
+            }
+            let Some(text) = command.get(body.clone()) else {
+                continue;
+            };
+            let mut tokens = crate::normalize::tokenize_for_normalization(text);
+            for token in &mut tokens {
+                token.byte_range =
+                    token.byte_range.start + body.start..token.byte_range.end + body.start;
+            }
+            views.push(tokens);
+        }
+        next += 1;
+    }
+    (views, true)
+}
+
+/// Byte ranges, within `word`, of the bodies of the process substitutions the
+/// word holds: bash expands an unquoted `<(…)`/`>(…)` wherever it stands in a
+/// word, so `--file=<(…)` and `a<(…)` run their bodies like `<(…)` does.
+/// Quoted text is literal, and a `$(…)` body is the command-substitution
+/// reader's, so both are skipped whole. Nested substitutions are the bodies'
+/// own. Linear.
+fn process_substitution_bodies(word: &str) -> Vec<Range<usize>> {
+    let bytes = word.as_bytes();
+    let len = bytes.len();
+    let mut bodies = Vec::new();
+    let mut index = 0usize;
+    while index < len {
+        match bytes[index] {
+            b'\\' => index = (index + 2).min(len),
+            // `$'…'` takes backslash escapes, so `\'` does not close it.
+            b'$' if bytes.get(index + 1) == Some(&b'\'') => {
+                index += 2;
+                while index < len && bytes[index] != b'\'' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index = (index + 1).min(len);
+            }
+            b'\'' => {
+                index += 1;
+                while index < len && bytes[index] != b'\'' {
+                    index += 1;
+                }
+                index = (index + 1).min(len);
+            }
+            b'"' => {
+                index += 1;
+                while index < len {
+                    match bytes[index] {
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        b'\\' => index = (index + 2).min(len),
+                        b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                            index = crate::normalize::consume_shell_paren_construct(
+                                bytes,
+                                index + 2,
+                                len,
+                            );
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                index = crate::normalize::consume_shell_paren_construct(bytes, index + 2, len);
+            }
+            b'<' | b'>' if bytes.get(index + 1) == Some(&b'(') => {
+                let end = crate::normalize::consume_shell_paren_construct(bytes, index + 2, len);
+                if end > index + 3 && bytes[end - 1] == b')' {
+                    bodies.push(index + 2..end - 1);
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    bodies
+}
+
+/// Runner occurrences one command is read for before the reading is partial.
+const MAX_COMMAND_STRING_RUNNERS: usize = 64;
+
+/// The runner the word token names, if any.
+fn command_string_runner_name(
+    command: &str,
+    token: &crate::normalize::NormalizeToken,
+) -> Option<&'static str> {
+    if token.kind != crate::normalize::NormalizeTokenKind::Word {
+        return None;
+    }
+    let word = dequoted_executable_word(token.text(command)?);
+    let basename = word.rsplit('/').next().unwrap_or(&word);
+    COMMAND_STRING_RUNNERS
+        .iter()
+        .find(|runner| **runner == basename)
+        .copied()
+}
+
+/// For each token, whether a runner there would run: it is the command word
+/// of its segment (after assignments, redirects and the reserved words `{`,
+/// `!`, `if`, `then`, `do`, …, and the name `function NAME` / `coproc NAME`
+/// give a body), or any later word behind a command that runs its arguments
+/// (`sudo -u bob watch …`, `timeout 5s watch …`, `taskset -c 0 watch …`),
+/// whose options and their values this does not model. A runner among another
+/// command's arguments (`echo watch 'x'`) is data. One pass, so the check is
+/// linear in the command.
+fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeToken]) -> Vec<bool> {
+    use crate::normalize::NormalizeTokenKind;
+    let mut positions = vec![false; tokens.len()];
+    let mut expect_command = true;
+    let mut wrapped = false;
+    let mut redirect_target = false;
+    let mut body_name = false;
+    for (index, token) in tokens.iter().enumerate() {
+        if token.kind != NormalizeTokenKind::Word {
+            if splits_fd_duplication(command, tokens, index) {
+                // `2>&1`: the `&` and the descriptor after it are the
+                // redirect's, not a background separator and a command.
+                redirect_target = true;
+                continue;
+            }
+            expect_command = true;
+            wrapped = false;
+            redirect_target = false;
+            body_name = false;
+            continue;
+        }
+        let Some(text) = token.text(command) else {
+            continue;
+        };
+        if redirect_target {
+            redirect_target = false;
+            continue;
+        }
+        if word_token_starts_local_redirect(text) {
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
+        }
+        if body_name {
+            // `function f { …; }`, `coproc NAME { …; }`: the name, then a
+            // body whose first word is a command.
+            body_name = false;
+            continue;
+        }
+        positions[index] = expect_command || wrapped;
+        if !expect_command {
+            continue;
+        }
+        if matches!(
+            text,
+            "{" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "coproc"
+        ) || crate::normalize::is_env_assignment(text)
+        {
+            // bash takes `coproc WORD` as a name only when a compound command
+            // follows it (`coproc NAME { …; }`); otherwise WORD is the command.
+            body_name = text == "coproc"
+                && tokens
+                    .get(index + 2)
+                    .filter(|body| body.kind == NormalizeTokenKind::Word)
+                    .and_then(|body| body.text(command))
+                    .is_some_and(|body| {
+                        matches!(
+                            body,
+                            "{" | "while" | "until" | "if" | "for" | "case" | "select"
+                        )
+                    });
+            continue;
+        }
+        if text == "function" {
+            body_name = true;
+            continue;
+        }
+        expect_command = false;
+        let executable = dequoted_executable_word(text);
+        let basename = executable.rsplit('/').next().unwrap_or(&executable);
+        let next = tokens
+            .get(index + 1)
+            .filter(|next| next.kind == NormalizeTokenKind::Word)
+            .and_then(|next| next.text(command));
+        wrapped = matches!(
+            basename,
+            "sudo"
+                | "doas"
+                | "nice"
+                | "nohup"
+                | "time"
+                | "exec"
+                | "command"
+                | "builtin"
+                | "xargs"
+                | "timeout"
+                | "gtimeout"
+                | "setsid"
+                | "stdbuf"
+                | "ionice"
+                | "chrt"
+                | "busybox"
+                | "chronic"
+                | "env"
+        ) || crate::packs::core::git::unmodeled_exec_wrapper(basename, next);
+    }
+    positions
+}
+
+/// Whether a bare redirect operator word takes the following word as its
+/// target: `2>` and `>&` do, while `2>&1`, `>&-` and `<&0` carry their target
+/// already, so the word after them is the command (`2>&1 watch '…'`).
+fn redirect_operator_takes_next_word(text: &str) -> bool {
+    let named = redirect_descriptor_prefix_len(text);
+    let operator = if named > 0 {
+        &text[named..]
+    } else {
+        text.trim_start_matches(|ch: char| ch.is_ascii_digit())
+    };
+    !operator.is_empty()
+        && operator
+            .bytes()
+            .all(|byte| matches!(byte, b'>' | b'<' | b'&' | b'|'))
+}
+
+/// Whether the separator token at `index` is the `&` of a descriptor
+/// duplication (`2>&1`, `>&2`, `<&0`, `>& file`) or the `|` of a clobbering
+/// redirect (`>|file`). The tokenizer ends a word at `&` and `|`, so `2>&1`
+/// arrives as the word `2>`, a `&` separator and the word `1`; read as a
+/// background `&`, the `1` became the command and the word after it
+/// (`2>&1 watch '…'`) an argument. `>|f` read as a pipe into `f` ended the
+/// runner's words the same way (`watch >|f '…'`).
+fn splits_fd_duplication(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> bool {
+    let Some(separator) = tokens.get(index) else {
+        return false;
+    };
+    let Some(before) = index.checked_sub(1).and_then(|at| tokens.get(at)) else {
+        return false;
+    };
+    before.kind == crate::normalize::NormalizeTokenKind::Word
+        && before.byte_range.end == separator.byte_range.start
+        && before.text(command).is_some_and(|text| {
+            word_token_starts_local_redirect(text)
+                && match separator.text(command) {
+                    Some("&") => text.ends_with(['>', '<']),
+                    Some("|") => text.ends_with('>') && !text.ends_with("&>"),
+                    _ => false,
+                }
+        })
+}
+
+/// The command-string payloads of the runner whose name token is at `start`.
+#[allow(clippy::too_many_lines)]
+fn command_string_runner_payloads(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+    name: &str,
+) -> Vec<SshRemotePayload> {
+    use crate::normalize::NormalizeTokenKind;
+    let full_start = tokens[start].byte_range.start;
+    // The word tokens of this segment after the runner, up to a separator.
+    // A local redirect (and a bare operator's target) is the local shell's,
+    // wherever it stands: `watch 2>/dev/null '<cmd>'` runs `<cmd>`. The
+    // payload spans below still start and end at argv words.
+    let mut words: Vec<(&str, Range<usize>)> = Vec::new();
+    let mut redirect_target = false;
+    for (index, token) in tokens.iter().enumerate().skip(start + 1) {
+        if token.kind != NormalizeTokenKind::Word {
+            if splits_fd_duplication(command, tokens, index) {
+                redirect_target = true;
+                continue;
+            }
+            break;
+        }
+        let Some(text) = token.text(command) else {
+            break;
+        };
+        if std::mem::take(&mut redirect_target) {
+            continue;
+        }
+        if word_token_starts_local_redirect(text) {
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
+        }
+        words.push((text, token.byte_range.clone()));
+    }
+    // Words `from..to` as one payload. Several words are joined by every
+    // runner that takes more than one (watch, a parallel template, env -S
+    // with trailing words), so they carry the joined reading too.
+    let span = |from: usize, to: usize| -> Option<SshRemotePayload> {
+        if from >= to || to > words.len() {
+            return None;
+        }
+        let first = &words[from].1;
+        let last = &words[to - 1].1;
+        let single = to - from == 1;
+        let content = if single {
+            unquoted_payload_range(words[from].0, first.start)
+        } else {
+            first.start..last.end
+        };
+        Some(SshRemotePayload {
+            content,
+            full: full_start..last.end,
+            joined: !single,
+        })
+    };
+    // An attached value, `-c'<cmd>'` or `--prepare=<cmd>`.
+    let attached = |rest: &str, value_start: usize, end: usize| SshRemotePayload {
+        content: unquoted_payload_range(rest, value_start),
+        full: full_start..end,
+        joined: false,
+    };
+    let option = |word: &str| word.len() > 1 && word.starts_with('-');
+    let short_cluster = |word: &str| {
+        word.len() > 1
+            && word.starts_with('-')
+            && !word.starts_with("--")
+            && word[1..].bytes().all(|byte| byte.is_ascii_alphanumeric())
+    };
+    let mut payloads = Vec::new();
+    match name {
+        "watch" => {
+            // procps `watch` stops at its first operand (`+` getopt), so only
+            // the options before it decide `-x`; `-n`/`-q` take a value,
+            // also at the end of a cluster (`-tn 1`).
+            let mut index = 0usize;
+            let mut exec = false;
+            while index < words.len() {
+                let word = words[index].0;
+                if word == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option(word) {
+                    break;
+                }
+                if matches!(word, "-n" | "--interval" | "-q" | "--equexit") {
+                    index += 2;
+                    continue;
+                }
+                if word == "--exec" {
+                    exec = true;
+                } else if short_cluster(word) {
+                    let letters = &word[1..];
+                    let value_at = letters.find(['n', 'q']);
+                    let flags = value_at.map_or(letters, |at| &letters[..at]);
+                    exec |= flags.contains('x');
+                    if value_at == Some(letters.len() - 1) {
+                        index += 2;
+                        continue;
+                    }
+                }
+                index += 1;
+            }
+            if exec {
+                // argv, not a shell string: judged where it stands.
+                return payloads;
+            }
+            payloads.extend(span(index, words.len()));
+        }
+        "parallel" => {
+            let separator = |word: &str| matches!(word, ":::" | "::::" | ":::+" | "::::+");
+            // Where the template may start: after the options, and at each
+            // word after an option this does not model, which is either that
+            // option's value (the options go on after it) or the template.
+            // `parallel --retries 3 --tag 'git …' ::: a` runs `git …`.
+            let mut starts = Vec::new();
+            let mut index = 0usize;
+            let mut after_unknown = false;
+            while index < words.len() {
+                let word = words[index].0;
+                if word == "--" {
+                    index += 1;
+                    break;
+                }
+                if separator(word) {
+                    break;
+                }
+                if !option(word) {
+                    if !after_unknown {
+                        break;
+                    }
+                    starts.push(index);
+                    after_unknown = false;
+                    index += 1;
+                    continue;
+                }
+                after_unknown = false;
+                if PARALLEL_VALUE_OPTIONS.contains(&word) {
+                    index += 2;
+                    continue;
+                }
+                after_unknown = !PARALLEL_FLAG_OPTIONS.contains(&word) && !word.contains('=');
+                index += 1;
+            }
+            starts.push(index);
+            // The first separator at or after each position, so every start
+            // costs O(1) however many options precede it.
+            let mut next_separator = vec![words.len(); words.len() + 1];
+            for at in (0..words.len()).rev() {
+                next_separator[at] = if separator(words[at].0) {
+                    at
+                } else {
+                    next_separator[at + 1]
+                };
+            }
+            let mut listed_arguments = false;
+            for template in starts {
+                let end = next_separator[template.min(words.len())];
+                if end > template {
+                    payloads.extend(span(template, end));
+                } else if !listed_arguments
+                    && words.get(template).is_some_and(|(word, _)| *word == ":::")
+                {
+                    // No command: each argument is one.
+                    listed_arguments = true;
+                    for (at, (word, _)) in words.iter().enumerate().skip(template + 1) {
+                        if separator(word) {
+                            break;
+                        }
+                        payloads.extend(span(at, at + 1));
+                    }
+                }
+            }
+        }
+        "hyperfine" => {
+            // Every operand is a benchmarked command, and so are the values
+            // of `--prepare`, `--setup`, `--cleanup`, `--conclude` and
+            // `--reference`, separate or attached; a value that is a number
+            // or a file name reads as a harmless command.
+            for (at, (word, range)) in words.iter().enumerate() {
+                if !option(word) {
+                    payloads.extend(span(at, at + 1));
+                    continue;
+                }
+                let value = [
+                    "--prepare=",
+                    "--setup=",
+                    "--cleanup=",
+                    "--conclude=",
+                    "--reference=",
+                ]
+                .iter()
+                .find_map(|prefix| word.strip_prefix(prefix).map(|rest| (prefix.len(), rest)))
+                .or_else(|| {
+                    ["-p", "-s", "-c"].iter().find_map(|prefix| {
+                        word.strip_prefix(prefix).map(|rest| (prefix.len(), rest))
+                    })
+                });
+                if let Some((prefix_len, rest)) = value
+                    && !rest.is_empty()
+                {
+                    payloads.push(attached(rest, range.start + prefix_len, range.end));
+                }
+            }
+        }
+        "entr" => {
+            // `-s` (a flag, alone or in a cluster) hands the first operand
+            // to `$SHELL -c`; entr's options take no values.
+            let mut shell = false;
+            let mut index = 0usize;
+            while index < words.len() {
+                let word = words[index].0;
+                if word == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option(word) {
+                    break;
+                }
+                shell |= !word.starts_with("--") && word[1..].contains('s');
+                index += 1;
+            }
+            if shell {
+                payloads.extend(span(index, index + 1));
+            }
+        }
+        "sg" if !words
+            .iter()
+            .any(|(word, _)| matches!(word.trim_matches(['\'', '"']), "-c"))
+            && !words.iter().any(|(word, _)| word.starts_with("-c")) =>
+        {
+            // `sg [-] group command`: without `-c` the word after the group
+            // is the command string.
+            let group = usize::from(words.first().is_some_and(|(word, _)| *word == "-"));
+            payloads.extend(span(group + 1, group + 2));
+        }
+        "su" | "sg" | "runuser" | "script" | "flock" | "nix-shell" | "npx" => {
+            let flags = command_string_flags(name);
+            for (at, (word, range)) in words.iter().enumerate() {
+                let unquoted = word.trim_matches(['\'', '"']);
+                // A short flag may end a cluster: `su -lc '<cmd>'`,
+                // `script -qc '<cmd>'`.
+                let clustered = |flag: &&str| {
+                    flag.len() == 2
+                        && !unquoted.starts_with("--")
+                        && unquoted.len() > 2
+                        && unquoted.starts_with('-')
+                        && unquoted.ends_with(&flag[1..])
+                        && unquoted[1..].bytes().all(|byte| byte.is_ascii_alphabetic())
+                };
+                if flags.contains(&unquoted) || flags.iter().any(clustered) {
+                    payloads.extend(span(at + 1, at + 2));
+                    continue;
+                }
+                // Attached: `-c'<cmd>'`, `--command=<cmd>`.
+                let value = flags.iter().find_map(|flag| {
+                    let prefix = if flag.starts_with("--") {
+                        format!("{flag}=")
+                    } else {
+                        (*flag).to_string()
+                    };
+                    word.strip_prefix(prefix.as_str())
+                        .filter(|rest| !rest.is_empty())
+                        .map(|rest| (prefix.len(), rest))
+                });
+                if let Some((prefix_len, rest)) = value {
+                    payloads.push(attached(rest, range.start + prefix_len, range.end));
+                }
+            }
+        }
+        _ => {
+            // env: the `-S`/`--split-string` value, split by env, is the
+            // command, and the words after it are appended to its argv.
+            let mut index = 0usize;
+            while index < words.len() {
+                let (word, range) = (words[index].0, words[index].1.clone());
+                if !option(word) {
+                    break;
+                }
+                let unquoted = word.trim_matches(['\'', '"']);
+                if matches!(unquoted, "-S" | "--split-string") {
+                    payloads.extend(span(index + 1, index + 2));
+                    payloads
+                        .extend(span(index + 1, words.len()).filter(|_| index + 2 < words.len()));
+                    break;
+                }
+                let value = ["--split-string=", "-S"]
+                    .iter()
+                    .find_map(|prefix| word.strip_prefix(prefix).map(|rest| (prefix.len(), rest)));
+                if let Some((prefix_len, rest)) = value
+                    && !rest.is_empty()
+                {
+                    let value_start = range.start + prefix_len;
+                    payloads.push(attached(rest, value_start, range.end));
+                    if let Some(last) = words.get(index + 1..).and_then(<[_]>::last) {
+                        // `env -S'git reset' --hard`: value plus trailing words.
+                        payloads.push(SshRemotePayload {
+                            content: value_start..last.1.end,
+                            full: full_start..last.1.end,
+                            joined: true,
+                        });
+                    }
+                    break;
+                }
+                index += if matches!(
+                    unquoted,
+                    "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0" | "-f" | "--file"
+                ) {
+                    2
+                } else {
+                    1
+                };
+            }
+        }
+    }
+    payloads
+}
+
+/// Programs that run a command string (see
+/// [`extract_command_string_runner_scripts`]).
+const COMMAND_STRING_RUNNERS: &[&str] = &[
+    "watch",
+    "parallel",
+    "env",
+    "su",
+    "sg",
+    "runuser",
+    "script",
+    "nix-shell",
+    "npx",
+    "entr",
+    "flock",
+    "hyperfine",
+];
+
+/// The option that hands each flag runner its command string.
+fn command_string_flags(name: &str) -> &'static [&'static str] {
+    match name {
+        "su" | "runuser" | "script" | "flock" => &["-c", "--command"],
+        "sg" => &["-c"],
+        "nix-shell" => &["--run", "--command"],
+        "npx" => &["-c", "--call"],
+        _ => &[],
+    }
+}
+
+/// GNU parallel options whose value is the next word.
+const PARALLEL_VALUE_OPTIONS: &[&str] = &[
+    "-a",
+    "-C",
+    "-I",
+    "-j",
+    "-L",
+    "-N",
+    "-P",
+    "-S",
+    "--arg-file",
+    "--colsep",
+    "--delay",
+    "--jobs",
+    "--joblog",
+    "--max-args",
+    "--results",
+    "--sshlogin",
+    "--timeout",
+];
+
+/// GNU parallel options known to take no value.
+const PARALLEL_FLAG_OPTIONS: &[&str] = &[
+    "-0",
+    "-k",
+    "-q",
+    "-r",
+    "-u",
+    "-v",
+    "-X",
+    "-m",
+    "--bar",
+    "--dry-run",
+    "--eta",
+    "--group",
+    "--keep-order",
+    "--line-buffer",
+    "--null",
+    "--pipe",
+    "--progress",
+    "--quote",
+    "--tag",
+    "--ungroup",
+    "--verbose",
+    "--xargs",
+];
 
 /// Locate the remote-command payload of the `ssh` invocation whose executable
 /// token is at `start`. See [`extract_ssh_inline_scripts`] for the grammar and
@@ -2199,22 +4773,52 @@ fn ssh_remote_payload(
     use crate::normalize::NormalizeTokenKind;
 
     let full_start = tokens.get(start)?.byte_range.start;
-    let mut index = start + 1;
-    let mut options_ended = false;
-
-    // Phase 1: options, then the destination.
-    loop {
-        let token = tokens.get(index)?;
+    // ssh's argv: the words up to the next shell separator (which belongs to
+    // the LOCAL shell), without local redirects and a bare operator's target,
+    // which the local shell also removes wherever they stand — a redirect
+    // applies to the `ssh` process, never to the remote command
+    // (`ssh h 2>/dev/null '<cmd>'` runs `<cmd>`). Dropping a trailing one is
+    // what keeps the payload a single token in `ssh h "a 2>/dev/null" 2>&1`,
+    // so the quote-stripping branch below still fires: when the run swallowed
+    // the local `2>`, the retained closing quote glued itself onto the remote
+    // target, producing `/dev/null"` and a `redirect-truncate-dynamic-path`
+    // deny for an unchanged, harmless inner redirect (issue #404).
+    let mut argv: Vec<&crate::normalize::NormalizeToken> = Vec::new();
+    let mut redirect_target = false;
+    for (index, token) in tokens.iter().enumerate().skip(start + 1) {
         if token.kind != NormalizeTokenKind::Word {
-            // Separator before any destination: an interactive `ssh host` in
-            // an earlier segment shape, or plain `ssh` — no payload.
-            return None;
+            if splits_fd_duplication(command, tokens, index) {
+                redirect_target = true;
+                continue;
+            }
+            break;
         }
+        let text = token.text(command)?;
+        if std::mem::take(&mut redirect_target) {
+            continue;
+        }
+        if word_token_starts_local_redirect(text) {
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
+        }
+        argv.push(token);
+    }
+    let word_at = |index: usize| -> Option<&str> {
+        let token = argv.get(index)?;
         let (word, _, _) = dequoted_flag_word(
             token.text(command)?,
             token.byte_range.start,
             token.byte_range.end,
         );
+        Some(word)
+    };
+    let mut index = 0usize;
+    let mut options_ended = false;
+
+    // Phase 1: options, then the destination.
+    loop {
+        // No destination: plain `ssh` — no payload.
+        let word = word_at(index)?;
         if !options_ended && word == "--" {
             options_ended = true;
             index += 1;
@@ -2236,39 +4840,35 @@ fn ssh_remote_payload(
         index += 1;
         break;
     }
-
-    // Phase 2: the payload is the run of Word tokens after the destination,
-    // up to the next shell separator (which belongs to the LOCAL shell) or the
-    // first redirect operator (which also belongs to the LOCAL shell — a
-    // redirect always applies to the `ssh` process, never to the remote
-    // command). Stopping at the redirect is what keeps the payload a single
-    // token in `ssh h "a 2>/dev/null" 2>&1`, so the quote-stripping branch
-    // below still fires: without it the run swallowed the local `2>` and the
-    // retained closing quote glued itself onto the remote target, producing
-    // `/dev/null"` and a `redirect-truncate-dynamic-path` deny for an
-    // unchanged, harmless inner redirect (issue #404).
-    let payload_start = index;
-    let mut payload_end = index;
-    while let Some(token) = tokens.get(payload_end) {
-        if token.kind != NormalizeTokenKind::Word {
-            break;
+    // OpenSSH parses options again right after the destination unless `--`
+    // ended them (`ssh host -t cmd`, `ssh host -- cmd`): those words are
+    // ssh's, not the remote command's. An option this does not model there
+    // leaves the words to the payload, as before.
+    if !options_ended {
+        let mut again = index;
+        while let Some(word) = word_at(again) {
+            if word == "--" {
+                again += 1;
+                index = again;
+                break;
+            }
+            if !(word.len() > 1 && word.starts_with('-')) {
+                index = again;
+                break;
+            }
+            match classify_ssh_option(word) {
+                SshOptionShape::FlagsOnly | SshOptionShape::ValueAttached => again += 1,
+                SshOptionShape::TakesSeparateValue => again += 2,
+                SshOptionShape::Unknown => break,
+            }
+            index = again;
         }
-        if token
-            .text(command)
-            .is_some_and(word_token_starts_local_redirect)
-        {
-            break;
-        }
-        payload_end += 1;
-    }
-    if payload_end == payload_start {
-        // Interactive session: no remote command.
-        return None;
     }
 
-    let first = tokens.get(payload_start)?;
-    let last = tokens.get(payload_end - 1)?;
-    if payload_end - payload_start == 1 {
+    // Phase 2: the payload is the rest of the argv.
+    let payload = argv.get(index..).unwrap_or_default();
+    let (first, last) = (payload.first()?, payload.last()?);
+    if payload.len() == 1 {
         // Single payload word: strip one layer of quotes so the recursive
         // evaluation sees the remote command line itself, exactly as the
         // remote shell will.
@@ -2276,11 +4876,13 @@ fn ssh_remote_payload(
         return Some(SshRemotePayload {
             content: unquoted_payload_range(text, first.byte_range.start),
             full: full_start..first.byte_range.end,
+            joined: false,
         });
     }
     Some(SshRemotePayload {
         content: first.byte_range.start..last.byte_range.end,
         full: full_start..last.byte_range.end,
+        joined: true,
     })
 }
 
@@ -2369,13 +4971,57 @@ fn extract_heredocs(
     }
 
     let mut hit_limit = false;
+    let mut foreign_body_ranges = None;
     for cap in HEREDOC_EXTRACTOR.captures_iter(command) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
+        let full_match = cap.get(0).unwrap();
+        // Retain executable/interpolating heredocs, but do not reclassify the
+        // literal argument of a plain Perl print statement as a new program.
+        // The outer shell AST must independently prove ownership as well.
+        let nested = extracted.iter().any(|source| {
+            source.quoted
+                && source.target_command.as_deref().is_some_and(|target| {
+                    ScriptLanguage::from_command(target) == ScriptLanguage::Perl
+                })
+                && source
+                    .content_range
+                    .as_ref()
+                    .is_some_and(|body| body.contains(&full_match.start()))
+        });
+        if nested
+            && is_literal_perl_print_heredoc(command, full_match.start()..full_match.end())
+            && foreign_body_ranges
+                .get_or_insert_with(|| {
+                    quoted_non_shell_heredoc_ranges(command, limits.max_heredocs)
+                })
+                .iter()
+                .any(|body| body.contains(&full_match.start()))
+        {
+            continue;
+        }
+        // A duplicate inside data must not consume the extraction quota either.
         if extracted.len() >= limits.max_heredocs {
             hit_limit = true;
             break;
+        }
+
+        // `<<<` is a here-string, not a heredoc, and `extract_herestrings`
+        // already handled it. The regex anchors on `<<`, so it also matches the
+        // last two `<` of `<<<` and reads the here-string's own text as a
+        // heredoc delimiter — `cat <<< 'hello world'` produced a phantom
+        // heredoc with delimiter `hello world`, which has no terminator line
+        // and so recorded `UnterminatedHeredoc`. That reason was invisible
+        // while a partial extraction was reported as complete; now that it is
+        // not (#427), a phantom reason would put every here-string on the
+        // bounded-fallback path, and deny it outright under
+        // `fallback_on_parse_error=false`.
+        if command.as_bytes()[..cap.get(0).map_or(0, |m| m.start())]
+            .last()
+            .is_some_and(|byte| *byte == b'<')
+        {
+            continue;
         }
 
         let operator_variant = cap.get(1).map(|m| m.as_str());
@@ -2398,7 +5044,6 @@ fn extract_heredocs(
             _ => HeredocType::Standard,
         };
 
-        let full_match = cap.get(0).unwrap();
         let mut start_pos = full_match.end();
 
         // Heredoc bodies start on the next line. If there are trailing tokens after the delimiter
@@ -2449,6 +5094,93 @@ fn extract_heredocs(
     }
 }
 
+/// A deliberately small Perl data-only statement: a single-quoted heredoc is
+/// the sole argument to a plain print/say terminated on its header line.
+/// `eval`, assignments with unknown later consumers, interpolation, additional
+/// arguments and transformations retain conservative analysis. This predicate
+/// is shared by extraction and the bounded Perl lexer, not a Perl evaluator.
+pub(crate) fn is_literal_perl_print_heredoc(command: &str, operator: Range<usize>) -> bool {
+    let Some(header) = command.get(operator.clone()) else {
+        return false;
+    };
+    let Some(delimiter) = header.strip_prefix("<<") else {
+        return false;
+    };
+    let delimiter = delimiter
+        .strip_prefix('~')
+        .unwrap_or(delimiter)
+        .trim_start_matches([' ', '\t']);
+    if !delimiter.starts_with('\'') || header.contains(['\n', '\r']) {
+        return false;
+    }
+    let prefix = command[..operator.start]
+        .rsplit('\n')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let suffix = command[operator.end..]
+        .split('\n')
+        .next()
+        .unwrap_or("")
+        .trim();
+    matches!(prefix, "print" | "say" | "CORE::print" | "CORE::say") && suffix == ";"
+}
+
+/// AST-proven quoted stdin owned by a concrete non-shell interpreter. This
+/// does NOT mark the program safe: the complete body is still analyzed. It
+/// only permits a proven literal print argument to retain its program owner.
+/// Shells, expanding bodies and overridden receivers
+/// retain the old conservative scan.
+///
+/// Do not call `active_heredocs` or the fallback-capable override helper here:
+/// their recovery paths call this extractor. A single direct parse avoids that
+/// cycle, and a parse error supplies no exemption. The caller caches the result;
+/// at most the extraction quota's worth of name-override walks can be required.
+fn quoted_non_shell_heredoc_ranges(command: &str, limit: usize) -> Vec<Range<usize>> {
+    if command.len() > 256 * 1024 {
+        return Vec::new();
+    }
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    let mut heredocs = Vec::new();
+    let mut parse_error = false;
+    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error);
+    if parse_error {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    for heredoc in heredocs.into_iter().take(limit) {
+        let ActiveHeredocBody::Heredoc {
+            body_start,
+            body_end,
+            delimiter_quoted: true,
+        } = heredoc.body
+        else {
+            continue;
+        };
+        let Some((target, wrapped)) =
+            extract_heredoc_target_resolution(command, heredoc.operator_start)
+        else {
+            continue;
+        };
+        if wrapped || !is_non_shell_interpreter_stdin_command(&target) {
+            continue;
+        }
+        let basename = target.rsplit(['/', '\\']).next().unwrap_or(&target);
+        let mut overridden = false;
+        let mut override_parse_error = false;
+        find_shell_name_override_deep(
+            ast.root(),
+            basename,
+            &mut overridden,
+            &mut override_parse_error,
+        );
+        if !overridden && !override_parse_error {
+            ranges.push(body_start..body_end);
+        }
+    }
+    ranges
+}
+
 /// Extract the command that receives a heredoc or here-string.
 ///
 /// Looks backwards from the heredoc operator position to find the command word.
@@ -2467,6 +5199,18 @@ fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option
             .unwrap_or(target.as_str())
             .to_string()
     })
+}
+
+/// The command that receives the first heredoc in `command`, by basename.
+///
+/// Exposed for pack ordering (#428): the dialect that will actually execute a
+/// SQL payload is the one that should answer for it, and that is decided by the
+/// carrier rather than by which pack the configuration happens to list first.
+/// Cheap by construction — one substring search plus the backward walk — and
+/// callers gate it on the command carrying a heredoc at all.
+pub(crate) fn first_heredoc_target_command(command: &str) -> Option<String> {
+    let operator = memchr::memmem::find(command.as_bytes(), b"<<")?;
+    extract_heredoc_target_command(command, operator)
 }
 
 /// Extract the lexical command token that owns a heredoc, preserving an
@@ -2490,7 +5234,7 @@ fn extract_heredoc_target_resolution(
 
     // The heredoc operator binds to the simple command on its OWN physical line,
     // so only that line can own this heredoc. Bounding here is a soundness fix:
-    // `tokenize_backwards` stops at `| ; & $ ( )` but NOT at newlines, so an
+    // `tokenize_backwards` stops at `| ; & ( )` but NOT at newlines, so an
     // unbounded scan resolves the target from an EARLIER line — e.g.
     // `cat f\nbash <<EOF\nrm -rf /\nEOF` would resolve the target as `cat` (a data
     // sink) and mask the executing `bash` body: a false negative. Limiting the
@@ -2600,6 +5344,18 @@ fn shell_assignment_name(token: &str) -> Option<&str> {
 /// Tokenize a command string backwards, respecting quotes.
 /// Returns tokens in reverse order (last token first).
 ///
+/// The walk stops at a real command boundary — `|`, `;`, `&`, `(`, `)` — so it
+/// never reads tokens belonging to another command. A bare `$` is **not** one:
+/// it introduces an expansion *inside* a word, and `$VAR`/`${VAR}` keep the word
+/// in the same simple command. Treating it as a boundary truncated the walk
+/// before the program word, so `cat > $S/out.md <<'EOF'` resolved no target at
+/// all, the quoted (therefore inert) body could not be masked, and a line-leading
+/// backtick in it tripped `heredoc.shell:launcher-unverified` — while the
+/// better-quoted `cat > "$S/out.md"` was allowed, because the quoted-string arm
+/// below consumes that token whole and the walk reached `cat` (#439).
+/// A command substitution is still bounded: `$(…)` ends in `)` and an unclosed
+/// one leaves its `(`, both of which stop the walk.
+///
 /// Note: This function does not handle escaped quotes inside double-quoted strings
 /// (e.g., `"foo\"bar"`). In such cases, tokenization may be incorrect. This is acceptable
 /// because the failure mode is safe - we won't find the target command and thus won't
@@ -2633,8 +5389,8 @@ fn tokenize_backwards(s: &str) -> Vec<String> {
             continue;
         }
 
-        // Check for command separator (|, ;, &, $, ()
-        if matches!(bytes[i - 1], b'|' | b';' | b'&' | b'$' | b'(' | b')') {
+        // Check for command separator (|, ;, &, (, ))
+        if matches!(bytes[i - 1], b'|' | b';' | b'&' | b'(' | b')') {
             // Stop parsing - we've reached a command boundary
             break;
         }
@@ -2642,7 +5398,7 @@ fn tokenize_backwards(s: &str) -> Vec<String> {
         // Regular word - scan backwards to whitespace or separator
         while i > 0 {
             let c = bytes[i - 1];
-            if c.is_ascii_whitespace() || matches!(c, b'|' | b';' | b'&' | b'$' | b'(' | b')') {
+            if c.is_ascii_whitespace() || matches!(c, b'|' | b';' | b'&' | b'(' | b')') {
                 break;
             }
             i -= 1;
@@ -2812,7 +5568,91 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
     let mut overridden = false;
     let mut parse_error = false;
     find_shell_name_override_deep(ast.root(), target, &mut overridden, &mut parse_error);
+    if !parse_error {
+        return overridden;
+    }
+    // The whole command can still fail to parse because of bytes inside a
+    // *quoted* heredoc body, which are literal stdin data the shell never
+    // parses as grammar (issue #412). Retry once with only those bodies
+    // blanked: if the command then parses and shows no override, the parse
+    // error came from inert data and cannot have hidden one. Anything else
+    // keeps the fail-closed answer.
+    //
+    // The failed parse's own `overridden` is deliberately NOT consulted: a
+    // mis-parse can invent an assignment out of body text (`Read-only` inside a
+    // commit message), and a verdict read off a tree the parser already
+    // rejected is exactly as untrustworthy as the rejection.
+    let Some(blanked) = quoted_heredoc_bodies_blanked(command) else {
+        return true;
+    };
+    let ast = AstGrep::new(blanked.as_str(), SupportLang::Bash);
+    let mut overridden = false;
+    let mut parse_error = false;
+    find_shell_name_override_deep(ast.root(), target, &mut overridden, &mut parse_error);
     overridden || parse_error
+}
+
+/// The command with every *quoted-delimiter* heredoc body replaced by blanks,
+/// or `None` when there is no such body to blank (issue #412).
+///
+/// A `<<'EOF'` body is literal stdin data: the shell performs no expansion in
+/// it and never parses it as grammar, so its bytes cannot rebind a name in the
+/// shell that feeds the heredoc. They can, however, stop tree-sitter-bash
+/// parsing the enclosing command — an unbalanced `"` in a German commit message
+/// (`„Messen"`) nested inside `"$(cat <<'EOF' … )"` is the reported case — and a
+/// parse error is answered fail-closed, which suppressed the very masking the
+/// body was eligible for.
+///
+/// Blanking preserves every byte offset and every newline, so the retry parses
+/// the same command with only inert data neutralized. Expanding heredocs are
+/// deliberately left alone: the shell *does* evaluate `$(…)` inside them, so
+/// their bytes can carry a real override.
+fn quoted_heredoc_bodies_blanked(command: &str) -> Option<String> {
+    // Raw text, not the masked scan view. The masker calls
+    // `stdin_data_sink_may_be_overridden`, which reaches this function, so
+    // asking for the mask here would not terminate (#420). Using the raw text
+    // is also the honest input: the question here is which bodies exist, not
+    // which of them are data.
+    let extracted = match extract_content_with_scan_view(
+        command,
+        command,
+        &ExtractionLimits::structural_scan(),
+    ) {
+        ExtractionResult::Extracted(extracted) | ExtractionResult::Partial { extracted, .. } => {
+            extracted
+        }
+        ExtractionResult::NoContent
+        | ExtractionResult::Skipped(_)
+        | ExtractionResult::Failed(_) => return None,
+    };
+    let mut ranges: Vec<std::ops::Range<usize>> = extracted
+        .into_iter()
+        .filter(|content| {
+            content.quoted
+                && content
+                    .heredoc_type
+                    .is_some_and(|kind| kind != HeredocType::HereString)
+        })
+        .filter_map(|content| content.content_range)
+        .filter(|range| range.end <= command.len() && range.start <= range.end)
+        .collect();
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_by_key(|range| range.start);
+
+    let mut out = String::with_capacity(command.len());
+    let mut pos = 0usize;
+    for range in ranges {
+        if range.start < pos {
+            continue;
+        }
+        out.push_str(command.get(pos..range.start)?);
+        out.push_str(&mask_preserve_newlines(command.get(range.clone())?));
+        pos = range.end;
+    }
+    out.push_str(command.get(pos..)?);
+    Some(out)
 }
 
 /// The whole-command retry walker for [`stdin_data_sink_may_be_overridden`].
@@ -3363,7 +6203,7 @@ pub(crate) fn range_is_inert_interpreter_stdin(command: &str, range: &Range<usiz
 /// after the terminator are still scanned, so a real destructive command chained
 /// after the heredoc still blocks. `--stdin-paths` is deliberately NOT matched.
 /// The scan is bounded to the heredoc's own physical line (see below) and
-/// `tokenize_backwards` additionally stops at shell separators (`| ; & $ ( )`),
+/// `tokenize_backwards` additionally stops at shell separators (`| ; & ( )`),
 /// so it never reads tokens across a command boundary; quoted args (e.g. a
 /// `-m "…-F -…"` message) are single tokens and cannot be mistaken for real flags.
 fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
@@ -3372,7 +6212,7 @@ fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     }
     // A heredoc operator binds to the simple command on its OWN physical line, so
     // only that line can own this heredoc. Bounding the scan to the current line
-    // is essential for soundness: `tokenize_backwards` stops at `| ; & $ ( )` but
+    // is essential for soundness: `tokenize_backwards` stops at `| ; & ( )` but
     // NOT at newlines, so without this a `git … -F -` on an EARLIER line would
     // leak its stdin sentinel onto a later, genuinely-executing heredoc and mask
     // its body — e.g. `git commit -F - f\nbash <<EOF\nrm -rf /\nEOF` would wrongly
@@ -3913,8 +6753,9 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
 /// with `&&` or `|` was allowed.
 ///
 /// The recovery is deliberately narrow so malformed input can never erase
-/// later executable text: exactly one heredoc-like operator in the whole
-/// input, proven active by the quote-aware trigger scanner, not preceded by
+/// later executable text: one heredoc-like operator outside the body it
+/// describes (a second one *inside* that body is data, not shell input —
+/// #440), proven active by the quote-aware trigger scanner, not preceded by
 /// a `#` on its own line (the scanner does not model comments), a simple
 /// delimiter token (no `<<'E'OF`-style concatenation, whose quote removal the
 /// tier-2 extractor does not perform), and a terminator the extractor
@@ -3924,7 +6765,7 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
 /// plus everything after the terminator, stay visible. Anything ambiguous
 /// answers `None`, which keeps the whole input unmasked.
 fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
-    if command.match_indices("<<").count() != 1 || !contains_active_heredoc_operator(command) {
+    if !contains_active_heredoc_operator(command) {
         return None;
     }
     let operator_start = command.find("<<")?;
@@ -3954,7 +6795,15 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
         Some(_) => return None,
     }
 
-    let extracted = match extract_content(command, &ExtractionLimits::default()) {
+    // Raw text, not the masked scan view: this function is reached *from* the
+    // masker, so asking for the mask here would not terminate (#420). Scanning
+    // the raw text in this one place is the conservative direction, and it is
+    // what every caller did before.
+    let extracted = match extract_content_with_scan_view(
+        command,
+        command,
+        &ExtractionLimits::structural_scan(),
+    ) {
         ExtractionResult::Extracted(extracted) | ExtractionResult::Partial { extracted, .. } => {
             extracted
         }
@@ -3975,6 +6824,24 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
     }
     let body_range = candidate.content_range?;
     if body_range.start < delimiter_match.end() || body_range.end > command.len() {
+        return None;
+    }
+    // A second `<<` is tolerated in exactly one place: inside the very body
+    // this call is about to describe. That body is what the shell hands the
+    // command as data, so a heredoc operator written there is text — most
+    // often another language's, since Ruby's `<<~` is what made tree-sitter
+    // reject the parse in the first place. Requiring a single `<<` in the
+    // whole input meant `cat > x.rb <<'OUTER'` with `eval <<~'SCRIPT'` in its
+    // body produced no span at all, so the quoted body was rescanned as live
+    // shell and its Ruby `eval` denied as a POSIX one — while the same
+    // command without the nested operator was correctly allowed (#440).
+    // Anything outside the body still answers None: a `<<` before the
+    // operator is shell input on the operator's own line, and one after the
+    // terminator is shell input that masking must never erase.
+    if command
+        .match_indices("<<")
+        .any(|(index, _)| index != operator_start && !body_range.contains(&index))
+    {
         return None;
     }
     Some(vec![ActiveHeredoc {
@@ -4348,6 +7215,44 @@ pub struct PosixCommandSubstitutionParseError;
 /// input is refused for its size rather than its syntax.
 pub(crate) const MAX_SUBSTITUTION_SOURCE_BYTES: usize = 256 * 1024;
 
+/// Stages one pipeline may have before a command is not handed to the bash
+/// parser. tree-sitter-bash parses a single long pipeline in superlinear
+/// time: `x | cat | … | sh -c ls` with 6,000 stages held one parse ~0.7 s in
+/// an optimized build and the shipped hook 2.5–9 s, past its own deadline.
+/// No real command comes near this; past it the reading is refused.
+pub(crate) const MAX_PARSED_PIPELINE_STAGES: usize = 1024;
+
+/// Stages in the command's longest pipeline, by the tokenizer: `|` (and
+/// `|&`) joins two stages; any other separator (`;`, `&&`, `||`, `&`, a
+/// newline, a parenthesis) starts a new pipeline. Linear.
+pub(crate) fn longest_pipeline_stages(command: &str) -> usize {
+    if !command.contains('|') {
+        return 1;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    let mut longest = 1usize;
+    let mut stages = 1usize;
+    let mut previous_pipe_end = None;
+    for token in &tokens {
+        if token.kind != crate::normalize::NormalizeTokenKind::Separator {
+            continue;
+        }
+        match token.text(command) {
+            Some("|") => {
+                stages += 1;
+                longest = longest.max(stages);
+                previous_pipe_end = Some(token.byte_range.end);
+                continue;
+            }
+            // `|&` arrives as `|` then `&`.
+            Some("&") if previous_pipe_end == Some(token.byte_range.start) => {}
+            _ => stages = 1,
+        }
+        previous_pipe_end = None;
+    }
+    longest
+}
+
 pub fn extract_posix_command_substitutions(
     content: &str,
 ) -> Result<Vec<PosixCommandSubstitution>, PosixCommandSubstitutionParseError> {
@@ -4358,7 +7263,9 @@ pub fn extract_posix_command_substitutions(
     if content.trim().is_empty() || (!content.contains("$(") && !content.contains('`')) {
         return Ok(Vec::new());
     }
-    if content.len() > MAX_SUBSTITUTION_SOURCE_BYTES {
+    if content.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+        || longest_pipeline_stages(content) > MAX_PARSED_PIPELINE_STAGES
+    {
         return Err(PosixCommandSubstitutionParseError);
     }
 
@@ -4837,6 +7744,134 @@ mod tests {
     #[allow(unused_imports)]
     use proptest::prelude::*;
 
+    /// Issue #440: a nested heredoc operator inside a quoted body is data.
+    ///
+    /// Writing a Ruby script with `cat > x.rb <<'OUTER'` whose body uses
+    /// Ruby's own `eval <<~'SCRIPT'` denied as a POSIX eval. Ruby's `<<~` is
+    /// what defeats tree-sitter-bash, and the single-heredoc recovery then
+    /// refused to describe the body because the input held a second `<<` —
+    /// one that sits *inside* that very body. With no span the quoted body
+    /// was rescanned as live shell.
+    #[test]
+    fn nested_heredoc_operator_inside_a_quoted_body_is_masked_issue_440() {
+        let command = "cat > /tmp/x.rb <<'OUTER'\neval <<~'SCRIPT'\n  puts 1\nSCRIPT\nOUTER";
+        let masked = mask_non_expanding_data_heredocs(command);
+        assert!(
+            !masked.contains("eval"),
+            "the quoted body must be masked out of the raw-shell rescan; got:\n{masked}"
+        );
+        // Masking is length-preserving, so spans computed against the raw
+        // command stay valid against the view.
+        assert_eq!(masked.len(), command.len());
+    }
+
+    /// The same shape with an UNQUOTED outer delimiter stays visible: the
+    /// shell expands that body before `cat` sees it, so it is not inert.
+    #[test]
+    fn nested_heredoc_operator_inside_an_unquoted_body_stays_visible_issue_440() {
+        let command = "cat > /tmp/x.rb <<OUTER\neval <<~'SCRIPT'\n  puts 1\nSCRIPT\nOUTER";
+        let masked = mask_non_expanding_data_heredocs(command);
+        assert!(
+            masked.contains("eval"),
+            "an unquoted body expands before the data sink runs and must not be masked"
+        );
+    }
+
+    /// Proves the recovery path itself, not just the AST path: `cat <<'EOF';
+    /// echo done` is the #393 shape tree-sitter-bash rejects outright, so the
+    /// span can only come from `active_single_heredoc_fallback`. With a nested
+    /// operator in the body the input holds three `<<`, which the old
+    /// single-operator guard refused, leaving the quoted body unmasked.
+    #[test]
+    fn fallback_recovers_a_body_holding_a_nested_operator_issue_440() {
+        let command = "cat <<'EOF'; echo done\neval <<~'X'\n  y\nX\nEOF";
+        let masked = mask_non_expanding_data_heredocs(command);
+        assert!(
+            !masked.contains("eval"),
+            "the recovery must describe a quoted body even when it holds another \
+             heredoc operator; got:\n{masked}"
+        );
+        assert!(
+            masked.contains("echo done"),
+            "the operator line's own commands stay visible"
+        );
+    }
+
+    /// The recovery must still refuse when the extra operator is real shell
+    /// input rather than body data — after the terminator, where masking it
+    /// would erase a command the shell actually runs.
+    #[test]
+    fn heredoc_operator_after_the_terminator_still_blocks_recovery_issue_440() {
+        let command = "cat > /tmp/x.rb <<'OUTER'\neval <<~'SCRIPT'\n  puts 1\nSCRIPT\nOUTER\ncat <<'NEXT'\nx\nNEXT";
+        let masked = mask_non_expanding_data_heredocs(command);
+        assert!(
+            masked.contains("cat <<'NEXT'"),
+            "text after the terminator is shell input and must never be erased"
+        );
+    }
+
+    /// Issue #412: data bytes inside a quoted heredoc body must not decide
+    /// whether the body gets masked.
+    ///
+    /// `„Messen"` in a German commit message leaves an odd number of `"` in the
+    /// body. Inside `"$(cat <<'EOF' … )"` that defeated tree-sitter-bash on the
+    /// whole command, and the fail-closed answer to a parse error suppressed
+    /// masking — so the body was rescanned as live shell, `Read-only` read as a
+    /// PowerShell verb-noun, and the commit was denied.
+    #[test]
+    fn quoted_heredoc_body_bytes_do_not_decide_the_override_answer() {
+        let balanced = "git commit -q -m \"$(cat <<'EOF'\na \"b\" c\nRead-only\nEOF\n)\"";
+        let unbalanced = "git commit -q -m \"$(cat <<'EOF'\n\u{201e}Messen\"\nRead-only\nEOF\n)\"";
+        for command in [balanced, unbalanced] {
+            let heredocs = active_heredocs(command).expect("heredoc is delimitable");
+            let [heredoc] = heredocs.as_slice() else {
+                panic!("expected exactly one heredoc in {command:?}");
+            };
+            let target = extract_heredoc_target_command(command, heredoc.operator_start)
+                .expect("target command");
+            assert_eq!(target, "cat");
+            assert!(
+                !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target),
+                "an unbalanced quote inside the body is data, not a rebinding: {command:?}"
+            );
+            assert_ne!(
+                mask_non_expanding_data_heredocs(command).as_ref(),
+                command,
+                "the body must be masked out of the raw-shell rescan: {command:?}"
+            );
+        }
+    }
+
+    /// The blanking retry only neutralizes *quoted* bodies, and preserves every
+    /// byte offset so the retry parses the same command.
+    #[test]
+    fn blanking_preserves_offsets_and_skips_expanding_bodies() {
+        let quoted = "git commit -q -m \"$(cat <<'EOF'\n\u{201e}Messen\"\nRead-only\nEOF\n)\"";
+        let blanked = quoted_heredoc_bodies_blanked(quoted).expect("quoted body is blanked");
+        assert_eq!(
+            blanked.len(),
+            quoted.len(),
+            "blanking must preserve byte offsets"
+        );
+        assert_eq!(
+            blanked.matches('\n').count(),
+            quoted.matches('\n').count(),
+            "blanking must preserve newlines"
+        );
+        assert!(!blanked.contains("Read-only"));
+        assert!(
+            blanked.contains("<<'EOF'") && blanked.contains("EOF\n)"),
+            "only the body is blanked, not the operator or terminator: {blanked:?}"
+        );
+
+        // An expanding heredoc body is evaluated by the shell, so its bytes can
+        // carry a real override and must be left alone.
+        assert!(
+            quoted_heredoc_bodies_blanked("cat <<EOF\n$(rm -rf /)\nEOF").is_none(),
+            "an unquoted delimiter must not be blanked"
+        );
+    }
+
     // ========================================================================
     // ssh remote-payload extraction (#326)
     // ========================================================================
@@ -4844,15 +7879,39 @@ mod tests {
     mod ssh_remote_payload_extraction {
         use super::*;
 
+        /// Extraction limits with only the wall clock relaxed.
+        ///
+        /// These cases assert *which* payloads ssh's option grammar yields, never
+        /// how fast the host is, but `ExtractionLimits::default()` also carries
+        /// `timeout_ms: 50`. Measured on a 128-core host at load 91, the inline
+        /// `heredoc` tests failed 2 of 8 runs here. The size and slot caps keep
+        /// their shipped values, so nothing about the grammar under test moves.
+        fn ssh_limits() -> ExtractionLimits {
+            ExtractionLimits {
+                timeout_ms: 5_000,
+                ..ExtractionLimits::default()
+            }
+        }
+
         fn ssh_payloads(command: &str) -> Vec<String> {
-            let result = extract_content(command, &ExtractionLimits::default());
-            match result {
+            // Only a completed extraction is an answer. Collapsing everything else
+            // into an empty vector let the wall clock decide these tests twice
+            // over: the positive assertions flaked, and the negative ones passed
+            // for the wrong reason, because
+            // `unmodeled_options_bail_without_extraction` cannot tell "ssh refused
+            // the option" from "extraction ran out of time" when both yield no
+            // payloads. `NoContent`/`Skipped` stay empty since they are real
+            // outcomes for these inputs; an incomplete read is now loud instead.
+            match extract_content(command, &ssh_limits()) {
                 ExtractionResult::Extracted(contents) => contents
                     .into_iter()
                     .filter(|content| content.target_command.as_deref() == Some("ssh"))
                     .map(|content| content.content)
                     .collect(),
-                _ => Vec::new(),
+                ExtractionResult::NoContent | ExtractionResult::Skipped(_) => Vec::new(),
+                incomplete @ (ExtractionResult::Partial { .. } | ExtractionResult::Failed(_)) => {
+                    panic!("extraction did not complete for {command:?}: {incomplete:?}")
+                }
             }
         }
 
@@ -4867,13 +7926,17 @@ mod tests {
         }
 
         #[test]
-        fn multi_word_payload_keeps_raw_per_word_quoting() {
-            // The remote shell re-parses the concatenated words, so per-word
-            // quotes must survive: `'&&'` here is remote DATA locally quoted.
+        fn multi_word_payload_keeps_raw_span_and_adds_the_joined_line() {
+            // The local shell removes each word's quotes and ssh joins the
+            // argv with spaces, so the remote shell runs `cd /app && ls`:
+            // the locally quoted `'&&'` is an operator there. The raw span
+            // stays (it carries the content range); the joined line is what
+            // runs (review of 7273b28: `ssh host 'git reset' --hard`).
             assert_eq!(
                 ssh_payloads("ssh host cd /app '&&' ls"),
-                ["cd /app '&&' ls"]
+                ["cd /app '&&' ls", "cd /app && ls"]
             );
+            assert_eq!(ssh_payloads("ssh host cd /app"), ["cd /app"]);
         }
 
         #[test]
@@ -5541,12 +8604,368 @@ mod tests {
         }
 
         #[test]
+        fn perl_data_heredoc_keeps_its_complete_program_owner() {
+            let command =
+                "perl <<'PERL'\nprint <<'DATA';\nopen(FH, '>', '/etc/shadow');\nDATA\nPERL";
+            let limits = ExtractionLimits {
+                max_heredocs: 1,
+                ..ExtractionLimits::default()
+            };
+            let ExtractionResult::Extracted(contents) = extract_content(command, &limits) else {
+                panic!("a nested Perl string is neither a program nor a quota overflow");
+            };
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0].delimiter.as_deref(), Some("PERL"));
+            assert_eq!(contents[0].language, ScriptLanguage::Perl);
+            assert_eq!(
+                contents[0].content,
+                "print <<'DATA';\nopen(FH, '>', '/etc/shadow');\nDATA"
+            );
+        }
+
+        #[test]
+        fn nested_data_suppression_keeps_later_executable_heredocs() {
+            let command = "perl <<'PERL'\nprint <<'DATA';\nopen(FH, '>', '/tmp/out');\nDATA\nPERL\nperl <<'NEXT'\nopen(FH, '>', '/etc/shadow');\nNEXT";
+            let ExtractionResult::Extracted(contents) =
+                extract_content(command, &ExtractionLimits::default())
+            else {
+                panic!("both actual Perl programs must be extracted");
+            };
+            assert_eq!(contents.len(), 2);
+            assert_eq!(contents[0].delimiter.as_deref(), Some("PERL"));
+            assert_eq!(contents[1].delimiter.as_deref(), Some("NEXT"));
+            assert!(contents[1].content.contains("/etc/shadow"));
+        }
+
+        #[test]
+        fn nested_heredoc_filter_requires_nonexpanding_unrebound_source() {
+            for command in [
+                "bash <<'OUTER'\ncat <<'DATA'\nhello\nDATA\nOUTER",
+                "perl <<OUTER\nprint <<'DATA';\nhello\nDATA\nOUTER",
+                "perl() { bash; }; perl <<'OUTER'\ncat <<'DATA'\nhello\nDATA\nOUTER",
+                "echo \"perl <<'OUTER'\"\ncat <<'DATA'\nhello\nDATA\nOUTER",
+            ] {
+                let ExtractionResult::Extracted(contents) =
+                    extract_content(command, &ExtractionLimits::default())
+                else {
+                    panic!("uncertain input must retain the conservative scan: {command}");
+                };
+                assert!(
+                    contents
+                        .iter()
+                        .any(|source| source.delimiter.as_deref() == Some("DATA")),
+                    "{command}"
+                );
+            }
+        }
+
+        #[test]
         fn extraction_limits_default() {
             let limits = ExtractionLimits::default();
             assert_eq!(limits.max_body_bytes, 1024 * 1024);
             assert_eq!(limits.max_body_lines, 10_000);
             assert_eq!(limits.max_heredocs, 10);
             assert_eq!(limits.timeout_ms, 50);
+        }
+
+        /// #443: the structural helpers keep every size cap and only relax time.
+        ///
+        /// The size caps are what bound the work, so they must not drift from the
+        /// defaults. The wall clock is the one bound that made a property of the
+        /// *command* depend on how loaded the machine was, which is why it alone
+        /// is larger here — and it stays finite so a pathological input still
+        /// terminates.
+        #[test]
+        fn structural_scan_limits_relax_only_the_wall_clock_443() {
+            let structural = ExtractionLimits::structural_scan();
+            let default = ExtractionLimits::default();
+
+            assert_eq!(structural.max_body_bytes, default.max_body_bytes);
+            assert_eq!(structural.max_body_lines, default.max_body_lines);
+            assert_eq!(structural.max_heredocs, default.max_heredocs);
+
+            assert!(
+                structural.timeout_ms > default.timeout_ms,
+                "a structural question must not be decided by a budget the host can exhaust"
+            );
+            assert!(
+                structural.timeout_ms > 0,
+                "the budget stays finite so a pathological input terminates"
+            );
+        }
+
+        /// Every *classification* helper has to use the structural budget.
+        ///
+        /// The six sites of #443 turn a non-`Extracted` result straight into
+        /// an answer — `Unverified`, `None`, `false`, "no content" — so with
+        /// the 50 ms hot-path budget the verdict followed the machine's load
+        /// rather than the command. The two here were fixed first; the four in
+        /// the evaluator ask the same kind of question (is this a literal
+        /// heredoc producer, is this offset inside a quoted body, does this
+        /// range intersect interpreter input) and were audited afterwards.
+        ///
+        /// The part of a source file compiled outside `cfg(test)`: everything
+        /// before the first `#[cfg(test)]` that gates an INLINE module
+        /// (`mod x {`), with any attributes between. That relies on no
+        /// production item following an inline test module, which holds for
+        /// every file under `src/` (what follows one is further test modules
+        /// or top-level `#[test]` fns, as in `normalize.rs`).
+        ///
+        /// Two kinds of `#[cfg(test)]` are deliberately NOT split points, and
+        /// getting either wrong makes the guard silently weaker, not stricter:
+        ///
+        /// - On a non-module item. Production code follows several of those —
+        ///   `ast_matcher.rs`'s `FLOOR_MS`, test-only helpers in `evaluator.rs`,
+        ///   a `thread_local!` in `allowlist.rs`.
+        /// - On an EXTERNAL module (`mod x;`). Its test code lives in the other
+        ///   file (see `test_only_files`); this file carries on as production.
+        ///   `packs/mod.rs` declares one at line 50 of ~7,000, so treating it as
+        ///   a split point would have dropped the whole pack registry from the
+        ///   scan while every assertion here still passed.
+        ///
+        /// It generalizes the old `"\nmod tests {"` split, which missed inline
+        /// test modules with other names (`windows_exe_tests`, `test_env`).
+        fn production_part(source: &str) -> &str {
+            let mut offset = 0;
+            let mut lines = source.split_inclusive('\n');
+            while let Some(line) = lines.next() {
+                if line.trim() == "#[cfg(test)]" {
+                    let gated = lines
+                        .clone()
+                        .map(str::trim)
+                        .find(|next| !next.is_empty() && !next.starts_with("#["));
+                    let is_inline_module = gated.is_some_and(|item| {
+                        let item = item
+                            .strip_prefix("pub(crate) ")
+                            .or_else(|| item.strip_prefix("pub "))
+                            .unwrap_or(item);
+                        item.starts_with("mod ") && !item.ends_with(';')
+                    });
+                    if is_inline_module {
+                        return &source[..offset];
+                    }
+                }
+                offset += line.len();
+            }
+            source
+        }
+
+        /// Files that exist only as `#[cfg(test)] mod name;` of some parent.
+        ///
+        /// Such a file is test code from its first line, so `production_part`
+        /// cannot see that — it has no gate of its own. Resolved with the
+        /// standard rules: a module declared in `lib.rs`/`main.rs`/`mod.rs`
+        /// lives beside it, one declared in `foo.rs` lives under `foo/`, and a
+        /// `#[path = "x.rs"]` (the layout `packs/test_template.rs` recommends
+        /// for pack tests) is relative to the declaring file's directory.
+        fn test_only_files(
+            files: &[std::path::PathBuf],
+        ) -> std::collections::BTreeSet<std::path::PathBuf> {
+            let mut test_only = std::collections::BTreeSet::new();
+            for file in files {
+                let Ok(source) = std::fs::read_to_string(file) else {
+                    continue;
+                };
+                let Some(dir) = file.parent() else { continue };
+                let stem = file.file_stem().and_then(|stem| stem.to_str());
+                let child_dir = if matches!(stem, Some("lib" | "main" | "mod")) {
+                    dir.to_path_buf()
+                } else {
+                    dir.join(stem.unwrap_or_default())
+                };
+                let mut lines = source.lines().map(str::trim);
+                while let Some(line) = lines.next() {
+                    if line != "#[cfg(test)]" {
+                        continue;
+                    }
+                    let mut path_attribute = None;
+                    let Some(item) = lines.clone().find(|next| {
+                        if let Some(path) = next
+                            .strip_prefix("#[path = \"")
+                            .and_then(|rest| rest.strip_suffix("\"]"))
+                        {
+                            path_attribute = Some(path);
+                        }
+                        !next.is_empty() && !next.starts_with("#[")
+                    }) else {
+                        continue;
+                    };
+                    let item = item
+                        .strip_prefix("pub(crate) ")
+                        .or_else(|| item.strip_prefix("pub "))
+                        .unwrap_or(item);
+                    let Some(name) = item
+                        .strip_prefix("mod ")
+                        .and_then(|rest| rest.strip_suffix(';'))
+                    else {
+                        continue;
+                    };
+                    if let Some(path) = path_attribute {
+                        test_only.insert(dir.join(path));
+                        continue;
+                    }
+                    test_only.insert(child_dir.join(format!("{name}.rs")));
+                    test_only.insert(child_dir.join(name).join("mod.rs"));
+                }
+            }
+            test_only
+        }
+
+        #[test]
+        fn production_part_splits_only_at_a_gated_module() {
+            let source = "fn a() {}\n#[cfg(test)]\nconst FLOOR: u64 = 1;\nfn b() {}\n\
+                          #[cfg(test)]\n#[allow(dead_code)]\nmod windows_exe_tests {\n}\n";
+            let production = production_part(source);
+            assert!(
+                production.contains("fn b()"),
+                "a gated const is not a module; code after it is still production"
+            );
+            assert!(
+                !production.contains("windows_exe_tests"),
+                "a gated module ends production whatever it is named"
+            );
+            assert_eq!(
+                production_part("fn only() {}\n"),
+                "fn only() {}\n",
+                "a file with no gated module is all production"
+            );
+            assert!(
+                production_part("fn a() {}\n#[cfg(test)]\npub(crate) mod test_env {\n}\n")
+                    .ends_with("fn a() {}\n"),
+                "visibility on the gated module does not hide it"
+            );
+            // The regression this guards: an EXTERNAL gated module must not end
+            // production. `packs/mod.rs` has one at line 50 of ~7,000.
+            let registry = "#[cfg(test)]\nmod test_template;\nstatic REGISTRY: u8 = 0;\n";
+            assert_eq!(
+                production_part(registry),
+                registry,
+                "`mod x;` puts its tests in another file; code after it is production"
+            );
+        }
+
+        #[test]
+        fn test_only_files_resolve_external_gated_modules() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let src = root.path();
+            std::fs::create_dir_all(src.join("pack")).unwrap();
+            std::fs::write(
+                src.join("lib.rs"),
+                "#[cfg(test)]\nmod beside;\nmod shipped;\n",
+            )
+            .unwrap();
+            std::fs::write(src.join("pack.rs"), "#[cfg(test)]\nmod tests;\n").unwrap();
+            std::fs::write(
+                src.join("my_pack.rs"),
+                "#[cfg(test)]\n#[path = \"my_pack_tests.rs\"]\nmod tests;\n",
+            )
+            .unwrap();
+            let files = vec![
+                src.join("lib.rs"),
+                src.join("pack.rs"),
+                src.join("my_pack.rs"),
+            ];
+            let test_only = test_only_files(&files);
+            assert!(test_only.contains(&src.join("beside.rs")), "{test_only:?}");
+            assert!(
+                test_only.contains(&src.join("pack").join("tests.rs")),
+                "a module of `pack.rs` lives under `pack/`: {test_only:?}"
+            );
+            assert!(
+                test_only.contains(&src.join("my_pack_tests.rs")),
+                "`#[path]` is relative to the declaring file's directory: {test_only:?}"
+            );
+            assert!(
+                !test_only.contains(&src.join("my_pack").join("tests.rs")),
+                "`#[path]` replaces the default location: {test_only:?}"
+            );
+            assert!(
+                !test_only.contains(&src.join("shipped.rs")),
+                "an ungated module is production"
+            );
+        }
+
+        /// A source check rather than a timing one on purpose: reproducing the
+        /// expiry needs a loaded host, which is the nondeterminism being
+        /// removed. `src/perf.rs` guards its own invariants the same way.
+        ///
+        /// It walks every file under `src/`, not a named list. It used to read
+        /// just `heredoc.rs` and `evaluator.rs`, and #461's
+        /// `credential_files/embedded.rs` — a new file — repeated this exact
+        /// anti-pattern in a classifier the guard could not see: extraction on
+        /// the 50 ms budget, anything but a completed result mapped to "no
+        /// protected write". A named list only protects the files someone
+        /// remembered, so a new file is now covered by default and escapes only
+        /// through `HOT_PATH_BUDGET_OWNERS` below.
+        #[test]
+        fn classification_helpers_use_the_structural_budget_443() {
+            /// Files whose job is to materialize the configurable HOT-PATH
+            /// extraction budget, which #443 deliberately leaves at 50 ms: that
+            /// knob governs extraction work, and a timeout there is handled by
+            /// the evaluator's bounded fallback rather than read as an answer.
+            /// Add a file here only if it builds that budget — never to let a
+            /// classifier keep the default.
+            const HOT_PATH_BUDGET_OWNERS: &[&str] = &["src/config.rs"];
+
+            fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                for entry in std::fs::read_dir(dir).expect("read a source directory") {
+                    let path = entry.expect("read a source directory entry").path();
+                    if path.is_dir() {
+                        rust_sources(&path, out);
+                    } else if path.extension().is_some_and(|ext| ext == "rs") {
+                        out.push(path);
+                    }
+                }
+            }
+
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let mut files = Vec::new();
+            rust_sources(&root.join("src"), &mut files);
+            files.sort();
+            // Vacuity guard: an empty or near-empty walk would pass trivially.
+            assert!(
+                files.iter().any(|path| path.ends_with("heredoc.rs"))
+                    && files.iter().any(|path| path.ends_with("evaluator.rs"))
+                    && files.iter().any(|path| path.ends_with("embedded.rs")),
+                "the source walk must reach the files this guard exists for: {files:?}"
+            );
+
+            let test_only = test_only_files(&files);
+            assert!(
+                test_only.contains(&root.join("src/scanner_regression_tests.rs")),
+                "external test-module resolution must find the known case: {test_only:?}"
+            );
+
+            for path in files {
+                let file = path
+                    .strip_prefix(root)
+                    .expect("walked path is under the manifest dir")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if HOT_PATH_BUDGET_OWNERS.contains(&file.as_str()) || test_only.contains(&path) {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read a source file");
+                let production = production_part(&source);
+                // Doc comments may name the default profile in an example; a
+                // call site is what matters.
+                let offenders: Vec<_> = production
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        let code = line.trim_start();
+                        !code.starts_with("//") && code.contains("ExtractionLimits::default()")
+                    })
+                    .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
+                    .collect();
+                assert!(
+                    offenders.is_empty(),
+                    "{file}: a classification helper outside tests still takes the 50 ms \
+                     hot-path budget, so its answer depends on how busy the machine is \
+                     (#443):\n  {}",
+                    offenders.join("\n  ")
+                );
+            }
         }
 
         #[test]
@@ -6104,7 +9523,7 @@ mod tests {
                 assert_eq!(contents[0].content, "hello world");
                 assert_eq!(contents[0].heredoc_type, Some(HeredocType::HereString));
             } else {
-                panic!("Expected Extracted result");
+                panic!("Expected Extracted result, got {result:?}");
             }
         }
 
@@ -6975,10 +10394,62 @@ mod tests {
                 ..Default::default()
             };
             let result = extract_content(cmd, &limits);
-            if let ExtractionResult::Extracted(contents) = result {
-                assert!(contents.len() <= limits.max_heredocs);
+            // The budget is never reached here: the delimiter lines carry
+            // trailing text (`A && cmd2 << B`), so only the last heredoc is
+            // terminated and one payload comes out. The other two are reported
+            // as unterminated, which is a shape observation rather than an
+            // early stop, so the reading is still complete — see
+            // `SkipReason::stopped_early` and, for the budget itself,
+            // `a_filled_heredoc_budget_is_reported_as_partial` (#427).
+            match result {
+                ExtractionResult::Extracted(contents) => {
+                    assert!(contents.len() <= limits.max_heredocs);
+                }
+                other => panic!("Expected Extracted result, got {other:?}"),
             }
-            // Otherwise, skip result is also acceptable
+        }
+
+        /// The budget itself, with terminators the extractor can actually find
+        /// (#427). Three complete heredocs against a budget of two: two are
+        /// read, the third is dropped, and the drop is reported.
+        #[test]
+        fn a_filled_heredoc_budget_is_reported_as_partial() {
+            let cmd = "cmd1 << A\na\nA\ncmd2 << B\nb\nB\ncmd3 << C\nc\nC";
+            let limits = ExtractionLimits {
+                max_heredocs: 2,
+                ..Default::default()
+            };
+            match extract_content(cmd, &limits) {
+                ExtractionResult::Partial { extracted, skipped } => {
+                    assert_eq!(extracted.len(), 2, "the budget should be filled");
+                    assert!(
+                        skipped
+                            .iter()
+                            .any(|r| matches!(r, SkipReason::ExceededHeredocLimit { .. })),
+                        "should report ExceededHeredocLimit, got {skipped:?}"
+                    );
+                }
+                other => panic!("Expected Partial(limit) result, got {other:?}"),
+            }
+        }
+
+        /// A here-string is not an unterminated heredoc (#427). The heredoc
+        /// regex anchors on `<<`, which also matches the tail of `<<<`; the
+        /// phantom reason it produced was harmless only while partial
+        /// extractions were reported as complete.
+        #[test]
+        fn a_here_string_produces_no_phantom_heredoc_reason() {
+            for cmd in [
+                "cat <<< 'hello world'",
+                "cat <<< \"hello world\"",
+                "cat <<< plain",
+                "grep foo <<< \"$payload\"",
+            ] {
+                match extract_content(cmd, &ExtractionLimits::default()) {
+                    ExtractionResult::Extracted(_) | ExtractionResult::NoContent => {}
+                    other => panic!("{cmd:?} must extract completely, got {other:?}"),
+                }
+            }
         }
 
         #[test]
@@ -7415,6 +10886,76 @@ fi"#;
             extract_heredoc_target_command(sudo_cmd, sudo_start).as_deref(),
             Some("bash")
         );
+    }
+
+    /// #439: a `$VAR` on the heredoc's line must not hide its target command.
+    ///
+    /// `tokenize_backwards` treated a bare `$` as a command boundary, so the walk
+    /// stopped before the program word and no target was resolved at all. The
+    /// quoted (inert) body then could not be masked, and a line-leading backtick
+    /// in it tripped `heredoc.shell:launcher-unverified`. A `$` introduces an
+    /// expansion inside a word, not a new command.
+    #[test]
+    fn extract_heredoc_target_command_resolves_across_dollar_expansions_439() {
+        for (command, expected) in [
+            // The reported shape: the redirect target is variable-expanded.
+            ("S=/tmp && cat > $S/d.md <<'EOF'\nbody\nEOF", Some("cat")),
+            // Braced, and quoted — the quoted spelling already worked, which is
+            // what pinned the cause.
+            ("S=/tmp && cat > ${S}/d.md <<'EOF'\nbody\nEOF", Some("cat")),
+            (
+                "S=/tmp && cat > \"$S/d.md\" <<'EOF'\nbody\nEOF",
+                Some("cat"),
+            ),
+            // A dynamic operand rather than a dynamic redirect target.
+            ("S=/tmp && cat $S/in.md <<'EOF'\nbody\nEOF", Some("cat")),
+            (
+                "D=/r && git -C $D commit -F - <<'EOF'\nbody\nEOF",
+                Some("git"),
+            ),
+            // An executing interpreter must still resolve to itself, never to a
+            // data sink, so its body is never masked.
+            ("S=/tmp && bash $S/x <<'EOF'\nbody\nEOF", Some("bash")),
+            ("S=/bin && $S/bash <<'EOF'\nbody\nEOF", Some("bash")),
+            // A program that is itself an unresolved expansion stays unproven:
+            // the token is returned as-is and matches no data sink.
+            ("S=cat && $S <<'EOF'\nbody\nEOF", Some("$S")),
+            // A command substitution is still a boundary, so nothing is resolved.
+            ("cat $(date) <<'EOF'\nbody\nEOF", None),
+        ] {
+            let start = command.find("<<").expect("heredoc operator");
+            assert_eq!(
+                extract_heredoc_target_command(command, start).as_deref(),
+                expected,
+                "target resolution for {command:?}"
+            );
+        }
+    }
+
+    /// The boundary set `tokenize_backwards` actually stops at (#439).
+    #[test]
+    fn tokenize_backwards_stops_at_command_boundaries_but_not_dollar_439() {
+        // A bare `$` keeps the word in the same simple command.
+        assert_eq!(
+            tokenize_backwards("cat > $S/d.md"),
+            vec!["$S/d.md".to_string(), ">".to_string(), "cat".to_string()]
+        );
+        // Every real separator still ends the walk, so tokens from another
+        // command can never be read as this one's.
+        for (source, expected_last) in [
+            ("echo hi | cat", "cat"),
+            ("echo hi; cat", "cat"),
+            ("echo hi && cat", "cat"),
+            ("(echo hi) cat", "cat"),
+            ("x=$(echo hi) cat", "cat"),
+        ] {
+            let tokens = tokenize_backwards(source);
+            assert_eq!(
+                tokens,
+                vec![expected_last.to_string()],
+                "walk should stop at the separator in {source:?}"
+            );
+        }
     }
 
     /// #136 REVERTED: interpreter-stdin heredoc bodies are no longer masked, so
@@ -8290,6 +11831,186 @@ EOF";
                     "{name} must not be classified as a proven non-shell interpreter"
                 );
             }
+        }
+    }
+
+    /// Fifth review: stages of the longest pipeline, the bound that keeps a
+    /// many-thousand-stage pipeline away from the bash parser.
+    #[test]
+    fn longest_pipeline_stages_counts_one_pipeline_at_a_time() {
+        for (command, stages) in [
+            ("ls", 1),
+            ("a | b", 2),
+            ("a | b | c; d | e", 3),
+            ("a | b && c | d | e | f", 4),
+            ("a |& b |& c", 3),
+            ("a || b || c", 1),
+            ("a & b | c", 2),
+            ("echo 'a|b|c|d' | wc", 2),
+            ("a | b\nc | d", 2),
+        ] {
+            assert_eq!(longest_pipeline_stages(command), stages, "{command:?}");
+        }
+        assert_eq!(
+            longest_pipeline_stages(&format!("x{}", " | cat".repeat(5000))),
+            5001
+        );
+    }
+
+    /// Sixth review: a redirect before or after an interpreter's inline flag,
+    /// and a shell's options between `-c` and its command string, hid the
+    /// payload from tier 1 and tier 2. Each payload is read exactly once.
+    #[test]
+    fn inline_flag_behind_redirects_and_shell_options_extracts_the_payload() {
+        for (command, payload) in [
+            ("sh 2>/dev/null -c 'git reset --hard'", "git reset --hard"),
+            ("sh 2>&1 -c 'x'", "x"),
+            ("sh 2> /dev/null -c 'x'", "x"),
+            ("sh 2>& 1 -c 'x'", "x"),
+            ("bash &>/dev/null -c 'x'", "x"),
+            ("bash &>>log -c 'x'", "x"),
+            ("zsh >|/tmp/o -c 'x'", "x"),
+            ("dash {fd}>/dev/null -c 'x'", "x"),
+            ("sh <>/tmp/o -c 'x'", "x"),
+            ("sh 3<&0- -c 'x'", "x"),
+            ("sh 2>\"/tmp/a b\" -c 'x'", "x"),
+            ("sh -e 2>/dev/null -c \"x\"", "x"),
+            ("sh -c 2>/dev/null 'x'", "x"),
+            ("sh -c -- 'x'", "x"),
+            ("sh -c - \"x\"", "x"),
+            ("bash -c -e 'x'", "x"),
+            ("bash -c -o errexit 'x'", "x"),
+            ("bash -c +e -- 'x'", "x"),
+            ("bash -c 2>&1 -x 2>/dev/null 'x'", "x"),
+            ("bash +e -c 'x'", "x"),
+            ("sh -c -- $CMD", "$CMD"),
+            ("sh 2>/dev/null -c $CMD", "$CMD"),
+            ("python3 2>/dev/null -c 'x'", "x"),
+            ("python3 -c 2>/dev/null 'x'", "x"),
+            ("sh>/dev/null -c 'x'", "x"),
+            ("sh -c 'x'>/dev/null", "x"),
+            ("sh -c 2>/dev/null 'echo a >/tmp/b'", "echo a >/tmp/b"),
+            // Seventh review: a here-string, and a redirect target holding
+            // a command substitution, backquotes or a `${…}` with blanks.
+            ("sh <<<y -c 'x'", "x"),
+            ("bash <<<'a b' -c 'x'", "x"),
+            ("sh 2>$(mktemp -u) -c 'x'", "x"),
+            ("sh 2>`mktemp -u` -c 'x'", "x"),
+            ("sh 2>${d:-a b}/f -c 'x'", "x"),
+        ] {
+            assert!(
+                matches!(check_triggers(command), TriggerResult::Triggered),
+                "{command:?} must trigger"
+            );
+            let contents = match extract_content(command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{command:?}: {other:?}"),
+            };
+            let reads = contents.iter().filter(|c| c.content == payload).count();
+            assert_eq!(reads, 1, "{command:?}: {contents:?}");
+        }
+        // A redirect's target is not a flag: `sh 2> -c 'x'` writes to a file
+        // named `-c` and runs the script file `x`. A quoted word after the
+        // command string is an argument (`$0`), not a second command string.
+        for (command, not_payload) in [("sh 2> -c 'x'", "x"), ("sh -c 'x' 2>/dev/null -e 'y'", "y")]
+        {
+            let contents = match extract_content(command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(contents) => contents,
+                ExtractionResult::NoContent => Vec::new(),
+                other => panic!("{command:?}: {other:?}"),
+            };
+            assert!(
+                !contents.iter().any(|c| c.content == not_payload),
+                "{command:?}: {contents:?}"
+            );
+        }
+    }
+
+    /// Sixth review: the redirect view blanks exactly the local redirects,
+    /// never text inside quotes, a heredoc or a process substitution.
+    #[test]
+    fn blank_local_redirects_blanks_only_redirect_words() {
+        for (command, expected) in [
+            ("sh 2>/dev/null -c 'x'", Some("sh             -c 'x'")),
+            ("sh 2> /dev/null -c 'x'", Some("sh              -c 'x'")),
+            ("a 2>&1 >&- 3<&0- b", Some("a                b")),
+            ("a &>l &>>l >|l <>l b", Some("a                  b")),
+            ("a {fd}>l {9x}>l b", Some("a        {9x}   b")),
+            ("a>l b", Some("a   b")),
+            ("a 2>\"x y\" b", Some("a         b")),
+            ("echo 'x > y' \"a <b\"", None),
+            ("cat <<EOF", None),
+            // Seventh review: a here-string is a redirect, and a target's
+            // `$(…)`, backquotes and `${…}` belong to it, blanks and all.
+            ("cat 2<<-EOF <<<x", Some("cat 2<<-EOF     ")),
+            ("a <<<'x y' b", Some("a          b")),
+            ("a 2>$(mktemp -u) b", Some("a                b")),
+            ("a 2>`mktemp -u` b", Some("a               b")),
+            ("a 2>${d:-x y}/f b", Some("a               b")),
+            ("cat <<<", None),
+            ("cat <(ls) >(wc)", None),
+            ("a 2>", None),
+            ("ls", None),
+        ] {
+            assert_eq!(
+                blank_local_redirects(command).as_deref(),
+                expected,
+                "{command:?}"
+            );
+        }
+    }
+
+    /// Sixth review: bash expands a process substitution anywhere in an
+    /// unquoted word (`--x=<(…)`), not only at its start.
+    #[test]
+    fn process_substitution_bodies_are_found_anywhere_in_a_word() {
+        for (word, expected) in [
+            ("<(a)", vec!["a"]),
+            ("--x=<(a b)", vec!["a b"]),
+            ("a<(b)>(c)", vec!["b", "c"]),
+            ("<(a <(b))", vec!["a <(b)"]),
+            ("$'\\''<(a)", vec!["a"]),
+            ("'<(a)'", vec![]),
+            ("\"<(a)\"", vec![]),
+            ("\\<(a)", vec![]),
+            ("$(<(a))", vec![]),
+            ("$'\\'<(a)'", vec![]),
+            ("<()", vec![]),
+            ("<(a", vec![]),
+        ] {
+            let bodies: Vec<&str> = process_substitution_bodies(word)
+                .into_iter()
+                .map(|body| &word[body])
+                .collect();
+            assert_eq!(bodies, expected, "{word:?}");
+        }
+    }
+
+    /// Seventh review: the Windows wrappers (`cmd /c`, `-EncodedCommand`,
+    /// `iex`, `Start-Process`) did not read the redirect view, so a redirect
+    /// between the program and its flag hid the payload
+    /// (`pwsh 2>$null -EncodedCommand …`, `cmd 2>nul /c …`). Each payload is
+    /// read once, from the command's own text.
+    #[test]
+    fn windows_wrappers_behind_redirects_extract_the_payload_once() {
+        // "git reset --hard" as base64 UTF-16LE.
+        let encoded = "ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA=";
+        let reset = "git reset --hard";
+        for (command, payload) in [
+            (format!("pwsh 2>$null -EncodedCommand {encoded}"), reset),
+            (format!("powershell 2>&1 -enc {encoded}"), reset),
+            (format!("pwsh -EncodedCommand {encoded} 2>$null"), reset),
+            (format!("cmd 2>nul /c \"{reset}\""), reset),
+            (format!("cmd >nul /c {reset}"), reset),
+            (format!("iex 2>$null '{reset}'"), reset),
+            ("cmd /c dir 2>nul".to_string(), "dir 2>nul"),
+        ] {
+            let contents = match extract_content(&command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{command:?}: {other:?}"),
+            };
+            let reads = contents.iter().filter(|c| c.content == payload).count();
+            assert_eq!(reads, 1, "{command:?}: {contents:?}");
         }
     }
 }

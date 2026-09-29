@@ -298,6 +298,30 @@ impl std::fmt::Debug for SafePattern {
 }
 
 /// A destructive pattern that, when matched, blocks the command.
+///
+/// # A correct regex is not a live rule
+///
+/// Three independent layers stand between this pattern and a production denial,
+/// and a rule can clear the first two and still never fire. Every escape in
+/// `GATE_MUST_REACH_RULE` looked like a working rule with a green pack-level
+/// test, because `Pack::check` is not what production calls.
+///
+/// 1. **`pack_aware_quick_reject`** — word-boundary aware, and it runs first.
+///    A command carrying none of the pack's `PACK_ENTRIES` keywords *as whole
+///    tokens* is allowed before any pack is consulted. Note that this matcher
+///    and `candidate_pack_mask` (layer 2) disagree: the mask is substring-based,
+///    so a row can look sufficient there and still be dead here. `mount` on the
+///    row does not reach the token `umount` (#323/#441).
+/// 2. **`candidate_pack_mask`** — decides pack candidacy from the same row.
+/// 3. **The evaluator's pattern pass** — applies phase filters that
+///    `Pack::check` does not, and treats a non-rm command's ordinary argv as
+///    data. A rule whose match lies wholly inside argv does not fire here, and
+///    belongs in a semantic classifier instead (#460, `tee-git-internals`).
+///
+/// So a new rule needs a row keyword this command carries as a token, and an
+/// end-to-end assertion. Add it to `GATE_MUST_REACH_RULE`, which proves all
+/// three layers against the same command; a pack-level test alone will pass
+/// whether or not the rule can ever run.
 pub struct DestructivePattern {
     /// Lazily-compiled regex pattern.
     pub regex: LazyCompiledRegex,
@@ -636,12 +660,52 @@ impl Pack {
             .any(|kw| keyword_matches_substring(cmd, kw))
     }
 
+    /// Some read-only database exemptions intentionally match anywhere in a
+    /// command string. For these packs, a safe read may coexist with a
+    /// destructive operation, so safe matching must never shadow a destructive
+    /// rule from the same pack. Keep this structural veto in addition to the
+    /// authored negative lookaheads: the regex lists are documentation and
+    /// fast rejection, while this guard makes future destructive-rule additions
+    /// fail conservative instead of silently creating an exemption (#435).
+    fn destructive_match_vetoes_safe(&self, cmd: &str) -> bool {
+        matches!(self.id.as_str(), "database.mongodb" | "database.redis")
+            && self
+                .destructive_patterns
+                .iter()
+                .any(|pattern| pattern.matches_command(cmd))
+    }
+
+    fn destructive_match_vetoes_safe_with_deadline(
+        &self,
+        cmd: &str,
+        deadline: Option<&crate::perf::Deadline>,
+    ) -> bool {
+        if !matches!(self.id.as_str(), "database.mongodb" | "database.redis") {
+            return false;
+        }
+        for pattern in &self.destructive_patterns {
+            if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
+                // Withhold the exemption on uncertainty. The evaluator's
+                // surrounding deadline checks convert an exhausted budget into
+                // an indeterminate result rather than treating time as safety.
+                return true;
+            }
+            if pattern.matches_command(cmd) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if a command matches any safe pattern.
     ///
     /// Uses `RegexSet` for O(n) matching when available (fast path).
     /// Falls back to individual pattern checks for backtracking patterns.
     #[must_use]
     pub fn matches_safe(&self, cmd: &str) -> bool {
+        if self.destructive_match_vetoes_safe(cmd) {
+            return false;
+        }
         if self.id == "kubernetes.kubectl"
             && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
         {
@@ -684,8 +748,8 @@ impl Pack {
     /// Deadline-aware safe pattern matching.
     ///
     /// Like [`matches_safe`], but polls the deadline between individual
-    /// backtracking-engine pattern evaluations. Returns `None` (no match) if
-    /// the deadline expires mid-scan, letting the caller return its bounded
+    /// backtracking-engine pattern evaluations. Returns no safe match if the
+    /// deadline expires mid-scan, letting the caller return its bounded
     /// outcome (hook evaluation treats this as indeterminate).
     #[must_use]
     pub fn matches_safe_with_deadline(
@@ -694,6 +758,9 @@ impl Pack {
         deadline: Option<&crate::perf::Deadline>,
     ) -> bool {
         if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
+            return false;
+        }
+        if self.destructive_match_vetoes_safe_with_deadline(cmd, deadline) {
             return false;
         }
         if self.id == "kubernetes.kubectl"
@@ -1449,6 +1516,21 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "/shred",
             "tar",
             "/tar",
+            // Archive extraction destinations (`tar -x -C <dir>`,
+            // `unzip -d <dir>`, `7z x -o<dir>`). `tar` is already above for the
+            // source-deleting rule, but these three carry no other rule at all,
+            // so this row is what decides whether the extraction classifier is
+            // ever a candidate — the same gate `chgrp` and `.git/` needed.
+            "bsdtar",
+            "/bsdtar",
+            "unzip",
+            "/unzip",
+            "7z",
+            "/7z",
+            "7za",
+            "/7za",
+            "7zr",
+            "/7zr",
             "dd",
             "/dd",
             "mv",
@@ -1470,6 +1552,71 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "/sed",
             "perl",
             "/perl",
+            // Windows disk-destruction verbs (cross-platform baseline, #451):
+            // `format-volume` / `clear-disk` / `vssadmin-delete-shadows` /
+            // `wmic-shadowcopy-delete` in `core::filesystem`. This quick-reject
+            // is case-sensitive, so every case the pack's keyword list carries
+            // is repeated here, exactly as the `windows.system` row does.
+            "Format-Volume",
+            "format-volume",
+            "FORMAT-VOLUME",
+            "Clear-Disk",
+            "clear-disk",
+            "CLEAR-DISK",
+            "vssadmin",
+            "VSSADMIN",
+            "wmic",
+            "WMIC",
+            // `wmi-shadowcopy-delete`: the WMI class every spelling names.
+            "Win32_ShadowCopy",
+            "win32_shadowcopy",
+            "WIN32_SHADOWCOPY",
+            // `redirect-truncate-git-internals-relative` needs this: a relative
+            // target carries none of the redirect keywords below, which all
+            // require the path to begin with `/`, `~`, `$` or a quote. Without
+            // it the quick-reject drops `cat > .git/config` before the pack is
+            // even a candidate, and the rule that exists for exactly that
+            // command never runs (#407). The pack's own keyword list had it;
+            // this row is the gate that actually decides, and it did not.
+            ".git/",
+            // Credential-directory anchors, for the relative half of
+            // `credential-file-write` (#407). `.ssh/authorized_keys` names an
+            // SSH key store wherever the shell stands, and a bare redirect to
+            // it carries none of the keywords below. The non-redirect writers
+            // the classifier understands (`tee`, `cp`, `dd`, `sed`, …) are
+            // already in this row under their own names.
+            ".ssh/",
+            ".gnupg/",
+            ".aws/",
+            ".kube/",
+            ".docker/",
+            ".bashrc.d/",
+            ".zshrc.d/",
+            // The same anchors spelled the Windows way, for the same reason.
+            // `echo x > .ssh\authorized_keys` from a cmd or PowerShell payload
+            // carries none of the forward-slash entries above, so this gate
+            // dropped it before core.filesystem was a candidate and the
+            // relative half of `credential-file-write` never ran. Resolution
+            // already handles `\`: the identical target denies as soon as a
+            // writer word is present.
+            ".git\\",
+            ".ssh\\",
+            ".gnupg\\",
+            ".aws\\",
+            ".kube\\",
+            ".docker\\",
+            ".bashrc.d\\",
+            ".zshrc.d\\",
+            // Login-shell startup files: writing one is code execution on the
+            // next shell, and a bare redirect to it carries no other keyword.
+            ".bashrc",
+            ".bash_profile",
+            ".bash_login",
+            ".profile",
+            ".zshrc",
+            ".zshenv",
+            ".zprofile",
+            ".zlogin",
             ">/",
             "> /",
             ">~",
@@ -1480,6 +1627,17 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "> \"",
             ">'",
             "> '",
+            // `> \/etc/passwd`: an escaped first character of the target.
+            ">\\",
+            "> \\",
+            // `> ../../etc/sudoers`, `> `printf /`etc/sudoers`: a relative
+            // climb or a backquote substitution as the target.
+            ">..",
+            "> ..",
+            ">./..",
+            "> ./..",
+            ">`",
+            "> `",
             "&>",
             ">&",
             ">|",
@@ -1519,10 +1677,14 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "cicd.jenkins",
-        &["jenkins-cli", "jenkins", "doDelete"],
+        &["jenkins-cli", "jenkins", "doDelete", "curl"],
         cicd::jenkins::create_pack,
     ),
-    PackEntry::new("cicd.circleci", &["circleci"], cicd::circleci::create_pack),
+    PackEntry::new(
+        "cicd.circleci",
+        &["circleci", "curl"],
+        cicd::circleci::create_pack,
+    ),
     PackEntry::new("secrets.vault", &["vault"], secrets::vault::create_pack),
     PackEntry::new(
         "secrets.aws_secrets",
@@ -1557,7 +1719,11 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         ],
         secrets::disclosure::create_pack,
     ),
-    PackEntry::new("platform.github", &["gh"], platform::github::create_pack),
+    PackEntry::new(
+        "platform.github",
+        &["gh", "curl"],
+        platform::github::create_pack,
+    ),
     PackEntry::new(
         "platform.gitlab",
         &["glab", "gitlab-rails", "gitlab-rake"],
@@ -1606,6 +1772,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "cloudflare",
             "api.cloudflare.com",
             "dns-records",
+            "curl",
         ],
         dns::cloudflare::create_pack,
     ),
@@ -1637,22 +1804,31 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "featureflags.flipt",
-        &["flipt"],
+        // `/api/v1/` is what `flipt-api-delete` actually keys on, and Flipt is
+        // self-hosted, so the server is usually NOT at a hostname containing
+        // "flipt" (#447). With only the vendor name here the API rule could
+        // fire solely by coincidence of hostname. Same shape as
+        // `monitoring.prometheus`, which carries `/api/dashboards` beside
+        // `grafana-cli` for exactly this reason.
+        &["flipt", "/api/v1/", "curl"],
         featureflags::flipt::create_pack,
     ),
     PackEntry::new(
         "featureflags.launchdarkly",
-        &["ldcli", "launchdarkly"],
+        &["ldcli", "launchdarkly", "curl"],
         featureflags::launchdarkly::create_pack,
     ),
     PackEntry::new(
         "featureflags.split",
-        &["split", "api.split.io"],
+        &["split", "api.split.io", "curl"],
         featureflags::split::create_pack,
     ),
     PackEntry::new(
         "featureflags.unleash",
-        &["unleash"],
+        // `/api/admin/` is what the three `unleash-api-delete-*` rules and the
+        // `unleash-api-get` exemption key on; Unleash is self-hosted, so the
+        // vendor name is not reliably in the command (#447).
+        &["unleash", "/api/admin/", "curl"],
         featureflags::unleash::create_pack,
     ),
     PackEntry::new(
@@ -1667,7 +1843,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "loadbalancer.traefik",
-        &["traefik", "ingressroute"],
+        &["traefik", "ingressroute", "curl"],
         loadbalancer::traefik::create_pack,
     ),
     PackEntry::new(
@@ -1685,22 +1861,22 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "monitoring.splunk",
-        &["splunk"],
+        &["splunk", "curl"],
         monitoring::splunk::create_pack,
     ),
     PackEntry::new(
         "monitoring.datadog",
-        &["datadog-ci", "datadoghq", "datadog"],
+        &["datadog-ci", "datadoghq", "datadog", "curl"],
         monitoring::datadog::create_pack,
     ),
     PackEntry::new(
         "monitoring.pagerduty",
-        &["pd", "pagerduty", "api.pagerduty.com"],
+        &["pd", "pagerduty", "api.pagerduty.com", "curl"],
         monitoring::pagerduty::create_pack,
     ),
     PackEntry::new(
         "monitoring.newrelic",
-        &["newrelic", "api.newrelic.com", "graphql"],
+        &["newrelic", "api.newrelic.com", "graphql", "curl"],
         monitoring::newrelic::create_pack,
     ),
     PackEntry::new(
@@ -1708,6 +1884,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         &[
             "promtool",
             "grafana-cli",
+            "curl",
             "/api/v1/admin/tsdb/delete_series",
             "delete_series",
             "/api/dashboards",
@@ -1723,7 +1900,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "payment.stripe",
-        &["stripe", "api.stripe.com"],
+        &["stripe", "api.stripe.com", "curl"],
         payment::stripe::create_pack,
     ),
     PackEntry::new(
@@ -1736,6 +1913,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "gateway.merchant_account.",
             "gateway.payment_method.",
             "gateway.subscription.",
+            "curl",
         ],
         payment::braintree::create_pack,
     ),
@@ -1746,6 +1924,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "api.squareup.com",
             "connect.squareup.com",
             "connect.squareupsandbox.com",
+            "curl",
         ],
         payment::square::create_pack,
     ),
@@ -1776,6 +1955,8 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         "search.elasticsearch",
         &[
             "elasticsearch",
+            "curl",
+            "http",
             "9200",
             "_search",
             "_cluster",
@@ -1790,6 +1971,8 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         "search.opensearch",
         &[
             "opensearch",
+            "curl",
+            "http",
             "9200",
             "_search",
             "_cluster",
@@ -1807,7 +1990,15 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "search.meilisearch",
-        &["meili", "meilisearch", "7700", "/indexes", "/keys"],
+        &[
+            "meili",
+            "meilisearch",
+            "7700",
+            "/indexes",
+            "/keys",
+            "curl",
+            "http",
+        ],
         search::meilisearch::create_pack,
     ),
     PackEntry::new("backup.borg", &["borg"], backup::borg::create_pack),
@@ -1825,6 +2016,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "DROP",
             "TRUNCATE",
             "DELETE",
+            // `update-without-where`; the rule needs `UPDATE <table> SET`, so
+            // `apt update` only costs a candidate check.
+            "UPDATE",
         ],
         database::postgresql::create_pack,
     ),
@@ -1841,11 +2035,20 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "DROP",
             "TRUNCATE",
             "DELETE",
+            "UPDATE",
         ],
         database::mysql::create_pack,
     ),
     PackEntry::new(
         "database.mongodb",
+        // The shell-method spellings have to be here, not just in the pack's own
+        // list: a mongosh snippet pasted into a `-eval` or a script names no
+        // client binary, so `db.users.drop()`, `db.users.remove({})` and
+        // `db.users.deleteMany({})` carried none of the keywords below and were
+        // quick-rejected before the pack was ever a candidate (#441). The rules
+        // they reach are tight — `.drop(` requires empty parens and
+        // `remove`/`deleteMany` require a literal `({})` — so admitting these
+        // widens which commands the pack is asked about, not what it denies.
         &[
             "mongo",
             "mongosh",
@@ -1853,6 +2056,11 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "mongorestore",
             "dropDatabase",
             "dropCollection",
+            "deleteMany",
+            ".drop(",
+            ".remove(",
+            ".deleteMany(",
+            ".updateMany(",
         ],
         database::mongodb::create_pack,
     ),
@@ -1873,7 +2081,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "database.sqlite",
-        &["sqlite3", "DROP", "DELETE", "TRUNCATE"],
+        &["sqlite3", "DROP", "DELETE", "TRUNCATE", "UPDATE"],
         database::sqlite::create_pack,
     ),
     PackEntry::new(
@@ -1908,6 +2116,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         "database.snowflake",
         &[
             "snow",
+            // The legacy SnowSQL client. `snow` is word-bounded, and the SQL
+            // verbs below are usually inside the quoted `-q` value.
+            "snowsql",
             "Snow",
             "SNOW",
             "DROP",
@@ -1953,7 +2164,12 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "containers.compose",
-        &["docker-compose", "docker compose"],
+        &[
+            "docker-compose",
+            "docker compose",
+            "podman-compose",
+            "podman compose",
+        ],
         containers::compose::create_pack,
     ),
     PackEntry::new(
@@ -1963,13 +2179,19 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "kubernetes.kubectl",
-        &["kubectl"],
+        // `/api/v1/` and `/apis/` reach the `api-delete-*` rules: the same
+        // deletion spelled as a raw API call carries no "kubectl" (#449).
+        &["kubectl", "/api/v1/", "/apis/", "curl"],
         kubernetes::kubectl::create_pack,
     ),
     PackEntry::new("kubernetes.helm", &["helm"], kubernetes::helm::create_pack),
     PackEntry::new(
         "kubernetes.kustomize",
-        &["kustomize"],
+        // `kubectl-delete-k` matches `kubectl … delete … -k`, which need not
+        // contain the word "kustomize" at all: `kubectl delete -k ./prod` and
+        // `kubectl delete --force -k./prod` were quick-rejected before this pack
+        // was a candidate, so the rule written for them could not fire (#441).
+        &["kustomize", "kubectl"],
         kubernetes::kustomize::create_pack,
     ),
     PackEntry::new("cloud.aws", &["aws"], cloud::aws::create_pack),
@@ -1997,7 +2219,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "apigateway.kong",
-        &["kong", "deck", "8001"],
+        &["kong", "deck", "8001", "curl"],
         apigateway::kong::create_pack,
     ),
     PackEntry::new(
@@ -2007,7 +2229,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "infrastructure.terraform",
-        &["terraform", "tofu"],
+        &["terraform", "tofu", "terragrunt"],
         infrastructure::terraform::create_pack,
     ),
     PackEntry::new(
@@ -2031,13 +2253,73 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "dd",
             "diskutil",
             "mkfs",
+            "mke2fs",
+            "mkdosfs",
+            "mkntfs",
+            "mkexfatfs",
+            "newfs",
+            "newfs_apfs",
+            "newfs_hfs",
+            "newfs_msdos",
+            "newfs_exfat",
             "mkswap",
             "fdisk",
             "parted",
             "wipefs",
-            // Without `umount` the umount-force rule was dead: no other
-            // keyword in this list appears in `umount -f /mnt/x` (#323).
+            // Without `/dev/` the tee-device and copy-to-device rules are dead:
+            // `tee /dev/sda < /dev/zero` names no other keyword in this row, so
+            // the quick-reject drops the command before this pack is a
+            // candidate and the rule never runs (#444).
+            "/dev/",
+            // BOTH spellings are required. This row briefly carried only
+            // `mount`, on the theory that keyword matching is substring-based
+            // and `mount` therefore also reaches `umount`. It is not, and it
+            // does not.
+            //
+            // There are two keyword matchers with different semantics, and they
+            // run in that order: `pack_aware_quick_reject` is word-boundary
+            // aware and deliberately ignores substring hits (it is what keeps
+            // `cat .gitignore` from waking `core.git` — see
+            // `pack_aware_quick_reject_ignores_substring_matches` and its
+            // `echo dcgx` case), while `candidate_pack_mask` is substring-based
+            // (overlapping Aho-Corasick). The quick-reject runs FIRST, so an
+            // alphanumeric `u` in front of `mount` is not a boundary and
+            // `mount` never matches the token `umount` in production, no matter
+            // what the mask would have said.
+            //
+            // Measured against the built binary with `mount` alone on the row:
+            // `umount -f /mnt/data` and `umount -f /` were ALLOWED, while
+            // `umount -f /mount/data` — the same rule, rescued only by the
+            // literal `mount` inside the PATH operand — was denied by
+            // `umount-force`. `umount -f /dev/sda1` was denied for the same
+            // kind of reason, by the unrelated `/dev/` row keyword. So #441's
+            // fix silently un-shipped #323's rule for every unmount that names
+            // neither, while its pack-level test stayed green because
+            // `Pack::check` never sees this gate (#460).
+            //
+            // With only `umount` here, `mount-bind-root` was dead for the
+            // mirror-image reason: no other keyword in this list appears in
+            // `mount --bind /mnt /`, and that command was allowed while
+            // `mount --bind /mnt/btrfs /` — rescued only by an unrelated row
+            // keyword — was denied (#441). Neither keyword substitutes for the
+            // other; both are load-bearing, and the gate tests now assert each
+            // one end-to-end through the evaluator.
+            "mount",
             "umount",
+            // All three GPT-editor spellings are required, for the same reason
+            // `mount` and `umount` both are: the quick-reject is word-boundary
+            // aware, so `gdisk` does not match the token `sgdisk` (no boundary
+            // between `s` and `g`) and `cgdisk` derives from neither.
+            //
+            // Without these, `sgdisk-modify` and `gdisk-edit` were reachable
+            // only when some OTHER keyword on this row happened to appear, and
+            // the one carrying them was `/dev/`. Quoting the device hid it:
+            // `gdisk /dev/sda` denied while `gdisk '/dev/sda'` was
+            // quick-rejected with no keywords and allowed, along with
+            // `sgdisk -Z '/dev/sda'` and `sudo gdisk '/dev/sda'` (#456).
+            "sgdisk",
+            "gdisk",
+            "cgdisk",
             "mdadm",
             "btrfs",
             "dmsetup",
@@ -2050,24 +2332,73 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "lvresize",
             "pvmove",
             "lvconvert",
+            // Whole-device wipe / erase tools (mirror `system::disk::create_pack`).
+            // `zpool`/`zfs` carry no `/dev/`, so they need their own keyword.
+            "blkdiscard",
+            "cryptsetup",
+            "hdparm",
+            "nvme",
+            "badblocks",
+            "sg_format",
+            "zpool",
+            "zfs",
+            "nwipe",
         ],
         system::disk::create_pack,
     ),
     PackEntry::new(
         "system.permissions",
-        &["chmod", "chown", "setfacl"],
+        // `chgrp` has been in the pack's OWN keyword row since it was written
+        // but was missing from this one, which is the gate that actually
+        // decides candidacy — the same divergence `core.filesystem`'s `.git/`
+        // entry documents. So `chgrp -R nogroup /` reached no rule even after
+        // one existed: the pack-level test calls `create_pack()` directly and
+        // never sees this row (#451).
+        //
+        // The Windows verbs are here for the same reason and must stay in sync
+        // with the pack's own list: `takeown /f C:\Windows /r` carries none of
+        // the POSIX words, so without them this gate drops it before the pack
+        // is a candidate and the rules written for it never run.
+        &[
+            "chmod", "chown", "chgrp", "setfacl", "icacls", "cacls", "takeown",
+        ],
         system::permissions::create_pack,
     ),
     PackEntry::new(
         "system.services",
-        &["systemctl", "service"],
+        // `init`, `shutdown` and `reboot` ARE the command word for the rules that
+        // gate them, so without them here the quick-reject drops the command
+        // before the pack is a candidate and `shutdown -h now`, `shutdown -r +1`,
+        // `reboot`, `reboot -f` and `init 0` are allowed with their rules sitting
+        // unreachable (#441). `systemctl`/`service` cannot stand in: none of those
+        // spellings contains either word.
+        //
+        // `upstart` is here only so the row covers the pack's own list. It matches
+        // no real command — upstart's CLI is `initctl` — and no rule covers
+        // `initctl` at all, so that is a coverage gap rather than a gate problem.
+        &[
+            "systemctl",
+            "service",
+            "init",
+            "upstart",
+            "shutdown",
+            "reboot",
+        ],
         system::services::create_pack,
     ),
     PackEntry::new("strict_git", &["git"], strict_git::create_pack),
     PackEntry::new(
         "package_managers",
+        // Each manager's own name has to be here: the row is what decides whether
+        // the pack runs at all, so omitting `apt`, `yum`, `dnf`, `brew`, `poetry`,
+        // `mvn`/`mvnw` and `gradle`/`gradlew` left `apt purge --autoremove`,
+        // `yum remove -y`, `brew uninstall --force`, `poetry publish`,
+        // `mvn deploy` and `gradle publish` allowed with their rules unreachable
+        // (#441). `publish` is deliberately absent: every command that needs it
+        // also names its manager.
         &[
-            "npm", "yarn", "pnpm", "pip", "cargo", "gem", "composer", "go",
+            "npm", "yarn", "pnpm", "pip", "cargo", "gem", "composer", "go", "apt", "yum", "dnf",
+            "brew", "poetry", "mvn", "mvnw", "gradle", "gradlew", "nuget",
         ],
         package_managers::create_pack,
     ),
@@ -2119,6 +2450,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "WMIC",
             "shadowcopy",
             "ShadowCopy",
+            "Win32_ShadowCopy",
+            "win32_shadowcopy",
+            "WIN32_SHADOWCOPY",
             "diskpart",
             "DISKPART",
             "Format-Volume",
@@ -2129,6 +2463,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "CLEAR-DISK",
             "Remove-Partition",
             "remove-partition",
+            "Remove-VirtualDisk",
+            "remove-virtualdisk",
+            "REMOVE-VIRTUALDISK",
             "Initialize-Disk",
             "initialize-disk",
             "Reset-PhysicalDisk",
@@ -2137,6 +2474,10 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "CIPHER",
             "bcdedit",
             "BCDEDIT",
+            "wbadmin",
+            "WBADMIN",
+            "fsutil",
+            "FSUTIL",
         ],
         windows::system::create_pack,
     ),
@@ -2694,6 +3035,41 @@ pub struct ExternalPackStore {
     /// configuration (issue #402). Recording it here lets the global reject
     /// stand down, restoring the documented contract.
     keywordless_pack_ids: Vec<String>,
+    /// Pack-authored denial wording, keyed by pack id (#416).
+    denial_text: HashMap<String, ExternalDenialText>,
+}
+
+/// Pack-authored denial wording for one external pack (#416), validated at
+/// load time. A rule's own text wins over the pack's.
+#[derive(Debug, Clone, Default)]
+struct ExternalDenialText {
+    banner: Option<String>,
+    trailer: Option<String>,
+    /// Rule name → (banner, trailer).
+    rules: HashMap<String, (Option<String>, Option<String>)>,
+}
+
+impl ExternalDenialText {
+    fn from_pack(pack: &external::ExternalPack) -> Option<Self> {
+        let rules: HashMap<String, (Option<String>, Option<String>)> = pack
+            .destructive_patterns
+            .iter()
+            .filter(|rule| rule.denial_banner.is_some() || rule.denial_trailer.is_some())
+            .map(|rule| {
+                (
+                    rule.name.clone(),
+                    (rule.denial_banner.clone(), rule.denial_trailer.clone()),
+                )
+            })
+            .collect();
+        (pack.denial_banner.is_some() || pack.denial_trailer.is_some() || !rules.is_empty()).then(
+            || Self {
+                banner: pack.denial_banner.clone(),
+                trailer: pack.denial_trailer.clone(),
+                rules,
+            },
+        )
+    }
 }
 
 impl ExternalPackStore {
@@ -2704,7 +3080,28 @@ impl ExternalPackStore {
             keywords: Vec::new(),
             warnings: Vec::new(),
             keywordless_pack_ids: Vec::new(),
+            denial_text: HashMap::new(),
         }
+    }
+
+    /// The pack-authored banner for a denial by `pack_id` (and `rule`, when
+    /// known), if the pack sets one (#416).
+    #[must_use]
+    pub fn denial_banner(&self, pack_id: &str, rule: Option<&str>) -> Option<&str> {
+        let text = self.denial_text.get(pack_id)?;
+        rule.and_then(|rule| text.rules.get(rule))
+            .and_then(|(banner, _)| banner.as_deref())
+            .or(text.banner.as_deref())
+    }
+
+    /// The pack-authored trailer for a denial by `pack_id` (and `rule`, when
+    /// known), if the pack sets one (#416).
+    #[must_use]
+    pub fn denial_trailer(&self, pack_id: &str, rule: Option<&str>) -> Option<&str> {
+        let text = self.denial_text.get(pack_id)?;
+        rule.and_then(|rule| text.rules.get(rule))
+            .and_then(|(_, trailer)| trailer.as_deref())
+            .or(text.trailer.as_deref())
     }
 
     /// Get a pack by ID.
@@ -2882,6 +3279,9 @@ pub fn load_external_packs(paths: &[String]) -> &'static ExternalPackStore {
         // Convert and store loaded packs
         for loaded in result.packs {
             let id = loaded.id.clone();
+            if let Some(text) = ExternalDenialText::from_pack(&loaded.pack) {
+                store.denial_text.insert(id.clone(), text);
+            }
             let pack = loaded.pack.into_pack();
 
             // Collect keywords
@@ -2906,6 +3306,18 @@ pub fn load_external_packs(paths: &[String]) -> &'static ExternalPackStore {
 #[must_use]
 pub fn get_external_packs() -> Option<&'static ExternalPackStore> {
     EXTERNAL_PACKS.get()
+}
+
+/// The pack-authored denial banner for `pack_id`/`rule`, if any (#416).
+#[must_use]
+pub fn external_denial_banner(pack_id: &str, rule: Option<&str>) -> Option<&'static str> {
+    get_external_packs()?.denial_banner(pack_id, rule)
+}
+
+/// The pack-authored denial trailer for `pack_id`/`rule`, if any (#416).
+#[must_use]
+pub fn external_denial_trailer(pack_id: &str, rule: Option<&str>) -> Option<&'static str> {
+    get_external_packs()?.denial_trailer(pack_id, rule)
 }
 
 /// Pre-compiled finders for core quick rejection (git/rm).
@@ -3894,6 +4306,72 @@ fn pack_aware_quick_reject_from_normalized_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pack-authored denial text (#416): a rule's text wins, the pack's is
+    /// the fallback, an unknown pack has none, and invalid text is refused at
+    /// load time.
+    #[test]
+    fn external_denial_text_precedence_and_validation_issue_416() {
+        let pack = external::parse_pack_string(
+            r"
+schema_version: 1
+id: custom.hostedci
+name: Hosted CI
+version: 1.0.0
+keywords: [sem]
+denial_banner: Use the hosted pipeline
+denial_trailer: Load the /semaphore skill.
+destructive_patterns:
+  - name: sem-direct
+    pattern: \bsem\b
+  - name: sem-apply
+    pattern: \bsem\s+apply\b
+    denial_trailer: Open a pipeline run instead.
+",
+        )
+        .expect("valid pack");
+        let mut store = ExternalPackStore::new();
+        store.denial_text.insert(
+            "custom.hostedci".to_string(),
+            ExternalDenialText::from_pack(&pack).expect("pack authors text"),
+        );
+
+        assert_eq!(
+            store.denial_trailer("custom.hostedci", Some("sem-apply")),
+            Some("Open a pipeline run instead.")
+        );
+        assert_eq!(
+            store.denial_trailer("custom.hostedci", Some("sem-direct")),
+            Some("Load the /semaphore skill.")
+        );
+        // No rule-level banner, so the pack's applies to both rules.
+        assert_eq!(
+            store.denial_banner("custom.hostedci", Some("sem-apply")),
+            Some("Use the hosted pipeline")
+        );
+        assert_eq!(store.denial_trailer("core.git", Some("reset-hard")), None);
+
+        for bad in [
+            "denial_trailer: \"a\\nb\"",
+            "denial_banner: \"\\u001b[31mred\"",
+            "denial_banner: \"   \"",
+        ] {
+            let yaml = format!(
+                "schema_version: 1\nid: custom.bad\nname: Bad\nversion: 1.0.0\n{bad}\n\
+                 destructive_patterns:\n  - name: x\n    pattern: \\bx\\b\n"
+            );
+            assert!(
+                external::parse_pack_string(&yaml).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        let long = "x".repeat(external::MAX_DENIAL_BANNER_CHARS + 1);
+        let yaml = format!(
+            "schema_version: 1\nid: custom.bad\nname: Bad\nversion: 1.0.0\n\
+             denial_banner: {long}\ndestructive_patterns:\n  - name: x\n    pattern: \\bx\\b\n"
+        );
+        assert!(external::parse_pack_string(&yaml).is_err());
+    }
 
     #[test]
     fn pack_aware_quick_reject_empty_keywords_is_conservative() {
@@ -6157,6 +6635,804 @@ mod tests {
                     !entry.keywords.is_empty(),
                     "pack {} has no keywords — it can never be activated",
                     entry.id
+                );
+            }
+        }
+
+        /// Keywords a pack omits from its row without opening a bypass.
+        ///
+        /// Every entry was run against the release binary: the commands that need
+        /// it are already denied without it. They are listed rather than added
+        /// because an entry that buys no coverage is not worth a wider hot path.
+        const KEYWORDS_DEAD_BUT_COVERED: &[(&str, &str)] = &[
+            // Cmd redirect spellings. Each of `echo x >%T%`, `>!T!` and `>^/etc/passwd`
+            // is already denied as `redirect-truncate-dynamic-path` with the keyword
+            // absent, checked individually in the cmd dialect.
+            ("core.filesystem", ">%"),
+            ("core.filesystem", "> %"),
+            ("core.filesystem", ">!"),
+            ("core.filesystem", "> !"),
+            ("core.filesystem", ">^"),
+            ("core.filesystem", "> ^"),
+            // `npm publish` — the only command needing this — is already denied
+            // as `npm-publish` through the `npm` keyword, and every other
+            // publisher names its own manager.
+            ("package_managers", "publish"),
+            // ---- Covered structurally: a subcommand, service name or flag of a
+            // CLI whose own name the row carries, so no command can present the
+            // keyword without also presenting the gate. Each pack's headline
+            // rules were run with only that pack enabled and all still deny.
+            ("storage.s3", "rb"),
+            ("storage.s3", "delete-bucket"),
+            ("storage.s3", "delete-object"),
+            ("storage.s3", "delete-objects"),
+            ("storage.s3", "--delete"),
+            ("platform.railway", "Project-Access-Token"),
+            ("platform.railway", "PROJECT_ACCESS_TOKEN"),
+            ("messaging.kafka", "kafka-topics.sh"),
+            ("messaging.kafka", "kafka-consumer-groups.sh"),
+            ("messaging.kafka", "kafka-configs.sh"),
+            ("messaging.kafka", "kafka-acls.sh"),
+            ("messaging.kafka", "kafka-delete-records.sh"),
+            ("messaging.kafka", "kafka-console-consumer"),
+            ("messaging.kafka", "kafka-console-producer"),
+            ("messaging.kafka", "kafka-broker-api-versions"),
+            ("search.opensearch", "aws"),
+            ("database.mysql", "mysqladmin"),
+            ("database.mysql", "delete"),
+            ("database.mysql", "drop"),
+            ("database.mysql", "truncate"),
+            ("database.mysql", "GRANT"),
+            ("database.redis", "redis"),
+            ("database.databricks", "bundle"),
+            ("database.supabase", "vanity-subdomains delete"),
+            ("containers.docker", "prune"),
+            ("containers.docker", "rmi"),
+            ("containers.docker", "volume"),
+            ("containers.compose", "compose"),
+            ("containers.podman", "prune"),
+            ("kubernetes.kubectl", "delete"),
+            ("kubernetes.kubectl", "drain"),
+            ("kubernetes.kubectl", "cordon"),
+            ("kubernetes.kubectl", "taint"),
+            ("kubernetes.helm", "uninstall"),
+            ("kubernetes.helm", "delete"),
+            ("kubernetes.helm", "rollback"),
+            ("cloud.aws", "terminate"),
+            ("cloud.aws", "delete"),
+            ("cloud.aws", "s3"),
+            ("cloud.aws", "ec2"),
+            ("cloud.aws", "rds"),
+            ("cloud.aws", "ecr"),
+            ("cloud.aws", "logs"),
+            ("cloud.aws", "athena"),
+            ("cloud.aws", "glue"),
+            ("cloud.aws", "kms"),
+            ("cloud.aws", "secretsmanager"),
+            ("cloud.aws", "route53"),
+            ("cloud.aws", "cloudtrail"),
+            ("cloud.aws", "redshift"),
+            ("cloud.aws", "kinesis"),
+            ("cloud.aws", "efs"),
+            ("cloud.gcp", "delete"),
+            ("cloud.gcp", "instances"),
+            ("cloud.gcp", "artifacts"),
+            ("cloud.gcp", "images"),
+            ("cloud.gcp", "repositories"),
+            ("cloud.gcp", "secrets"),
+            ("cloud.gcp", "kms"),
+            ("cloud.gcp", "iam"),
+            ("cloud.gcp", "dns"),
+            ("cloud.gcp", "spanner"),
+            ("cloud.gcp", "bigtable"),
+            ("cloud.gcp", "dataproc"),
+            ("cloud.azure", "delete"),
+            ("cloud.azure", "vm"),
+            ("cloud.azure", "storage"),
+            ("cloud.azure", "acr"),
+            ("cloud.azure", "registry"),
+            ("cloud.azure", "keyvault"),
+            ("cloud.azure", "role"),
+            ("cloud.azure", "ad"),
+            ("cloud.azure", "dns"),
+            ("cloud.azure", "cosmosdb"),
+            ("cloud.azure", "monitor"),
+            ("cloud.azure", "purge"),
+            ("cloud.azure", "account"),
+            ("cloud.azure", "management-group"),
+            ("cloud.azure", "subscription"),
+            ("cloud.azure", "lock"),
+            ("cloud.azure", "cancel"),
+            ("cloud.azure", "clear"),
+            ("cloud.azure", "remove"),
+            ("infrastructure.terraform", "destroy"),
+            ("infrastructure.terraform", "taint"),
+            ("infrastructure.terraform", "state"),
+            ("infrastructure.pulumi", "destroy"),
+            ("infrastructure.pulumi", "state"),
+            // ---- Covered by the matcher, not by a sibling keyword: the
+            // automaton is ASCII case-insensitive (see the windows module docs),
+            // so these upper-case spellings are reached through their lower-case
+            // twins in the row.
+            ("windows.filesystem", "CLEAR-CONTENT"),
+            ("windows.filesystem", "CLEAR-RECYCLEBIN"),
+            ("windows.system", "SHADOWCOPY"),
+            ("windows.system", "REMOVE-PARTITION"),
+            ("windows.system", "INITIALIZE-DISK"),
+            ("windows.system", "RESET-PHYSICALDISK"),
+            // ---- Covered only because NO RULE currently needs them. This is a
+            // weaker guarantee than the groups above: adding a rule that matches
+            // one of these, without also adding the keyword here, silently
+            // reintroduces the #441 defect, and this test cannot catch that. Each
+            // was checked to be allowed both bare and with a row keyword present,
+            // which is what distinguishes "no rule" from "the gate hid the rule".
+            //
+            // Derive that probe from the pack's rule list, not from what the
+            // keyword suggests. `("system.disk", "mount")` used to sit here on the
+            // strength of `mount -o remount,ro /`, which really does match no
+            // rule — while `mount-bind-root` had matched `mount --bind /mnt /`
+            // the whole time. The pair was allowed-bare and allowed-prefixed, so
+            // the method reported "no rule" correctly about the wrong command.
+            ("database.postgresql", "postgres"), // `postgres --single -D …`
+            ("database.postgresql", "delete"),
+            ("database.postgresql", "drop"),
+            ("database.postgresql", "truncate"),
+            ("database.snowflake", "drop"),
+            ("database.snowflake", "truncate"),
+            ("database.snowflake", "delete"),
+            ("database.snowflake", "update"),
+            ("database.snowflake", "alter"),
+            ("database.snowflake", "grant"),
+            ("database.snowflake", "revoke"),
+            ("database.snowflake", "remove"),
+            ("database.snowflake", "overwrite"),
+            ("database.snowflake", "EXECUTE"),
+            ("database.snowflake", "execute"),
+            ("infrastructure.ansible", "playbook"), // `ansible-playbook` carries `ansible`
+            // `("system.permissions", "chgrp")` was here, noted as "`chgrp -R …
+            // /etc` has no rule" — accurate, and the right call while that was
+            // true: a keyword that buys no coverage is not worth a wider hot
+            // path. `chgrp-recursive-root` now exists, so the keyword buys
+            // coverage and has moved to the row proper.
+            // ---- A deliberate omission rather than an oversight. The row carries
+            // `sqlite3`, the binary modern systems ship; `sqlite` is SQLite 2's
+            // CLI. Admitting it would make the pack a candidate for any command
+            // merely containing the substring — a path like `/var/lib/sqlite/`
+            // included — and the rule it reaches is `(?i)\bDROP\s+TABLE\b` with no
+            // client requirement, so `echo "DROP TABLE" >> /var/lib/sqlite/notes`
+            // would begin to deny. Widening a rule that broad for a legacy binary
+            // is a decision, not a reflex.
+            ("database.sqlite", "sqlite"),
+        ];
+
+        /// Commands whose rule was, or could be, hidden by the registry gate.
+        ///
+        /// Each entry is `(pack, command, rule)` for a command that carries
+        /// exactly one keyword belonging to its pack's row — the keyword whose
+        /// absence made the rule unreachable. They are the escapes this defect
+        /// class has produced, kept as a corpus because each was found only
+        /// after shipping, and twice a fix for one row broke another.
+        const GATE_MUST_REACH_RULE: &[(&str, &str, &str)] = &[
+            // #407: `.git/` was declared by the pack but missing from the row.
+            (
+                "core.filesystem",
+                "cat > .git/config",
+                "redirect-truncate-git-internals-relative",
+            ),
+            // #457: the appending spelling of the same write. It carries `.git/`
+            // and nothing else — `>>` is not a row keyword.
+            (
+                "core.filesystem",
+                "cat >> .git/config",
+                "redirect-append-git-internals-relative",
+            ),
+            // #323: no other keyword in system.disk's row appears here. #441
+            // dropped `umount` from the row believing `mount` covered it by
+            // substring; it does not, because the quick-reject needs a word
+            // boundary, and this rule was dead in production until #460.
+            ("system.disk", "umount -f /mnt/data", "umount-force"),
+            // #444: `tee /dev/sda` names `/dev/` and nothing else.
+            ("system.disk", "tee /dev/sda", "tee-device"),
+            // #456: the GPT tools are admitted by `/dev/` alone — `sgdisk`,
+            // `gdisk` and `cgdisk` are deliberately NOT row keywords, because
+            // every invocation these rules can match already names a device.
+            // Asserting it here is what makes that a measured decision rather
+            // than an assumption about someone else's keyword budget.
+            ("system.disk", "sgdisk --zap-all /dev/sda", "sgdisk-modify"),
+            ("system.disk", "gdisk /dev/sda", "gdisk-edit"),
+            // #441: `mount --bind /mnt /` names `mount` and nothing else. The
+            // row carried only `umount`, which this command does not contain.
+            ("system.disk", "mount --bind /mnt /", "mount-bind-root"),
+            // Direct formatters with no `/dev/` in the command: the new row
+            // keywords are the only thing that selects the pack.
+            ("system.disk", "mke2fs disk.img", "mkfs"),
+            ("system.disk", "newfs_apfs disk2s1", "mkfs"),
+        ];
+
+        /// A rule is only real if the production gate lets its pack see the command.
+        ///
+        /// `Pack::check` and `Pack::might_match` consult the pack's own keyword
+        /// list, so a pack-level test passes whether or not the registry row
+        /// carries the keyword. Production does not work that way: the
+        /// `EnabledKeywordIndex` built from `PACK_ENTRIES` decides candidacy
+        /// first, and a pack that is not a candidate never runs. Every escape in
+        /// `GATE_MUST_REACH_RULE` had a correct rule and a green pack-level test.
+        ///
+        /// So assert all three layers against the same command: the gate admits
+        /// the pack, the pack agrees the command is destructive, *and* the
+        /// evaluator actually returns that rule.
+        ///
+        /// The third layer is not redundant (#460). `Pack::check` is not what
+        /// production calls — the evaluator runs the pattern pass itself, with
+        /// phase filters `Pack::check` does not apply, and a rule can pass the
+        /// first two layers and still never fire. That is the #407/#441/#444
+        /// shape one level deeper: the keyword admits the pack, the pack agrees,
+        /// and the command is allowed anyway. `tee-git-internals` was withdrawn
+        /// in `0dfabb6` for exactly this, after its pack-level test had been
+        /// green the whole time. A rule that cannot fire in production now fails
+        /// its own reachability test instead of advertising coverage it does not
+        /// have.
+        #[test]
+        fn registry_gate_admits_every_command_its_rules_must_decide() {
+            for (pack_id, command, rule) in GATE_MUST_REACH_RULE {
+                let mut enabled = HashSet::new();
+                enabled.insert((*pack_id).to_string());
+                let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+                let index = REGISTRY
+                    .build_enabled_keyword_index(&ordered)
+                    .expect("keyword index should build for a single pack");
+                let pack_idx = ordered
+                    .iter()
+                    .position(|id| id == pack_id)
+                    .expect("enabled pack should appear in the ordered list");
+
+                assert_eq!(
+                    (index.candidate_pack_mask(command) >> pack_idx) & 1,
+                    1,
+                    "{pack_id} is not a candidate for {command:?}, so rule {rule} can \
+                     never run no matter what it matches. Add the keyword this command \
+                     carries to the pack's PACK_ENTRIES row"
+                );
+
+                // `candidate_pack_mask` is not the only gate, and on its own it
+                // is the more permissive of the two: it is an overlapping
+                // Aho-Corasick scan, so a row keyword buried inside a longer
+                // word still sets the bit. `pack_aware_quick_reject` requires a
+                // word boundary, runs first, and is what actually drops the
+                // command. Asserting only the mask is how `umount-force` went
+                // dead while this test stayed green: `mount` set system.disk's
+                // bit from inside `umount`, and the quick-reject then threw the
+                // command away (#460).
+                let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+                assert!(
+                    !pack_aware_quick_reject(command, &keywords),
+                    "the word-boundary quick-reject drops {command:?} before {pack_id} \
+                     runs, so rule {rule} can never decide it. A row keyword that only \
+                     appears inside a longer word does not count: add the spelling this \
+                     command actually uses"
+                );
+
+                let pack = REGISTRY
+                    .get(pack_id)
+                    .unwrap_or_else(|| panic!("pack {pack_id} should be retrievable"));
+                let matched = pack
+                    .check(command)
+                    .unwrap_or_else(|| panic!("{pack_id} must block {command:?}"));
+                assert_eq!(
+                    matched.name,
+                    Some(*rule),
+                    "{command:?} was blocked by the wrong rule"
+                );
+
+                // Layer three: the production evaluator, with only this pack
+                // enabled so nothing else can rescue the command. Built from the
+                // same `ordered`/`index`/`keywords` the gate checks above used.
+                let config = crate::Config::default();
+                let result = crate::evaluator::evaluate_command_with_pack_order(
+                    command,
+                    &keywords,
+                    &ordered,
+                    Some(&index),
+                    &config.overrides.compile(),
+                    &crate::LayeredAllowlist::default(),
+                    &config.heredoc_settings(),
+                );
+                let fired = result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref());
+                assert_eq!(
+                    fired,
+                    Some(*rule),
+                    "{pack_id} and its keyword row both accept {command:?} and \
+                     `Pack::check` returns {rule}, but the evaluator answered \
+                     {fired:?}. The rule is unreachable in production, so a \
+                     pack-level test asserting it is asserting coverage that does \
+                     not exist (#460). A destructive pattern must anchor on the \
+                     command word or on shell syntax; one that can only match \
+                     inside argv needs a semantic classifier instead."
+                );
+            }
+        }
+
+        /// The countermetric for widening a keyword row: what must STAY allowed.
+        ///
+        /// Adding `umount` to `system.disk` makes the pack a candidate for every
+        /// command naming it, where before the quick-reject dropped them all.
+        /// From that point only `umount-force`'s own regex separates the force
+        /// spelling from the ordinary one, so the ordinary one needs an
+        /// end-to-end pin rather than a pack-level `check` — the whole lesson of
+        /// #460 is that those two answer different questions.
+        #[test]
+        fn widening_the_disk_row_does_not_deny_ordinary_mount_commands() {
+            let mut enabled = HashSet::new();
+            enabled.insert("system.disk".to_string());
+            let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+            let index = REGISTRY
+                .build_enabled_keyword_index(&ordered)
+                .expect("keyword index should build for a single pack");
+            let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+            let config = crate::Config::default();
+
+            for command in [
+                "umount /mnt/data",
+                "umount -l /mnt/data",
+                "mount",
+                "mount -l",
+                "mount /dev/sdb1 /mnt",
+                // The cmdlet named as data, not run. `umount-force`'s regex is
+                // unanchored, so this is the shape that would expose a widening.
+                "echo umount -f /mnt/data",
+                r#"git commit -m "fix umount -f handling""#,
+            ] {
+                let result = crate::evaluator::evaluate_command_with_pack_order(
+                    command,
+                    &keywords,
+                    &ordered,
+                    Some(&index),
+                    &config.overrides.compile(),
+                    &crate::LayeredAllowlist::default(),
+                    &config.heredoc_settings(),
+                );
+                assert_eq!(
+                    result.decision,
+                    crate::evaluator::EvaluationDecision::Allow,
+                    "{command:?} is ordinary and must stay allowed after the row \
+                     gained `umount`; it was answered by {:?}",
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref())
+                );
+            }
+        }
+
+        /// The same commands, under the config a user actually runs.
+        ///
+        /// The layer-three assertion above enables only the pack under test, so
+        /// that nothing else can rescue the command and the attribution is
+        /// unambiguous. That is the right way to prove the *rule* works, and it
+        /// is deliberately not the question here.
+        ///
+        /// Nobody runs dcg with one pack. In production five packs are enabled
+        /// together, and every one of them contributes safe patterns and
+        /// allowlist entries that can suppress a match another pack made. A rule
+        /// can therefore pass all three layers in isolation and still be
+        /// overridden the moment it shares a process with its neighbours — a
+        /// failure mode a single-pack harness cannot see, because the neighbour
+        /// is not loaded.
+        ///
+        /// So this runs `evaluate_command`, the entry point `main` uses, against
+        /// `Config::default()`: whatever it says is what a user gets. It also
+        /// pins the pack id, not just the rule name, so a row cannot start
+        /// passing because a different pack happens to deny the same command.
+        #[test]
+        fn the_evaluator_actually_decides_every_command_its_rules_must_reach() {
+            use crate::allowlist::LayeredAllowlist;
+            use crate::config::Config;
+            use crate::evaluator::{EvaluationDecision, evaluate_command};
+
+            let config = Config::default();
+            let enabled_packs = config.enabled_pack_ids();
+            let keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+            let keyword_refs: Vec<&str> = keywords.iter().map(|s| &**s).collect();
+            let overrides = config.overrides.compile();
+            let allowlists = LayeredAllowlist::default();
+
+            // `enabled_pack_ids` keeps category markers such as `core` rather
+            // than expanding them, so ask the registry what that actually means.
+            let expanded = REGISTRY.expand_enabled_ordered(&enabled_packs);
+
+            for (pack_id, command, rule) in GATE_MUST_REACH_RULE {
+                assert!(
+                    expanded.iter().any(|id| id == pack_id),
+                    "{pack_id} is not enabled by default, so this row cannot be \
+                     asserted through the evaluator; move it or enable the pack"
+                );
+
+                let result =
+                    evaluate_command(command, &config, &keyword_refs, &overrides, &allowlists);
+
+                assert!(
+                    matches!(result.decision, EvaluationDecision::Deny),
+                    "the evaluator ALLOWS {command:?} under the DEFAULT config, so rule \
+                     {pack_id}:{rule} does not decide it for a user — even if the \
+                     single-pack assertion above passes (#460). The usual cause is a \
+                     neighbouring default-on pack's safe pattern or allowlist entry \
+                     suppressing the match; find it with `dcg explain` before changing \
+                     this rule."
+                );
+
+                let info = result
+                    .pattern_info
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{command:?} denied with no pattern attributed"));
+                assert_eq!(
+                    (info.pack_id.as_deref(), info.pattern_name.as_deref()),
+                    (Some(*pack_id), Some(*rule)),
+                    "{command:?} is decided by a different rule than the row claims"
+                );
+            }
+        }
+
+        /// Every keyword a pack declares must also be in its `PACK_ENTRIES` row.
+        ///
+        /// There are two live keyword lists per pack and they gate in sequence:
+        /// `PACK_ENTRIES` builds the `EnabledKeywordIndex` that decides whether a
+        /// pack is a candidate at all, and only then does `Pack::might_match` test
+        /// the pack's own `keywords`. So a keyword added to the pack but not to the
+        /// registry row is dead — the pack is rejected before its own list is ever
+        /// consulted, and any rule that relies on that keyword silently never runs.
+        ///
+        /// That is not hypothetical: #407 added `.git/` to `core::filesystem`'s
+        /// keywords so `cat > .git/config` would reach
+        /// `redirect-truncate-git-internals-relative`. The registry row did not get
+        /// it, so the rule stayed unreachable and the redirect kept being allowed,
+        /// while pack-level unit tests — which call `Pack::might_match` directly and
+        /// never see the registry gate — passed.
+        ///
+        /// The registry row may be a strict superset (it also carries `/rm`-style
+        /// path-qualified variants that the pack list does not); only the missing
+        /// direction is a defect.
+        ///
+        /// This runs over **every** registered pack. It was once limited to an
+        /// allowlist of packs whose drift had been audited, on the assumption that
+        /// most rows omitted keywords. Re-measuring settled it: of the 103 rows, 6
+        /// share one `KEYWORDS` const with their pack and so cannot drift at all,
+        /// 68 already carry every keyword their pack declares, and every remaining
+        /// omission belongs to a pack that was already audited and recorded in
+        /// `KEYWORDS_DEAD_BUT_COVERED`. Nothing was left to phase in, so the
+        /// allowlist was removed — all it could still do is exempt the next pack to
+        /// acquire an omission, which is the defect it was meant to find (#441).
+        #[test]
+        fn registry_keywords_cover_every_pack_declared_keyword() {
+            let mut dead: Vec<String> = Vec::new();
+            for entry in &PACK_ENTRIES {
+                let Some(pack) = REGISTRY.get(entry.id) else {
+                    continue;
+                };
+                for keyword in pack.keywords {
+                    if entry.keywords.contains(keyword) {
+                        continue;
+                    }
+                    if KEYWORDS_DEAD_BUT_COVERED.contains(&(entry.id, keyword)) {
+                        continue;
+                    }
+                    dead.push(format!("{}: {keyword:?}", entry.id));
+                }
+            }
+            assert!(
+                dead.is_empty(),
+                "these pack keywords are absent from PACK_ENTRIES, so the quick-reject \
+                 filter drops the command before the pack's own keyword list is \
+                 consulted and every rule relying on them is unreachable. Add each to \
+                 the pack's PACK_ENTRIES row, or — only after checking against the real \
+                 binary that the commands needing it are already denied — to \
+                 KEYWORDS_DEAD_BUT_COVERED:\n  {}",
+                dead.join("\n  ")
+            );
+        }
+
+        /// Report every row's drift, exemption or not.
+        ///
+        /// The assertion above says only that each omission is *accounted for*.
+        /// This prints what is actually omitted, which is what an audit needs to
+        /// re-check when a pack gains a rule. It reads the two lists the binary
+        /// uses rather than parsing the sources:
+        ///
+        /// ```text
+        /// cargo test --lib report_registry_keyword_drift -- --ignored --nocapture
+        /// ```
+        #[test]
+        #[ignore = "reporting tool, not an assertion"]
+        fn report_registry_keyword_drift_for_every_pack() {
+            let mut packs = 0usize;
+            let mut keywords = 0usize;
+            for entry in &PACK_ENTRIES {
+                let Some(pack) = REGISTRY.get(entry.id) else {
+                    continue;
+                };
+                let missing: Vec<&str> = pack
+                    .keywords
+                    .iter()
+                    .filter(|keyword| !entry.keywords.contains(*keyword))
+                    .copied()
+                    .collect();
+                if missing.is_empty() {
+                    continue;
+                }
+                packs += 1;
+                keywords += missing.len();
+                let unexplained: Vec<&str> = missing
+                    .iter()
+                    .filter(|keyword| !KEYWORDS_DEAD_BUT_COVERED.contains(&(entry.id, *keyword)))
+                    .copied()
+                    .collect();
+                let flag = if unexplained.is_empty() {
+                    String::new()
+                } else {
+                    format!(" UNEXEMPTED {unexplained:?}")
+                };
+                println!("{}: {missing:?}{flag}", entry.id);
+            }
+            println!("\n{packs} packs with drift, {keywords} keywords absent from their rows");
+        }
+
+        /// Report every rule whose regex names no keyword on its own row.
+        ///
+        /// The exemption list above is a set of human claims made against the
+        /// binary at one point in time, and #323 is what happens when one rots:
+        /// `system.disk` carried `mount` on the strength of a probe
+        /// (`mount -o remount,ro /`) that really does match no rule, while
+        /// `umount-force` and `mount-bind-root` both needed keywords the row did
+        /// not have. The list's own comment says to derive the probe from the
+        /// pack's RULE list rather than from what the keyword suggests — which is
+        /// exactly what this does, mechanically, for every rule in the registry.
+        ///
+        /// The question asked per rule: can a command match this regex while
+        /// carrying no row keyword as a whole token? Approximated by looking for
+        /// any row keyword appearing as a literal in the regex source. A rule
+        /// with none is not necessarily dead — it may be reached through a path
+        /// literal like `/dev/`, a classifier, or a keyword spelled differently
+        /// in the source — but it is the shape every escape in this class has
+        /// had, and it is the list an audit should work through.
+        ///
+        /// ```text
+        /// cargo test --lib report_rules_whose_regex_names_no_row_keyword -- --ignored --nocapture
+        /// ```
+        ///
+        /// Known-clean classes still appear: semantic `*-unverified` rules and
+        /// classifiers like `credential-file-write` carry no command word by
+        /// design, and SQL-keyed packs are gated by their client's name instead.
+        /// It is a worklist, not a defect list. Retire it if rule reachability
+        /// ever becomes a standing assertion rather than an audit.
+        fn regex_names_keyword(source: &str, keyword: &str) -> bool {
+            let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            if keyword.is_empty() {
+                return false;
+            }
+            // Neutralize escape sequences first. `\bpvremove\b` otherwise
+            // reads as the letter `b` abutting the keyword, which makes the
+            // boundary test reject the single most common way a rule anchors
+            // on its command word — the first draft of this report flagged
+            // 278 of 1124 rules almost entirely for that reason.
+            let mut flattened = Vec::with_capacity(source.len());
+            let mut bytes = source.bytes();
+            while let Some(byte) = bytes.next() {
+                if byte == b'\\' {
+                    flattened.push(b' ');
+                    if bytes.next().is_some() {
+                        flattened.push(b' ');
+                    }
+                } else {
+                    flattened.push(byte);
+                }
+            }
+            let (hay, needle) = (flattened.as_slice(), keyword.as_bytes());
+            hay.windows(needle.len())
+                .enumerate()
+                .filter(|(_, window)| window.eq_ignore_ascii_case(needle))
+                .any(|(at, _)| {
+                    let before_is_word = at > 0 && is_word(hay[at - 1]) && is_word(needle[0]);
+                    let after = at + needle.len();
+                    let after_is_word = after < hay.len()
+                        && is_word(hay[after])
+                        && is_word(needle[needle.len() - 1]);
+                    !before_is_word && !after_is_word
+                })
+        }
+
+        /// The helper above is the whole report, so it gets its own pins.
+        ///
+        /// Its first draft had no escape handling and flagged 278 of 1124 rules,
+        /// nearly all of them because `\bfoo\b` reads as the letter `b` abutting
+        /// the keyword. A reporting tool that cries wolf is worse than none.
+        #[test]
+        fn regex_names_keyword_matches_tokens_not_substrings() {
+            // The defect this whole class is about.
+            assert!(!regex_names_keyword(r"umount\s+.*-[a-z]*f", "mount"));
+            assert!(regex_names_keyword(r"umount\s+.*-[a-z]*f", "umount"));
+            // `\b` must not count as the letter `b`.
+            assert!(regex_names_keyword(r"\bpvremove\b", "pvremove"));
+            assert!(regex_names_keyword(r"\bshutdown\b", "shutdown"));
+            // A keyword that is genuinely absent stays absent.
+            assert!(!regex_names_keyword(r"\bpvremove\b", "vgremove"));
+            // Path-shaped keywords have non-word edges of their own.
+            assert!(regex_names_keyword(r"tee\s+/dev/sd[a-z]", "/dev/"));
+            // Case-insensitive, matching the automaton.
+            assert!(regex_names_keyword(r"(?i)Remove-Item", "remove-item"));
+            assert!(!regex_names_keyword("", "mount"));
+        }
+
+        #[test]
+        #[ignore = "reporting tool, not an assertion"]
+        fn report_rules_whose_regex_names_no_row_keyword() {
+            let mut flagged = 0usize;
+            let mut total = 0usize;
+            for entry in &PACK_ENTRIES {
+                let Some(pack) = REGISTRY.get(entry.id) else {
+                    continue;
+                };
+                let mut bare: Vec<&str> = Vec::new();
+                for pattern in &pack.destructive_patterns {
+                    total += 1;
+                    let source = pattern.regex.as_str();
+                    if entry
+                        .keywords
+                        .iter()
+                        .any(|keyword| regex_names_keyword(source, keyword))
+                    {
+                        continue;
+                    }
+                    // A rule scoped to declared executables is gated by those,
+                    // not by its regex text.
+                    if pattern.executables.is_some_and(|executables| {
+                        executables.iter().any(|executable| {
+                            entry
+                                .keywords
+                                .iter()
+                                .any(|keyword| regex_names_keyword(executable, keyword))
+                        })
+                    }) {
+                        continue;
+                    }
+                    bare.push(pattern.name.unwrap_or("<unnamed>"));
+                }
+                if bare.is_empty() {
+                    continue;
+                }
+                flagged += bare.len();
+                println!("{}: {bare:?}", entry.id);
+            }
+            println!(
+                "\n{flagged} of {total} rules name no keyword from their own row; \
+                 each needs a command probe before it can be called reachable"
+            );
+        }
+
+        /// Neither list may outlive what it describes.
+        ///
+        /// An exemption for a keyword that has since been added to its row, or that
+        /// its pack no longer declares, is stale — and a stale exemption is how a
+        /// real omission gets waved through later.
+        #[test]
+        fn keyword_coverage_exemptions_have_no_stale_entries() {
+            for (pack_id, keyword) in KEYWORDS_DEAD_BUT_COVERED {
+                let entry = PACK_ENTRIES
+                    .iter()
+                    .find(|entry| entry.id == *pack_id)
+                    .unwrap_or_else(|| panic!("unknown pack id in exemption list: {pack_id}"));
+                assert!(
+                    !entry.keywords.contains(keyword),
+                    "{pack_id}: {keyword:?} is in PACK_ENTRIES now — drop it from \
+                     KEYWORDS_DEAD_BUT_COVERED"
+                );
+                let pack = REGISTRY
+                    .get(pack_id)
+                    .unwrap_or_else(|| panic!("pack {pack_id} should be retrievable"));
+                assert!(
+                    pack.keywords.contains(keyword),
+                    "{pack_id}: {keyword:?} is no longer declared by the pack — drop it \
+                     from KEYWORDS_DEAD_BUT_COVERED"
+                );
+            }
+        }
+
+        /// Packs whose rules key on a URL path, and the path they key on.
+        ///
+        /// A vendor name is not a usable gate for a self-hosted product: the
+        /// server is reached at whatever hostname the operator chose, so a row
+        /// carrying only the vendor name lets its own API rules fire by
+        /// coincidence and not otherwise (#447). `monitoring.prometheus` set
+        /// the precedent by carrying `/api/dashboards` beside `grafana-cli`.
+        ///
+        /// SaaS-only products are deliberately absent: `launchdarkly` and
+        /// `split` anchor on `app.launchdarkly.com` and `api.split.io`, which
+        /// contain the vendor name, so their rows already reach them.
+        const API_PATH_TRIGGERS: &[(&str, &str)] = &[
+            ("featureflags.flipt", "/api/v1/"),
+            ("featureflags.unleash", "/api/admin/"),
+            ("monitoring.prometheus", "/api/dashboards"),
+            // Kubernetes is self-hosted by definition, and a raw API call
+            // carries no "kubectl" at all (#449).
+            ("kubernetes.kubectl", "/api/v1/"),
+            ("kubernetes.kubectl", "/apis/"),
+        ];
+
+        /// A rule that matches an HTTP client needs that client in the gate.
+        ///
+        /// The global quick reject reads keywords only from spans that
+        /// execute; a quoted URL is data there. A row gated only on URL
+        /// fragments (`9200`, `/api/v1/`, `api.stripe.com`) therefore skipped
+        /// its own pack for `curl -X DELETE '<url>'` -- the usual spelling --
+        /// while the unquoted spelling denied. The client stays outside the
+        /// quotes, so it is the keyword that reliably reaches these rules.
+        /// Derived from the regex sources, so a new curl-keyed rule is covered
+        /// without a table row.
+        #[test]
+        fn a_rule_that_matches_an_http_client_has_that_client_in_its_gate() {
+            // These match curl beside an anchor that is never inside the URL,
+            // and their rows carry that anchor: `--mail-rcpt`/`--mail-from`
+            // (curl's SMTP mode needs a recipient flag to send anything) and
+            // `iex`/`Invoke-Expression` (the download-and-execute pipe).
+            const ANCHORED_OUTSIDE_THE_URL: &[&str] = &[
+                "careful_company_running_windows.email",
+                "careful_company_running_windows.guardrails",
+            ];
+            let mut missing = Vec::new();
+            for entry in &PACK_ENTRIES {
+                if ANCHORED_OUTSIDE_THE_URL.contains(&entry.id) {
+                    continue;
+                }
+                let Some(pack) = REGISTRY.get(entry.id) else {
+                    continue;
+                };
+                for (client, marker) in [("curl", "curl"), ("http", r"http\s")] {
+                    let keyed = pack
+                        .destructive_patterns
+                        .iter()
+                        .any(|p| p.regex.as_str().contains(marker));
+                    if keyed && !entry.keywords.contains(&client) {
+                        missing.push(format!("{}: {client:?}", entry.id));
+                    }
+                }
+            }
+            assert!(
+                missing.is_empty(),
+                "these packs have rules matching an HTTP client that their PACK_ENTRIES \
+                 row does not carry, so quoting the URL skips the pack:\n  {}",
+                missing.join("\n  ")
+            );
+        }
+
+        /// A rule keyed on a URL path needs that path in the gate.
+        ///
+        /// `registry_keywords_cover_every_pack_declared_keyword` above compares
+        /// the two keyword lists against each other, so it passes when a
+        /// trigger is missing from *both* — which is exactly how #447 hid. This
+        /// checks the lists against what the rules actually match on instead.
+        ///
+        /// It is a table and not a derivation because a regex's literal anchors
+        /// are not machine-readable here; adding a pack with a URL-keyed rule
+        /// means adding a row.
+        #[test]
+        fn a_rule_keyed_on_a_url_path_has_that_path_in_its_gate() {
+            for (pack_id, path) in API_PATH_TRIGGERS {
+                let entry = PACK_ENTRIES
+                    .iter()
+                    .find(|entry| entry.id == *pack_id)
+                    .unwrap_or_else(|| panic!("unknown pack id: {pack_id}"));
+                assert!(
+                    entry.keywords.contains(path),
+                    "{pack_id}: PACK_ENTRIES must carry {path:?} — it is the gate that \
+                     decides, and the rule keyed on that path cannot fire without it"
+                );
+                let pack = REGISTRY
+                    .get(pack_id)
+                    .unwrap_or_else(|| panic!("pack {pack_id} should be retrievable"));
+                assert!(
+                    pack.keywords.contains(path),
+                    "{pack_id}: the pack must declare {path:?} too, so the two lists agree"
                 );
             }
         }

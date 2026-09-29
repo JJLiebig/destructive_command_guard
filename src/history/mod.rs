@@ -64,6 +64,24 @@ pub const ENV_HISTORY_DB_PATH: &str = "DCG_HISTORY_DB";
 /// Environment variable to disable history collection entirely.
 pub const ENV_HISTORY_DISABLED: &str = "DCG_HISTORY_DISABLED";
 
+/// Opt in to terse history lifecycle diagnostics on stderr (`1` or `true`).
+///
+/// These report acknowledgement deadlines and intentional busy drops without
+/// recording commands or changing the hook's timeout, retry, or drop policy.
+/// They also let subprocess persistence tests distinguish a known best-effort
+/// omission from unexplained data loss. Normal robot/hook output stays silent.
+pub const ENV_HISTORY_DIAGNOSTICS: &str = "DCG_HISTORY_DIAGNOSTICS";
+
+fn history_diagnostic(status: &str, detail: std::fmt::Arguments<'_>) {
+    if env::var(ENV_HISTORY_DIAGNOSTICS)
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        use std::io::Write as _;
+        // Diagnostics must never turn a closed stderr pipe into a hook panic.
+        let _ = writeln!(std::io::stderr(), "[dcg-history] status={status} {detail}");
+    }
+}
+
 /// Whether [`ENV_HISTORY_DISABLED`] is set to `1` or `true` (case-insensitive).
 #[must_use]
 pub fn history_disabled_by_env() -> bool {
@@ -194,10 +212,10 @@ fn existing_legacy_db_path() -> Option<PathBuf> {
             bases.push(xdg);
         }
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         bases.push(home.join(".config"));
     }
-    if let Some(native) = dirs::config_dir() {
+    if let Some(native) = crate::config::user_config_dir() {
         bases.push(native);
     }
     bases
@@ -210,8 +228,8 @@ fn existing_legacy_db_path() -> Option<PathBuf> {
 fn default_state_db_path() -> PathBuf {
     state_db_path_from(
         env::var_os("XDG_STATE_HOME").as_deref(),
-        dirs::home_dir().as_deref(),
-        dirs::data_local_dir().as_deref(),
+        crate::config::home_dir().as_deref(),
+        crate::config::user_data_local_dir().as_deref(),
     )
 }
 
@@ -306,7 +324,8 @@ impl HistoryFlushHandle {
     /// Request a flush and wait for at most `timeout`.
     ///
     /// Returns `true` only when the worker acknowledged that every entry
-    /// queued before this request was processed.
+    /// queued before this request was processed. Processing can intentionally
+    /// drop best-effort telemetry; this is not a durability acknowledgement.
     #[must_use]
     pub fn flush_sync_with_timeout(&self, timeout: Duration) -> bool {
         let (ack_tx, ack_rx) = mpsc::channel();
@@ -352,6 +371,12 @@ impl HistoryWriter {
                     Ok(db) => history_worker(db, receiver, worker_config),
                     Err(e) => {
                         error!(error = %e, "Failed to open history DB in worker thread");
+                        let status = if is_contention_error(&e) {
+                            "busy_drop"
+                        } else {
+                            "storage_error"
+                        };
+                        history_diagnostic(status, format_args!("phase=open"));
                         // Drain the receiver so senders don't block
                         drop(receiver);
                     }
@@ -365,6 +390,7 @@ impl HistoryWriter {
                     error = %e,
                     "Failed to spawn history writer thread - history collection disabled"
                 );
+                history_diagnostic("worker_error", format_args!("phase=spawn"));
                 return Self::disabled();
             }
         };
@@ -440,7 +466,7 @@ impl HistoryWriter {
     /// Request a flush and wait for at most `timeout`.
     ///
     /// Returns `true` for a disabled writer or when the storage worker
-    /// acknowledges the flush before the deadline.
+    /// acknowledges processing before the deadline, not necessarily persistence.
     #[must_use]
     pub fn flush_sync_with_timeout(&self, timeout: Duration) -> bool {
         self.flush_handle()
@@ -477,8 +503,21 @@ impl Drop for HistoryWriter {
                 if let Some(deadline) = self.drop_wait_deadline {
                     // Hook mode never lets best-effort telemetry extend the
                     // guarded decision beyond its absolute deadline.
-                    let timeout = deadline.saturating_duration_since(Instant::now());
-                    let _ = ack_rx.recv_timeout(timeout);
+                    let started = Instant::now();
+                    let timeout = deadline.saturating_duration_since(started);
+                    let status = match ack_rx.recv_timeout(timeout) {
+                        Ok(()) => "shutdown_complete",
+                        Err(mpsc::RecvTimeoutError::Timeout) => "shutdown_timeout",
+                        Err(mpsc::RecvTimeoutError::Disconnected) => "worker_disconnected",
+                    };
+                    history_diagnostic(
+                        status,
+                        format_args!(
+                            "timeout_ms={} elapsed_ms={}",
+                            timeout.as_millis(),
+                            started.elapsed().as_millis()
+                        ),
+                    );
                 } else {
                     // Library and CLI callers without a hook deadline receive
                     // the conventional writer guarantee: queued entries are
@@ -522,11 +561,54 @@ fn generate_session_id() -> String {
     )
 }
 
+/// No timer is armed for an empty batch unless periodic pruning is enabled.
+/// In particular, an expired flush timer must not make an idle or disabled
+/// worker poll the channel with a zero timeout forever.
+fn history_receive_timeout(
+    config: &WorkerConfig,
+    batch_empty: bool,
+    history_disabled: bool,
+    last_flush: Instant,
+    last_prune_check: Instant,
+    now: Instant,
+) -> Option<Duration> {
+    if history_disabled {
+        return None;
+    }
+    let flush = (!batch_empty).then(|| {
+        config
+            .flush_interval
+            .saturating_sub(now.saturating_duration_since(last_flush))
+    });
+    let prune = config.auto_prune.then(|| {
+        config
+            .prune_check_interval
+            .saturating_sub(now.saturating_duration_since(last_prune_check))
+    });
+    match (flush, prune) {
+        (Some(flush), Some(prune)) => Some(flush.min(prune)),
+        (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
+        (None, None) => None,
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
-fn history_worker(
+fn history_worker(db: HistoryDb, receiver: mpsc::Receiver<HistoryMessage>, config: WorkerConfig) {
+    run_history_worker(db, config, |timeout| match timeout {
+        Some(timeout) => receiver.recv_timeout(timeout),
+        None => receiver
+            .recv()
+            .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+    });
+}
+
+/// Keep receipt of the next message separate from processing it. Besides
+/// allowing deterministic mailbox tests with real SQLite, this makes the
+/// flush barrier explicit: never consume messages after a flush before its ack.
+fn run_history_worker(
     mut db: HistoryDb,
-    receiver: mpsc::Receiver<HistoryMessage>,
     config: WorkerConfig,
+    mut receive: impl FnMut(Option<Duration>) -> Result<HistoryMessage, mpsc::RecvTimeoutError>,
 ) {
     let mut batch: Vec<CommandEntry> = Vec::with_capacity(config.batch_size);
     let mut last_flush = Instant::now();
@@ -539,6 +621,7 @@ fn history_worker(
     // immediately brings it back under the configured limit.
     if config.auto_prune {
         check_and_prune(&db, config.retention_days);
+        last_prune_check = Instant::now();
     }
 
     let mut history_disabled = match db.enforce_size_limit(config.max_size_bytes) {
@@ -556,22 +639,40 @@ fn history_worker(
                 max_size_bytes = config.max_size_bytes,
                 "Failed to enforce history max_size_mb; disabling writes"
             );
+            history_diagnostic("storage_error", format_args!("phase=size_limit"));
             true
         }
     };
 
     loop {
-        // Use recv_timeout to enable periodic flushing
-        let timeout = config.flush_interval.saturating_sub(last_flush.elapsed());
-        match receiver.recv_timeout(timeout) {
+        let timeout = history_receive_timeout(
+            &config,
+            batch.is_empty(),
+            history_disabled,
+            last_flush,
+            last_prune_check,
+            Instant::now(),
+        );
+        // recv_timeout(0) still returns a buffered message. Service an expired
+        // timer before receiving again, so a constantly readable channel cannot
+        // starve a partial-batch flush or periodic maintenance.
+        let message = if timeout == Some(Duration::ZERO) {
+            Err(mpsc::RecvTimeoutError::Timeout)
+        } else {
+            receive(timeout)
+        };
+        match message {
             Ok(HistoryMessage::Entry(entry)) => {
                 if history_disabled {
                     continue;
                 }
-
+                if batch.is_empty() {
+                    // Measure batch age from its first entry, not worker
+                    // startup, and do not postpone it for subsequent entries.
+                    last_flush = Instant::now();
+                }
                 batch.push(*entry);
 
-                // Flush if batch is full
                 if batch.len() >= config.batch_size {
                     flush_batch_with_recovery(
                         &mut db,
@@ -584,38 +685,9 @@ fn history_worker(
                 }
             }
             Ok(HistoryMessage::Flush(ack)) => {
-                // Drain and flush ALL pending entries before acknowledging.
-                // drain_entries_into_batch caps at batch_size*2, so we loop
-                // to ensure the entire channel is emptied before sending the ack.
-                let mut pending_acks = vec![ack];
-                let mut should_shutdown = false;
-                let mut shutdown_ack = None;
-                loop {
-                    while let Some(msg) =
-                        drain_entries_into_batch(&receiver, &mut batch, config.batch_size)
-                    {
-                        match msg {
-                            HistoryMessage::Flush(pending_ack) => pending_acks.push(pending_ack),
-                            HistoryMessage::Shutdown(ack) => {
-                                shutdown_ack = Some(ack);
-                                should_shutdown = true;
-                                break;
-                            }
-                            HistoryMessage::Entry(_) => unreachable!(),
-                        }
-                    }
-                    if batch.is_empty() || should_shutdown {
-                        break;
-                    }
-                    flush_batch_with_recovery(
-                        &mut db,
-                        &mut batch,
-                        db_path.as_ref(),
-                        &mut history_disabled,
-                        config.max_size_bytes,
-                    );
-                }
-                // Final flush for any remaining entries
+                // mpsc is FIFO: every entry queued before this marker has
+                // already been handled. Draining *later* messages here makes
+                // the barrier a moving target under sustained producers.
                 flush_batch_with_recovery(
                     &mut db,
                     &mut batch,
@@ -624,39 +696,12 @@ fn history_worker(
                     config.max_size_bytes,
                 );
                 last_flush = Instant::now();
-                // Send all pending acks
-                for pending_ack in pending_acks {
-                    let _ = pending_ack.send(());
-                }
-                if should_shutdown {
-                    // The shutdown acknowledgement is also a connection-close
-                    // barrier. Closing the final SQLite connection performs
-                    // normal WAL close handling; forcing TRUNCATE here would
-                    // add an exclusive-lock round trip to every hook. Drop
-                    // SQLite before waking the caller so an immediate
-                    // hook-style reopen cannot race journal setup.
-                    drop(db);
-                    if let Some(ack) = shutdown_ack {
-                        let _ = ack.send(());
-                    }
-                    return;
-                }
+                let _ = ack.send(());
             }
-            Ok(HistoryMessage::Shutdown(shutdown_ack)) => {
-                // Final flush before shutdown
-                let mut pending_acks = Vec::new();
-                let mut shutdown_acks = vec![shutdown_ack];
-                while let Some(msg) =
-                    drain_entries_into_batch(&receiver, &mut batch, config.batch_size)
-                {
-                    match msg {
-                        HistoryMessage::Flush(pending_ack) => pending_acks.push(pending_ack),
-                        HistoryMessage::Shutdown(pending_ack) => {
-                            shutdown_acks.push(pending_ack);
-                        }
-                        HistoryMessage::Entry(_) => unreachable!(),
-                    }
-                }
+            Ok(HistoryMessage::Shutdown(ack)) => {
+                // HistoryWriter is the only entry producer, and queues this
+                // marker after its final entry. Retained flush handles cannot
+                // extend shutdown by submitting requests after the marker.
                 flush_batch_with_recovery(
                     &mut db,
                     &mut batch,
@@ -664,21 +709,14 @@ fn history_worker(
                     &mut history_disabled,
                     config.max_size_bytes,
                 );
-                // Send all pending acks before shutdown
-                for pending_ack in pending_acks {
-                    let _ = pending_ack.send(());
-                }
-                // See the flush-plus-shutdown path above: acknowledge only
-                // after the file handles and SQLite locks are gone.
+                // This acknowledgement is also a connection-close barrier.
+                // Do not add an exclusive TRUNCATE checkpoint to hook shutdown.
                 drop(db);
-                for pending_ack in shutdown_acks {
-                    let _ = pending_ack.send(());
-                }
+                let _ = ack.send(());
                 return;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Periodic flush on timeout
-                if !batch.is_empty() {
+                if !batch.is_empty() && last_flush.elapsed() >= config.flush_interval {
                     flush_batch_with_recovery(
                         &mut db,
                         &mut batch,
@@ -689,7 +727,6 @@ fn history_worker(
                     last_flush = Instant::now();
                 }
 
-                // Check for auto-prune periodically
                 if !history_disabled
                     && config.auto_prune
                     && last_prune_check.elapsed() >= config.prune_check_interval
@@ -699,7 +736,6 @@ fn history_worker(
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Channel closed, flush and exit
                 debug!("History channel disconnected, performing final flush");
                 flush_batch_with_recovery(
                     &mut db,
@@ -777,13 +813,16 @@ fn flush_batch_with_recovery(
         FlushOutcome::Contended => {
             batch.clear();
             debug!("History database is busy; dropped best-effort telemetry batch");
+            history_diagnostic("busy_drop", format_args!("phase=write"));
         }
         FlushOutcome::CapacityReached => {
             *history_disabled = true;
             batch.clear();
             warn!("History max_size_mb reached; disabling history writes for this process");
+            history_diagnostic("storage_error", format_args!("phase=capacity"));
         }
         FlushOutcome::Fatal => {
+            history_diagnostic("storage_error", format_args!("phase=recovery"));
             warn!("Detected fatal history storage error; attempting DB recovery");
             if recover_history_db(db, db_path, max_size_bytes) {
                 match flush_batch(db, batch) {
@@ -795,6 +834,7 @@ fn flush_batch_with_recovery(
                         debug!(
                             "Recovered history database is busy; dropped best-effort telemetry batch"
                         );
+                        history_diagnostic("busy_drop", format_args!("phase=recovery"));
                     }
                     FlushOutcome::Fatal => {
                         *history_disabled = true;
@@ -817,35 +857,6 @@ fn flush_batch_with_recovery(
                 error!(
                     "History DB recovery unavailable; disabling history writes for this process"
                 );
-            }
-        }
-    }
-}
-
-/// Drain pending entry messages into the batch.
-///
-/// Returns any control message (Flush/Shutdown) encountered during drain
-/// so the caller can handle it properly instead of losing it.
-fn drain_entries_into_batch(
-    receiver: &mpsc::Receiver<HistoryMessage>,
-    batch: &mut Vec<CommandEntry>,
-    batch_size: usize,
-) -> Option<HistoryMessage> {
-    loop {
-        match receiver.try_recv() {
-            Ok(HistoryMessage::Entry(entry)) => {
-                batch.push(*entry);
-                // If batch exceeds limit, return to allow flush
-                if batch.len() >= batch_size * 2 {
-                    return None;
-                }
-            }
-            Ok(msg @ (HistoryMessage::Flush(_) | HistoryMessage::Shutdown(_))) => {
-                // Return control message so caller can handle it
-                return Some(msg);
-            }
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
-                return None;
             }
         }
     }
@@ -957,6 +968,7 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
                                 return FlushOutcome::Fatal;
                             }
                             error_count += 1;
+                            history_diagnostic("storage_error", format_args!("phase=insert"));
                             // Log first few errors, then summarize
                             if error_count <= 3 {
                                 error!(
@@ -1009,6 +1021,7 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
                         command = %entry.command,
                         "Failed to insert history entry"
                     );
+                    history_diagnostic("storage_error", format_args!("phase=insert"));
                 }
             }
         }
@@ -1075,6 +1088,278 @@ fn redact_for_history(command: &str, mode: HistoryRedactionMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_and_disabled_workers_have_no_flush_poll_timer() {
+        let config = WorkerConfig::default();
+        let started = Instant::now();
+        let much_later = started + Duration::from_secs(7 * 24 * 3600);
+        assert_eq!(
+            history_receive_timeout(&config, true, false, started, started, much_later),
+            None,
+            "an expired empty-batch timer must not busy-spin"
+        );
+        let config = WorkerConfig {
+            auto_prune: true,
+            ..config
+        };
+        assert_eq!(
+            history_receive_timeout(&config, true, true, started, started, much_later),
+            None,
+            "a disabled worker must wait for messages, not run maintenance"
+        );
+    }
+
+    #[test]
+    fn pending_batch_timer_expires_without_a_quiet_channel() {
+        let config = WorkerConfig::default();
+        let started = Instant::now();
+        assert_eq!(
+            history_receive_timeout(&config, false, false, started, started, started),
+            Some(config.flush_interval)
+        );
+        assert_eq!(
+            history_receive_timeout(
+                &config,
+                false,
+                false,
+                started,
+                started,
+                started + config.flush_interval
+            ),
+            Some(Duration::ZERO),
+            "the batch deadline must be serviced even when a message is ready"
+        );
+    }
+
+    #[test]
+    fn idle_pruning_and_batch_flush_use_the_earliest_deadline() {
+        let config = WorkerConfig {
+            auto_prune: true,
+            flush_interval: Duration::from_secs(10),
+            prune_check_interval: Duration::from_secs(30),
+            ..WorkerConfig::default()
+        };
+        let started = Instant::now();
+        let now = started + Duration::from_secs(25);
+        assert_eq!(
+            history_receive_timeout(&config, true, false, now, started, now),
+            Some(Duration::from_secs(5)),
+            "an idle writer must still wake for pruning"
+        );
+        assert_eq!(
+            history_receive_timeout(&config, false, false, now, started, now),
+            Some(Duration::from_secs(5)),
+            "maintenance must not wait for a younger batch"
+        );
+        assert_eq!(
+            history_receive_timeout(&config, false, false, now, now, now),
+            Some(Duration::from_secs(10)),
+            "flushing must not wait for a later maintenance check"
+        );
+    }
+
+    fn persisted_test_commands(path: &Path) -> Vec<String> {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open read-only observer");
+        let mut statement = connection
+            .prepare("SELECT command FROM commands ORDER BY id")
+            .expect("prepare persisted command query");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("query persisted commands")
+            .collect::<Result<Vec<String>, _>>()
+            .expect("read persisted commands")
+    }
+
+    #[test]
+    fn flush_acknowledges_its_fifo_prefix_before_receiving_more_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("flush-prefix.db");
+        let db = HistoryDb::open(Some(path.clone())).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        // More than several batches: a flush must cover *all* prior entries,
+        // but neither a later entry nor a later control message.
+        for index in 0..257 {
+            sender
+                .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                    command: format!("before-{index}"),
+                    ..Default::default()
+                })))
+                .unwrap();
+        }
+        let (first_tx, first_rx) = mpsc::channel();
+        let (empty_tx, empty_rx) = mpsc::channel();
+        let (last_tx, last_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        sender.send(HistoryMessage::Flush(first_tx)).unwrap();
+        sender.send(HistoryMessage::Flush(empty_tx)).unwrap();
+        sender
+            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                command: "after-marker".to_string(),
+                ..Default::default()
+            })))
+            .unwrap();
+        sender.send(HistoryMessage::Flush(last_tx)).unwrap();
+        sender.send(HistoryMessage::Shutdown(shutdown_tx)).unwrap();
+        drop(sender);
+
+        let mut received = 0;
+        run_history_worker(db, WorkerConfig::default(), |_| {
+            match received {
+                258 => {
+                    first_rx.try_recv().expect("ack before the next receive");
+                    let expected: Vec<_> = (0..257).map(|i| format!("before-{i}")).collect();
+                    assert_eq!(persisted_test_commands(&path), expected);
+                }
+                259 => {
+                    empty_rx
+                        .try_recv()
+                        .expect("consecutive empty flush acknowledged");
+                }
+                261 => {
+                    last_rx
+                        .try_recv()
+                        .expect("later flush acknowledged independently");
+                    assert_eq!(persisted_test_commands(&path).len(), 258);
+                }
+                _ => {}
+            }
+            received += 1;
+            receiver
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        });
+        assert_eq!(received, 262);
+        shutdown_rx.try_recv().expect("shutdown acknowledged");
+        assert_eq!(
+            persisted_test_commands(&path).last().unwrap(),
+            "after-marker"
+        );
+    }
+
+    #[test]
+    fn expired_batch_flushes_before_receiving_an_already_queued_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ready-channel.db");
+        let db = HistoryDb::open(Some(path.clone())).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                command: "timer-flush".to_string(),
+                ..Default::default()
+            })))
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        sender.send(HistoryMessage::Shutdown(shutdown_tx)).unwrap();
+        drop(sender);
+        let config = WorkerConfig {
+            // An already-expired timer makes the ordering deterministic:
+            // no sleeps, throughput thresholds, or scheduler assumptions.
+            flush_interval: Duration::ZERO,
+            ..WorkerConfig::default()
+        };
+        let mut received = 0;
+        run_history_worker(db, config, |timeout| {
+            assert_eq!(timeout, None, "empty batches must block rather than poll");
+            if received == 1 {
+                assert_eq!(persisted_test_commands(&path), vec!["timer-flush"]);
+            }
+            received += 1;
+            receiver
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        });
+        assert_eq!(received, 2);
+        shutdown_rx.try_recv().unwrap();
+    }
+
+    #[test]
+    fn shutdown_does_not_acknowledge_requests_queued_after_its_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shutdown-marker.db");
+        let db = HistoryDb::open(Some(path.clone())).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                command: "final-entry".to_string(),
+                ..Default::default()
+            })))
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (late_tx, late_rx) = mpsc::channel();
+        sender.send(HistoryMessage::Shutdown(shutdown_tx)).unwrap();
+        sender.send(HistoryMessage::Flush(late_tx)).unwrap();
+        // Retaining this sender models a cloned flush handle at writer drop.
+        history_worker(db, receiver, WorkerConfig::default());
+        shutdown_rx.try_recv().expect("shutdown completed");
+        assert_eq!(
+            late_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected),
+            "late control requests must not extend the shutdown barrier"
+        );
+        assert_eq!(persisted_test_commands(&path), vec!["final-entry"]);
+        // A mode change requires all other connections to be gone. This is
+        // checked after the shutdown ack, not after a grace-period sleep.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .expect("shutdown must close the writer connection");
+        assert_eq!(mode, "delete");
+        drop(sender);
+    }
+
+    #[test]
+    fn channel_disconnect_flushes_the_final_partial_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("disconnect.db");
+        let db = HistoryDb::open(Some(path.clone())).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        for index in 0..3 {
+            sender
+                .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                    command: format!("last-{index}"),
+                    ..Default::default()
+                })))
+                .unwrap();
+        }
+        drop(sender);
+        history_worker(db, receiver, WorkerConfig::default());
+        assert_eq!(
+            persisted_test_commands(&path),
+            vec!["last-0", "last-1", "last-2"]
+        );
+    }
+
+    #[test]
+    fn flush_timeout_does_not_consume_or_replay_queued_entries() {
+        let (sender, receiver) = mpsc::channel();
+        let flush = HistoryFlushHandle {
+            sender: sender.clone(),
+        };
+        sender
+            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                command: "queued exactly once".to_string(),
+                ..Default::default()
+            })))
+            .unwrap();
+
+        // No worker is running: this must time out, regardless of host speed.
+        assert!(!flush.flush_sync_with_timeout(Duration::ZERO));
+        let HistoryMessage::Entry(entry) = receiver.try_recv().unwrap() else {
+            panic!("timing out must leave the original entry queued");
+        };
+        assert_eq!(entry.command, "queued exactly once");
+        let HistoryMessage::Flush(ack) = receiver.try_recv().unwrap() else {
+            panic!("flush request must follow the entry");
+        };
+        assert!(ack.send(()).is_err(), "expired waiter must be disconnected");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
 
     /// Issue #386: `redaction_mode = "pattern"` is documented as redacting
     /// sensitive values, but for a long time it only truncated *quoted*
@@ -1203,7 +1488,7 @@ mod tests {
 
     #[test]
     fn env_override_expands_tilde_and_relative_paths() {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = crate::config::home_dir() else {
             return;
         };
         let resolved = ResolvedHistoryPath::from_parts(

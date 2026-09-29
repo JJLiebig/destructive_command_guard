@@ -16,8 +16,20 @@ use std::process::{Command, Stdio};
 
 /// Semantic protocol tests must not accidentally become deadline tests when
 /// the host is busy or the full integration suite runs in parallel. Tests that
-/// exercise the production deadline pass their own explicit value instead.
-const SEMANTIC_TEST_TIMEOUT_MS: &str = "5000";
+/// exercise the production deadline pass their own explicit value instead — see
+/// `codex_hook_deadline_exhaustion_is_indeterminate`, which uses 200ms — so
+/// raising this constant cannot weaken the deadline coverage.
+///
+/// 5000ms was not enough. These tests spawn the real binary, which costs ~50ms
+/// unloaded; but on a many-core CI or developer host running all 114 test
+/// binaries in parallel, one spawn can lose two orders of magnitude to
+/// contention. When it does, evaluation hits the hook deadline and dcg returns
+/// its bounded fallback — still a DENY, so the guard behaves correctly, but a
+/// deny with no rule attribution. The assertions here check *which* rule fired,
+/// so they failed intermittently while the product was working exactly as
+/// designed. Observed twice in one session, on different tests, with the
+/// pre-change binary measuring identical latency.
+const SEMANTIC_TEST_TIMEOUT_MS: &str = "30000";
 
 // ---------------------------------------------------------------------------
 // HookOutcome — typed subprocess result with postmortem diagnostics
@@ -237,6 +249,10 @@ pub fn run_hook_raw(json_bytes: &[u8], extra_env: &[(&str, &str)]) -> HookOutcom
         .env("NO_COLOR", "1")
         .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        // The third budget. Raising the other two left the AST matcher on its
+        // 20ms release constant, which no environment could reach, so a
+        // descheduled worker still lost the rule id (#438).
+        .env("DCG_AST_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -304,6 +320,10 @@ pub fn run_hook_raw_with_config(
         .env("NO_COLOR", "1")
         .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        // The third budget. Raising the other two left the AST matcher on its
+        // 20ms release constant, which no environment could reach, so a
+        // descheduled worker still lost the rule id (#438).
+        .env("DCG_AST_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -644,7 +664,10 @@ fn explicit_powershell_tool_decodes_backticks_only_in_shell_syntax() {
         "tool_input": { "command": "g`it branch -`d feature" },
     })
     .to_string();
-    let blocked = run_hook_raw(destructive.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "5000")]);
+    let blocked = run_hook_raw(
+        destructive.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+    );
     assert!(
         blocked.is_codex_block_shape(),
         "PowerShell syntax escapes must not hide git branch -d\n{blocked}"
@@ -659,7 +682,7 @@ fn explicit_powershell_tool_decodes_backticks_only_in_shell_syntax() {
     .to_string();
     let allowed = run_hook_raw(
         option_operand.as_bytes(),
-        &[("DCG_HOOK_TIMEOUT_MS", "5000")],
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
     );
     assert!(
         allowed.is_allow_shape(),
@@ -676,7 +699,10 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
         "tool_input": { "command": "g^it branch ^-d feature" },
     })
     .to_string();
-    let blocked = run_hook_raw(destructive.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "5000")]);
+    let blocked = run_hook_raw(
+        destructive.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+    );
     assert!(
         blocked.is_codex_block_shape(),
         "cmd.exe syntax escapes must not hide git branch -d\n{blocked}"
@@ -691,7 +717,7 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
     .to_string();
     let allowed = run_hook_raw(
         option_operand.as_bytes(),
-        &[("DCG_HOOK_TIMEOUT_MS", "5000")],
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
     );
     assert!(
         allowed.is_allow_shape(),
@@ -699,9 +725,16 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
     );
 }
 
-/// A *proven* Bash dialect must never reinterpret Windows escape syntax: a
-/// backtick or caret in the middle of a word is an ordinary byte to POSIX, so
+/// A *proven* Bash dialect must never reinterpret Windows escape syntax in
+/// the middle of a word: a backtick there is ordinary POSIX syntax, so
 /// `` g`it … `` is not git.
+///
+/// A caret in the COMMAND WORD is the exception: since `f5f6b49` it widens
+/// even a Bash-labelled payload to the deny-wins union
+/// (`segment_command_word_is_cmd_assembled`), because `doc^ker system prune`
+/// otherwise reached an allow while `docker system prune` denied, and nothing
+/// but cmd.exe assembly puts a caret in an executable name. So `g^it branch
+/// ^-d` is judged under the cmd.exe reading too and denies for every label.
 ///
 /// The unknown dialect is a different question. Since #294 it is a deny-wins
 /// *union* rather than a synonym for POSIX: a generic terminal adapter has not
@@ -714,7 +747,10 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
 /// (see `tests/repro_294_unknown_dialect_pack_fanout.rs`).
 #[test]
 fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
-    for command in ["g`it branch -`d feature", "g^it branch ^-d feature"] {
+    for (command, caret_command_word) in [
+        ("g`it branch -`d feature", false),
+        ("g^it branch ^-d feature", true),
+    ] {
         let bash_payload = serde_json::json!({
             "turn_id": "turn-bash-dialect",
             "hook_event_name": "PreToolUse",
@@ -722,12 +758,53 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
             "tool_input": { "command": command },
         })
         .to_string();
-        let bash_outcome =
-            run_hook_raw(bash_payload.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "5000")]);
-        assert!(
-            bash_outcome.is_allow_shape(),
-            "Bash must not reinterpret Windows shell escapes in {command:?}\n{bash_outcome}"
+        let bash_outcome = run_hook_raw(
+            bash_payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
         );
+        // `turn_id` makes this a Codex payload. Codex labels its shell `Bash`
+        // on every platform, but on a Windows host that shell is PowerShell by
+        // default, so the label is down-trusted there (#379,
+        // `codex_host_shell_dialect`) and the escape IS reconstructed.
+        if cfg!(windows) || caret_command_word {
+            assert!(
+                bash_outcome.is_codex_block_shape(),
+                "a Codex Bash payload must adopt the PowerShell/cmd reading of \
+                 {command:?} on a Windows host or when a caret assembles the \
+                 command word\n{bash_outcome}"
+            );
+        } else {
+            assert!(
+                bash_outcome.is_allow_shape(),
+                "Bash must not reinterpret Windows shell escapes in {command:?}\n{bash_outcome}"
+            );
+        }
+
+        // Claude Code's Bash tool is Git Bash on every host, so its label is
+        // never down-trusted for escape syntax alone — only a caret-assembled
+        // command word widens it.
+        let claude_payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let claude_outcome = run_hook_raw(
+            claude_payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        );
+        if caret_command_word {
+            assert!(
+                claude_outcome.is_claude_block_shape(),
+                "a caret-assembled command word widens Claude's Bash too in \
+                 {command:?}\n{claude_outcome}"
+            );
+        } else {
+            assert!(
+                claude_outcome.is_allow_shape(),
+                "Claude's Bash must not reinterpret Windows shell escapes in {command:?}\n{claude_outcome}"
+            );
+        }
 
         let unknown_payload = serde_json::json!({
             "hook_event_name": "PreToolUse",
@@ -737,7 +814,7 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
         .to_string();
         let unknown_outcome = run_hook_raw(
             unknown_payload.as_bytes(),
-            &[("DCG_HOOK_TIMEOUT_MS", "5000")],
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
         );
         assert!(
             unknown_outcome.is_claude_block_shape(),
@@ -1868,7 +1945,8 @@ fn failopen_empty_stdin() {
 
 #[test]
 fn failopen_truncated_json() {
-    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "git reset --ha"#;
+    // Truncated JSON whose visible command is benign still fails open.
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "echo hel"#;
     let outcome = run_hook_raw(payload, &[]);
     assert_eq!(
         outcome.exit_code, 0,
@@ -1877,6 +1955,20 @@ fn failopen_truncated_json() {
     assert!(
         outcome.stdout.is_empty(),
         "no stdout on fail-open\n{outcome}"
+    );
+}
+
+/// An unparseable payload gets the same best-effort scan as an oversized one,
+/// so a destructive command visible in it is judged rather than allowed blind.
+/// `--ha` is Git's unambiguous abbreviation of `--hard`.
+#[test]
+fn truncated_json_with_a_visible_destructive_command_is_denied() {
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "git reset --ha"#;
+    let outcome = run_hook_raw(payload, &[]);
+    assert_eq!(outcome.exit_code, 0, "{outcome}");
+    assert!(
+        String::from_utf8_lossy(&outcome.stdout).contains("\"deny\""),
+        "the visible destructive command must be denied\n{outcome}"
     );
 }
 
@@ -2987,31 +3079,80 @@ fn sequential_vs_parallel_codex_denies_exit_normally() {
 // P2.14.3 — Real HOME not touched by hermetic tests
 // ---------------------------------------------------------------------------
 
+/// Redirecting the home directory must relocate every file dcg writes.
+///
+/// Asserted positively — the writes land inside the redirected home — because
+/// the earlier form (real-home mtime unchanged) returned early wherever `HOME`
+/// is unset, i.e. on every Windows host, which is the one platform where the
+/// redirection did not work: dcg resolved the profile through the known-folder
+/// API and ignored `USERPROFILE`, so a sandboxed run rewrote the operator's real
+/// `~\.claude\settings.json` and minted allow-once grants in the real store
+/// (bd-b2b1). Only `HOME`/`USERPROFILE` are set, no `APPDATA`: the profile
+/// variable alone has to be enough, as `HOME` is on POSIX.
 #[test]
-fn hermetic_tests_do_not_touch_real_home() {
-    let real_home = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h),
-        Err(_) => return, // skip if no real HOME
-    };
-    let real_pending = real_home.join(".config/dcg/pending");
+fn redirected_home_receives_every_hook_write() {
+    let home = make_hermetic_home();
+    let claude_dir = home.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let settings = claude_dir.join("settings.json");
+    std::fs::write(&settings, "{}").unwrap();
 
-    // Record mtime before (if dir exists)
-    let mtime_before = std::fs::metadata(&real_pending)
-        .ok()
-        .and_then(|m| m.modified().ok());
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn dcg process");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(build_claude_payload("git reset --hard HEAD~1").as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "expected a deny; stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    // Run a deny that writes to pending store
-    let outcome = run_codex_hook("git reset --hard HEAD~1");
-    assert!(outcome.is_codex_block_shape());
-    assert_ne!(outcome.home_dir, real_home);
+    // Self-heal repaired the settings file in the redirected profile.
+    let healed = std::fs::read_to_string(&settings).unwrap();
+    assert!(
+        healed.contains("PreToolUse") && healed.contains("dcg"),
+        "self-heal must write the redirected profile's settings.json, got: {healed}"
+    );
 
-    // Verify mtime unchanged
-    let mtime_after = std::fs::metadata(&real_pending)
-        .ok()
-        .and_then(|m| m.modified().ok());
-    assert_eq!(
-        mtime_before, mtime_after,
-        "real HOME pending dir mtime must not change during hermetic test"
+    // The deny's pending record was written somewhere under the redirected home.
+    let mut stack = vec![home.path().to_path_buf()];
+    let mut pending = None;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|n| n == "pending_exceptions.jsonl")
+            {
+                pending = Some(path);
+            }
+        }
+    }
+    let pending =
+        pending.expect("pending_exceptions.jsonl must be written under the redirected home");
+    assert!(
+        std::fs::read_to_string(&pending)
+            .unwrap()
+            .contains("git reset --hard HEAD~1"),
+        "pending record at {} must hold the denied command",
+        pending.display()
     );
 }
 
@@ -3113,8 +3254,8 @@ fn run_codex_heredoc(command: &str) -> HookOutcome {
     run_hook_raw(
         payload.as_bytes(),
         &[
-            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
-            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+            ("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
+            ("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
         ],
     )
 }
@@ -3125,15 +3266,18 @@ fn run_claude_heredoc(command: &str) -> HookOutcome {
     run_hook_raw(
         payload.as_bytes(),
         &[
-            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
-            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+            ("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
+            ("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
         ],
     )
 }
 
 #[test]
 fn heredoc_python_shutil_rmtree_codex_deny() {
-    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    // Non-temp target: #455 gave the recursive-delete rule the same temp
+    // carve-out `rm -rf /tmp/data` has always had, and these tests are about
+    // the hook protocol shape rather than which paths the rule covers.
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/home/example/project')""#;
     let o = run_codex_hook(cmd);
     assert!(
         o.is_codex_block_shape(),
@@ -3151,7 +3295,10 @@ fn heredoc_python_shutil_rmtree_codex_deny() {
 
 #[test]
 fn heredoc_python_shutil_rmtree_claude_deny() {
-    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    // Non-temp target: #455 gave the recursive-delete rule the same temp
+    // carve-out `rm -rf /tmp/data` has always had, and these tests are about
+    // the hook protocol shape rather than which paths the rule covers.
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/home/example/project')""#;
     let o = run_claude_hook(cmd);
     assert!(
         o.is_claude_block_shape(),
@@ -3216,7 +3363,10 @@ fn heredoc_javascript_fs_rmsync_claude_deny() {
 
 #[test]
 fn heredoc_python_cross_protocol_parity() {
-    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    // Non-temp target: #455 gave the recursive-delete rule the same temp
+    // carve-out `rm -rf /tmp/data` has always had, and these tests are about
+    // the hook protocol shape rather than which paths the rule covers.
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/home/example/project')""#;
     let codex = run_codex_hook(cmd);
     let claude = run_claude_hook(cmd);
 

@@ -64,6 +64,8 @@ safe_patterns:                       # Patterns that explicitly allow
 | `keywords` | array | `[]` | Keywords that trigger pattern matching |
 | `destructive_patterns` | array | `[]` | Patterns that block or warn |
 | `safe_patterns` | array | `[]` | Patterns that explicitly allow |
+| `denial_banner` | string | none | Replaces "Destructive Command Detected" in the denial banner (see below) |
+| `denial_trailer` | string | none | Replaces the closing instruction the agent reads (see below) |
 
 ### Destructive Pattern Fields
 
@@ -75,6 +77,84 @@ safe_patterns:                       # Patterns that explicitly allow
 | `description` | string | no | Short reason shown on denial |
 | `explanation` | string | no | Detailed explanation for verbose output |
 | `executables` | array | no | Restrict the rule to segments run by these programs (see below) |
+| `suggestions` | array | no | Safer alternatives. Accepted and validated, **not yet rendered** (see below) |
+| `denial_banner` | string | no | Per-rule override of the pack's `denial_banner` |
+| `denial_trailer` | string | no | Per-rule override of the pack's `denial_trailer` |
+
+### Custom Denial Wording (redirect-style packs)
+
+By default a denial is titled "Destructive Command Detected", and the reason the
+agent reads ends with "ask the user for explicit permission and have them run the
+command manually". For a pack that *redirects*, where the command is fine but
+should go through a sanctioned route, both are wrong. The trailer is also
+actively misleading: it tells the agent to stop and ask a human instead of
+following your `explanation`.
+
+```yaml
+id: example.hosted_ci
+denial_banner: Use the hosted pipeline
+denial_trailer: Run this through the hosted Semaphore pipeline instead; load the /semaphore skill.
+destructive_patterns:
+  - name: sem-direct
+    pattern: '\bsem\b'
+    executables: [sem]
+  - name: terraform-apply
+    pattern: '\bterraform\s+apply\b'
+    denial_trailer: Open a pipeline run for this workspace instead.
+```
+
+A rule's own text wins over the pack's. Only the wording changes. The command is
+still denied, and the `BLOCKED` marker, the rule id and the reason stay dcg's.
+The text reaches the agent, so it is validated when the pack loads: the banner
+is at most 80 characters, the trailer at most 400, and neither may be empty or
+contain control characters (a newline could forge structure in the reason). A
+pack that fails validation does not load.
+
+### Offering Safer Alternatives
+
+> **Status: accepted but not yet rendered.** A `suggestions` array is parsed,
+> validated by `dcg pack validate`, and carried on the compiled rule, but no
+> output path reads it today. Built-in rules render their suggestions from an
+> internal registry keyed by rule id, and an external rule id is not in that
+> registry, so nothing appears in `dcg test`, `dcg explain`, or the hook
+> denial's `remediation`. Authoring the field now is harmless and future-proof;
+> just do not rely on a caller seeing it yet. Put the guidance your users need
+> in `description` and `explanation`, which *are* rendered. Tracked with the
+> denial-text work in
+> [#416](https://github.com/Dicklesworthstone/destructive_command_guard/issues/416).
+
+The intended shape:
+
+```yaml
+destructive_patterns:
+  - name: mytool-force-wipe
+    pattern: mytool\s+.*--force
+    executables: [mytool]
+    description: mytool --force wipes the workspace without confirmation
+    suggestions:
+      - command: mytool status
+        description: Show what --force would remove
+      - command: mytool clean --dry-run
+        description: Preview the removal
+      - command: mytool clean --force
+        description: The narrower removal — still gated, so it needs approval too
+        gated: true
+      - command: mytool wipe --confirm
+        description: Windows-only recovery path
+        platform: windows
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `command` | string | yes | The alternative to run |
+| `description` | string | yes | Why it is safer, in one line |
+| `gated` | bool | no | `true` marks an alternative dcg *also* gates (default `false`) |
+| `platform` | string | no | `all` (default), `linux`, `macos`, `windows`, `bsd` |
+
+Set `gated: true` on any alternative dcg would itself deny. The intent is that
+a rendered denial marks it as still requiring approval, so an agent does not
+retry it expecting an allow and burn a turn discovering otherwise — which is
+why the flag is worth setting correctly now even while rendering is pending.
 
 ### Scoping a Rule to Its Executables
 
@@ -367,9 +447,22 @@ reason = "Force push allowed on feature branches"
 # Validate syntax and patterns
 dcg pack validate mypack.yaml
 
-# Test against specific commands
-dcg test --pack-path mypack.yaml "dangerous-command"
+# Test against specific commands: point a throwaway config at the pack,
+# then select it for the one invocation.
+mkdir -p /tmp/dcg-packtest
+cat > /tmp/dcg-packtest/config.toml <<'TOML'
+[packs]
+custom_paths = ["/abs/path/to/mypack.yaml"]
+TOML
+DCG_CONFIG=/tmp/dcg-packtest/config.toml dcg test "dangerous-command"
+
+# Same route with the full decision trace:
+DCG_CONFIG=/tmp/dcg-packtest/config.toml dcg explain "dangerous-command"
 ```
+
+There is no `--pack-path` flag. A custom pack is loaded through `custom_paths`
+in a config file, and `DCG_CONFIG` is what selects that file for a single
+invocation without touching your real configuration.
 
 ### Q: What happens if schema_version is higher than supported?
 

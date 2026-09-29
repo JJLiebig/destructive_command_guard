@@ -410,7 +410,10 @@ fn run_hook_with_env(payload: &str, extra_env: &[(&str, &str)]) -> std::process:
         .env("TMP", &tmp)
         .env("NO_COLOR", "1")
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
-        .env("DCG_HEREDOC_TIMEOUT_MS", "5000");
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
+        // The AST budget is the third one, and until #438 no environment could
+        // reach it, so a loaded host could still cost this suite a rule id.
+        .env("DCG_AST_TIMEOUT_MS", "5000");
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -709,4 +712,85 @@ fn indeterminate_entry_outranks_a_warn_entry() {
         !stderr.contains("dcg WARNING:"),
         "the non-decisive warn must not also be published.\nstderr: {stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #428 (non-batch field precedence): every command-bearing field is collected
+//
+// The batch branch appended the sibling fields — `toolCall`, `tool_input`,
+// `tool_args` — as extra entries. The fall-through did the opposite: it
+// returned on the first field it found, so a command in a lower-precedence
+// field was never evaluated. Adding an *empty* `toolCalls` array flipped the
+// verdict, which is what showed the difference was accidental.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tool_args_survives_when_tool_input_also_carries_a_command() {
+    let input = parse(
+        r#"{"tool_name":"Bash","tool_input":{"command":"ls"},
+            "tool_args":{"command":"rm -rf /"}}"#,
+    );
+    let extracted = extract_command_with_context(&input).expect("must extract");
+    assert_eq!(
+        extracted.command, "ls",
+        "precedence of the primary is unchanged"
+    );
+    assert_eq!(
+        extracted.additional_commands,
+        vec![("rm -rf /".to_string(), ShellDialect::Posix)],
+        "the sibling field must be evaluated, not dropped"
+    );
+}
+
+#[test]
+fn an_empty_tool_calls_array_no_longer_changes_the_reading() {
+    let with_empty_batch = parse(
+        r#"{"tool_name":"Bash","tool_calls":[],"tool_input":{"command":"ls"},
+            "tool_args":{"command":"rm -rf /"}}"#,
+    );
+    let without_batch = parse(
+        r#"{"tool_name":"Bash","tool_input":{"command":"ls"},
+            "tool_args":{"command":"rm -rf /"}}"#,
+    );
+    let a = extract_command_with_context(&with_empty_batch).expect("must extract");
+    let b = extract_command_with_context(&without_batch).expect("must extract");
+    assert_eq!(a.command, b.command);
+    assert_eq!(
+        a.additional_commands, b.additional_commands,
+        "an empty batch array must not decide which fields are read"
+    );
+}
+
+#[test]
+fn a_singular_tool_call_still_leads_and_no_longer_hides_its_siblings() {
+    // Antigravity nests the command under `toolCall.args.CommandLine`; that
+    // stays the primary, and the other fields now ride along.
+    let input = parse(
+        r#"{"tool_name":"Bash","toolCall":{"name":"run_command","args":{"CommandLine":"echo hi"}},
+            "tool_input":{"command":"ls"},"tool_args":{"command":"rm -rf /"}}"#,
+    );
+    let extracted = extract_command_with_context(&input).expect("must extract");
+    assert_eq!(extracted.command, "echo hi");
+    assert_eq!(
+        extracted.additional_commands,
+        vec![
+            ("ls".to_string(), ShellDialect::Posix),
+            ("rm -rf /".to_string(), ShellDialect::Posix),
+        ]
+    );
+}
+
+#[test]
+fn a_single_command_field_still_extracts_exactly_one_command() {
+    for json in [
+        r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#,
+        r#"{"tool_name":"Bash","tool_args":{"command":"rm -rf /"}}"#,
+    ] {
+        let extracted = extract_command_with_context(&parse(json)).expect("must extract");
+        assert_eq!(extracted.command, "rm -rf /");
+        assert!(
+            extracted.additional_commands.is_empty(),
+            "one field means one command: {json}"
+        );
+    }
 }

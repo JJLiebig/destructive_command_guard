@@ -191,6 +191,7 @@ pub fn create_pack() -> Pack {
             "drop",
             "truncate",
             "GRANT",
+            "UPDATE",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -231,10 +232,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             High,
             "Materialize and review the exact SQL before piping or redirecting it into the client."
         ),
-        // DROP DATABASE
+        // DROP DATABASE. In MySQL/MariaDB `DROP SCHEMA` is a synonym, not a
+        // narrower operation, so it shares the rule id.
         destructive_pattern!(
             "drop-database",
-            r"(?i)\bDROP\s+DATABASE\b",
+            r"(?i)\bDROP\s+(?:DATABASE|SCHEMA)\b",
             "DROP DATABASE permanently deletes the entire database. Verify and back up first.",
             Critical,
             "DROP DATABASE completely removes a database and ALL its contents:\n\n\
@@ -276,7 +278,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // Keep byte-identical to `crate::packs::database::TRUNCATE_TABLE_PATTERN`
             // (asserted by `truncate_table_pattern_is_shared`); the rationale
             // for every constraint lives on that constant. Issue #403.
-            r#"(?i)(?:^|[;"'`])\s*(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
+            r#"(?i)(?:(?:^|[;"'`])(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*|\r?\n(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*(?=TRUNCATE\s+TABLE\b)|/\*!\d*\s*)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|\*/|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
             "TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL.",
             High,
             "TRUNCATE is faster than DELETE but more dangerous in MySQL:\n\n\
@@ -315,6 +317,34 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              SELECT COUNT(*) FROM tablename;  -- all rows!\n  \
              SELECT * FROM tablename LIMIT 10;",
             DELETE_WITHOUT_WHERE_SUGGESTIONS
+        ),
+        // UPDATE without WHERE rewrites every row (same blast radius as the
+        // unscoped DELETE above).
+        destructive_pattern!(
+            "update-without-where",
+            // Keep byte-identical to `crate::packs::database::UPDATE_WITHOUT_WHERE_PATTERN`.
+            r#"(?i)\bUPDATE\s+(?:(?:LOW_PRIORITY|IGNORE|ONLY|OR\s+(?:ROLLBACK|ABORT|REPLACE|FAIL|IGNORE))\s+)*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])(?:\s*\.\s*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\]))?\s+(?:(?:AS\s+)?(?!SET\b)[A-Za-z_]\w*\s+)?SET\b(?:(?!\bWHERE\b)[^;])*(?:;|$)"#,
+            "UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause.",
+            High,
+            "UPDATE without WHERE changes every row in the table. With autocommit on (the \
+             MySQL default) the previous values are gone the moment it runs.\n\n\
+             Scope it:\n  \
+             UPDATE tablename SET col = value WHERE condition;\n\n\
+             Preview what would change:\n  \
+             SELECT COUNT(*) FROM tablename WHERE condition;"
+        ),
+        // ALTER TABLE … DROP COLUMN (and DROP PARTITION) deletes data in every
+        // row; index/key/constraint drops are metadata only.
+        destructive_pattern!(
+            "drop-column",
+            // Keep byte-identical to `crate::packs::database::DROP_COLUMN_PATTERN`.
+            r#"(?i)\bALTER\s+TABLE\b[^;]*?\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION|INDEX|KEY|PRIMARY\s+KEY|FOREIGN\s+KEY|CHECK)\b)[A-Za-z_"`\[]"#,
+            "ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row.",
+            High,
+            "Dropping a column (or a partition) removes its data from every row it covers; \
+             ALTER TABLE is not transactional in MySQL, so there is no rollback.\n\n\
+             Back up the column first:\n  \
+             CREATE TABLE tablename_col_backup AS SELECT id, col FROM tablename;"
         ),
         // mysqladmin drop
         destructive_pattern!(
@@ -527,6 +557,34 @@ mod tests {
         }
     }
 
+    /// A continuation line is a conditional opener: it counts when the explicit
+    /// `TRUNCATE TABLE` spelling follows it.
+    ///
+    /// Regression: constraint 4 originally accepted only text start, `;`, and a
+    /// quote, which under-blocked a statement sitting on a continuation line
+    /// after a SQL comment — it has no `;` before it and is not at text start.
+    /// A bare newline opener would instead re-admit #403, so the `TABLE` keyword
+    /// is the evidence that separates SQL from a wrapped class list.
+    #[test]
+    fn a_continuation_line_opens_a_statement_when_table_is_explicit() {
+        let pack = create_pack();
+        for command in [
+            "mysql -e \"-- clean the table\nTRUNCATE TABLE users\"",
+            "mysql -e \"SET foreign_key_checks=0\nTRUNCATE TABLE users\"",
+            "mysql -e \"-- clean\r\nTRUNCATE TABLE users\"",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "truncate-table");
+        }
+
+        // The #403 class must stay out: a wrapped class list has no `TABLE`.
+        for command in [
+            "echo \"<div class=\\\"p-2\ntruncate flex\\\">\"",
+            "echo \"class=\\\"min-w-0\ntruncate line-through\\\"\"",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
     #[test]
     fn test_drop_database() {
         let pack = create_pack();
@@ -545,6 +603,15 @@ mod tests {
             "DROP DATABASE IF EXISTS mydb;",
             "permanently deletes the entire database",
         );
+        // `DROP SCHEMA` is MySQL's synonym for `DROP DATABASE`.
+        for command in [
+            "DROP SCHEMA mydb;",
+            "mysql -u root -e \"drop schema prod\"",
+            "DROP SCHEMA IF EXISTS mydb",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "drop-database");
+        }
+        assert_allows(&pack, "SELECT schema_name FROM information_schema.schemata");
     }
 
     #[test]

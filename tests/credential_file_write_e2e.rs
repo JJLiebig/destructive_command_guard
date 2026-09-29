@@ -202,6 +202,9 @@ fn credential_file_writes_are_denied_absent_or_existing_for_every_writer() {
         "~/.kube/config",
         "~/.gnupg/gpg-agent.conf",
         "~/.config/gh/hosts.yml",
+        "~/.pgpass",
+        "~/.cargo/credentials.toml",
+        "~/.config/gcloud/application_default_credentials.json",
         "/etc/sudoers",
         "/etc/sudoers.d/agent",
         "/etc/passwd",
@@ -361,4 +364,211 @@ fn allowlisting_the_rule_lifts_only_that_rule() {
         verdict("echo x > /etc/passwd", home),
         Verdict::Deny("redirect-truncate-root-home")
     );
+}
+
+/// Home roots other than `/home`, `/Users`, `/root` and `/var/root` (#502),
+/// through the real hook: on v0.14.4 the append and `tee -a` rows below were
+/// all allowed, and `/volume1/homes` had no incidental cover for `>` either.
+#[test]
+fn unlisted_home_roots_are_guarded_through_the_hook() {
+    let home = fixture_home();
+    let home = home.path();
+    for root in [
+        "/var/services/homes/luna",
+        "/volume1/homes/luna",
+        "/volume10/homes/luna",
+        "/export/home/luna",
+        "/var/home/luna",
+        "/usr/home/luna",
+    ] {
+        for file in [".ssh/authorized_keys", ".zshrc", ".netrc", ".npmrc"] {
+            let path = format!("{root}/{file}");
+            for command in [
+                format!("echo x >> {path}"),
+                format!("echo x | tee -a {path}"),
+                format!("cp /tmp/src {path}"),
+            ] {
+                assert_ne!(verdict(&command, home), Verdict::Allow, "{command}");
+            }
+        }
+        assert_eq!(
+            verdict(&format!("echo x >> {root}/notes.txt"), home),
+            Verdict::Allow,
+            "{root}: ordinary files stay writable"
+        );
+        assert_eq!(
+            verdict(&format!("echo x >> {root}/.ssh/known_hosts"), home),
+            Verdict::Allow,
+            "{root}: the known_hosts append carve-out holds"
+        );
+    }
+    // `.` ahead of the root, found probing the same fix.
+    for command in [
+        "echo x >> /home/./luna/.netrc",
+        "echo x >> /./home/luna/.netrc",
+        "echo x >> /home/../home/luna/.netrc",
+    ] {
+        assert_ne!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+}
+
+/// The hook's own `$HOME` is a home root wherever it lives (#502), e.g. a
+/// container's `HOME=/app` or a NAS share no fixed list names.
+#[test]
+fn the_runtime_home_is_a_home_root_through_the_hook() {
+    let home = tempfile::Builder::new()
+        .prefix("nashome")
+        .tempdir()
+        .expect("temp home");
+    let root = home.path();
+    fs::create_dir_all(root.join("xdg_config/dcg")).expect("fixture dir");
+    let spelled = root.to_str().expect("utf-8 temp path");
+    for file in [".netrc", ".npmrc", ".pypirc", ".zshrc"] {
+        let command = format!("echo x >> {spelled}/{file}");
+        assert_eq!(
+            verdict(&command, root),
+            Verdict::Deny("credential-file-write"),
+            "{command}"
+        );
+    }
+    assert_eq!(
+        verdict(&format!("echo x >> {spelled}/notes.txt"), root),
+        Verdict::Allow
+    );
+}
+
+/// Spellings of a home or system root that the review of #502 found still
+/// open through the hook: a quote splitting the root's name (the candidate
+/// gate searched the raw text for `/home/`), a backslash-escaped first
+/// character of a redirect target (no core.filesystem keyword matched `> \`,
+/// so the pack never ran), and prefixes that only re-spell `/` — macOS's
+/// `/System/Volumes/Data` firmlink and Linux's `/proc/<pid>/root` — plus root's
+/// real macOS home `/private/var/root`. All were allowed before the fix.
+#[test]
+fn quoted_escaped_and_aliased_roots_are_guarded_through_the_hook() {
+    let home = fixture_home();
+    let home = home.path();
+    for command in [
+        "echo x >> \"/home\"/luna/.netrc",
+        "echo x >> /ho\"me\"/luna/.netrc",
+        "echo x >> /var/services/'homes'/luna/.netrc",
+        "echo x >> /volume1/ho\"mes\"/luna/.npmrc",
+        "echo x >> \\/home/luna/.netrc",
+        "echo x > \\/etc/passwd",
+        "echo x >\\/etc/sudoers",
+        "echo x >> /System/Volumes/Data/Users/luna/.netrc",
+        "echo x >> /System/Volumes/Data/private/etc/sudoers",
+        "cp /tmp/src /System/Volumes/Data/Users/luna/.pypirc",
+        "echo x >> /proc/self/root/home/luna/.netrc",
+        "echo x | tee -a /proc/1/root/etc/sudoers",
+        "echo x >> /private/var/root/.netrc",
+    ] {
+        assert_ne!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+    for command in [
+        "echo x >> \"/home\"/luna/notes.txt",
+        "echo x >> /System/Volumes/Data/Users/luna/notes.txt",
+        "echo x >> /proc/self/root/tmp/out.txt",
+    ] {
+        assert_eq!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+}
+
+/// Found in the second review of #502, all allowed through the hook on
+/// c8b77a1: ANSI-C numeric escapes spelling a separator, a glob, brace list
+/// or expansion in a root's own name (`/e?c` also carried no gate needle),
+/// `/proc/<pid>/task/<tid>/root`, macOS's `/.nofollow` and
+/// `/Volumes/Macintosh HD`, and a base nothing can read — a relative climb out
+/// of the working directory (whose `> ..` target selected no pack), a
+/// process's working directory, or a substitution spelling the root — plus
+/// zsh/extglob alternation in a root's name and a Windows profile mounted by
+/// WSL or Git Bash.
+#[test]
+fn rewritten_and_unknown_base_roots_are_guarded_through_the_hook() {
+    let home = fixture_home();
+    let home = home.path();
+    for command in [
+        "echo x >> $'\\x2fetc/sudoers'",
+        "echo x >> /home/luna/$'\\x2enetrc'",
+        "echo x >> /e?c/sudoers",
+        "echo x | tee -a /h?me/luna/.netrc",
+        "echo x >> /{home,tmp}/luna/.netrc",
+        "cp ./x /*/luna/.npmrc",
+        "echo x >> /et${x}c/sudoers",
+        "echo x >> /proc/self/task/1/root/home/luna/.netrc",
+        "echo x >> /.nofollow/private/etc/sudoers",
+        "echo x >> '/Volumes/Macintosh HD/Users/luna/.netrc'",
+        "echo x >> ../../../../../../etc/sudoers",
+        "echo x >> ./../../../../etc/sudoers",
+        "echo x >> /proc/1/cwd/etc/sudoers",
+        "echo x >> $x/etc/sudoers",
+        "echo x >> $(printf /)etc/sudoers",
+        "echo x >> `printf /`etc/sudoers",
+        "echo x | tee -a /(etc|x)/sudoers",
+        "echo x >> /@(etc)/sudoers",
+        "echo x >> /mnt/c/Users/luna/.netrc",
+        "echo x >> /c/Users/luna/.npmrc",
+    ] {
+        assert_ne!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+    for command in [
+        "echo x >> ../notes.md",
+        "echo x >> ../etc/app.conf",
+        "cp ./x $OUT/passwd",
+        "echo x >> /e?c/notes.txt",
+        "ls src/*.rs > /tmp/files.txt",
+    ] {
+        assert_eq!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+}
+
+/// Third review of #502. A bracket expression whose first member is `]`
+/// (`/e[]t]c` is `/etc`) and a brace list whose alternatives span a `/`
+/// (`/{tmp/x,etc/sudoers}` expands to two words) were allowed; a long run of
+/// rewritable components (`/*/*/…`, `/$x/$x/…`) and a source glob of many
+/// `*?` pairs held the hook for over a minute. The slow ones must answer
+/// within the hook's own budget, and fail closed rather than time out.
+#[test]
+fn bracket_brace_and_pathological_roots_are_guarded_in_bounded_time() {
+    let home = fixture_home();
+    let home = home.path();
+    let deep_stars = format!("echo x >> /{}sudoers", "*/".repeat(5000));
+    let deep_expansions = format!("echo x >> /{}sudoers", "$x/".repeat(5000));
+    let star_pairs = format!("cp ./{} ~/.config/gcloud/", "*?".repeat(40));
+    for command in [
+        "echo x >> /e[]t]c/sudoers",
+        "echo x >> /e[!]x]c/sudoers",
+        "echo x >> /[[:lower:]]tc/sudoers",
+        "echo x | tee -a /{etc/sudoers,tmp/x}",
+        "echo x | tee -a /{tmp/x,etc/sudoers}",
+        "cp ./x /{tmp/y,home/luna/.netrc}",
+        "echo x | tee -a /{tmp/x,{var/y,etc/sudoers}}",
+        deep_stars.as_str(),
+        deep_expansions.as_str(),
+    ] {
+        let started = std::time::Instant::now();
+        assert_ne!(verdict(command, home), Verdict::Allow, "{command:.80}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{command:.80} took {:?}",
+            started.elapsed()
+        );
+    }
+    // No gcloud file name is 40 characters long, so this may be allowed; it
+    // must only be decided quickly.
+    let started = std::time::Instant::now();
+    let _ = verdict(&star_pairs, home);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a glob of 40 `*?` pairs took {:?}",
+        started.elapsed()
+    );
+    for command in [
+        "echo x | tee -a /{tmp/x,var/tmp/y}",
+        "echo x > /tmp/{a,b}/c.txt",
+        "echo x >> /e[]x]c/notes.txt",
+        "cp ./*.txt /tmp/out/",
+    ] {
+        assert_eq!(verdict(command, home), Verdict::Allow, "{command}");
+    }
 }

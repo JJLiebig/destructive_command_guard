@@ -24,6 +24,7 @@ Protects against destructive GitHub CLI operations like changing repository visi
 Commands containing these keywords are checked against this pack:
 
 - `gh`
+- `curl`
 
 ### Safe Patterns (Allowed)
 
@@ -41,7 +42,7 @@ These patterns match safe commands that are always allowed:
 | `gh-auth-status` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+auth\s+status\b` |
 | `gh-status` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+status\b` |
 | `gh-api-explicit-get` | `^(?!(?=.*(?:-X\s*\|--method(?:=\|\s+))DELETE\b))gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+api\b.*(?:-X\s*\|--method(?:=\|\s+))GET\b` |
-| `gh-help` | `gh(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+--help(?:\s\|$)` |
+| `gh-help` | `gh(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+--help(?:\s\|$)(?![^;&\|]*--visibility(?:=\|\s))` |
 | `gh-help-short` | `gh(?!(?:\s+[^\s;&\|]+)*?\s+repo\s+edit(?:\s\|$))(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+-h(?:\s\|$)` |
 | `gh-help-topic` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+help(?:\s\|$)` |
 
@@ -69,6 +70,7 @@ These patterns match potentially destructive commands:
 | `gh-api-delete-deploy-key` | gh api DELETE keys removes deploy keys. | high |
 | `gh-api-delete-release` | gh api DELETE releases removes GitHub releases. | high |
 | `gh-api-delete-repo` | gh api DELETE /repos/{owner}/{repo} permanently deletes a GitHub repository. This cannot be undone. | high |
+| `curl-api-delete-repo` | curl DELETE /repos/{owner}/{repo} permanently deletes a GitHub repository. This cannot be undone. | high |
 | `gh-api-delete-generic` | gh api DELETE calls can be destructive. Please verify the endpoint. | high |
 
 ### Allowlist Guidance

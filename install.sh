@@ -240,6 +240,7 @@ HERMES_VERSION=""
 POSIT_ASSISTANT_VERSION=""
 OPENCODE_VERSION=""
 CRUSH_VERSION=""
+REASONIX_VERSION=""
 OMP_VERSION=""
 
 print_agent_scan_notice() {
@@ -382,6 +383,23 @@ resolve_omp_config_root() {
   printf '%s\n' "$result"
 }
 
+# The Reasonix home as Reasonix resolves it on macOS/Linux (#358): REASONIX_HOME,
+# trimmed, with a leading `~` expanded, else ~/.reasonix. (Reasonix also expands
+# `${VAR}` references inside the value; `dcg install --reasonix` does too, and
+# is what actually writes the file. This probe only decides detection and the
+# created/merged wording.)
+reasonix_home_dir() {
+  local dir="${REASONIX_HOME:-}"
+  dir="${dir#"${dir%%[![:space:]]*}"}"
+  dir="${dir%"${dir##*[![:space:]]}"}"
+  case "$dir" in
+    "") dir="$HOME/.reasonix" ;;
+    "~") dir="$HOME" ;;
+    "~/"*) dir="$HOME/${dir#"~/"}" ;;
+  esac
+  printf '%s\n' "$dir"
+}
+
 detect_agents() {
   DETECTED_AGENTS=()
 
@@ -474,6 +492,17 @@ detect_agents() {
     [[ -n "$crush_bin" ]] && CRUSH_VERSION=$(try_version "$crush_bin")
   fi
 
+  # Reasonix (esengine/DeepSeek-Reasonix) — home at ${REASONIX_HOME:-~/.reasonix}
+  # (see reasonix_home_dir), optional `reasonix` CLI on PATH. The CLI is
+  # resolved the same way as Crush's above.
+  local reasonix_bin
+  reasonix_bin=$(builtin type -P reasonix 2>/dev/null || true)
+  if [[ -d "$(reasonix_home_dir)" ]] \
+    || [[ -n "$reasonix_bin" && -f "$reasonix_bin" && -x "$reasonix_bin" ]]; then
+    DETECTED_AGENTS+=("reasonix")
+    [[ -n "$reasonix_bin" ]] && REASONIX_VERSION=$(try_version "$reasonix_bin")
+  fi
+
   # Oh My Pi (`omp`) — require an external executable on PATH. Config/profile
   # state can outlive an uninstall, while command lookup also accepts aliases
   # and functions that the non-interactive installer cannot safely identify as
@@ -557,6 +586,11 @@ print_detected_agents() {
           [[ -n "$CRUSH_VERSION" ]] && ver_info=" (${CRUSH_VERSION})"
           gum style --foreground 42 "  ✓ Crush${ver_info}"
           ;;
+        reasonix)
+          local ver_info=""
+          [[ -n "$REASONIX_VERSION" ]] && ver_info=" (${REASONIX_VERSION})"
+          gum style --foreground 42 "  ✓ Reasonix${ver_info}"
+          ;;
         omp)
           local ver_info=""
           [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
@@ -624,6 +658,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$CRUSH_VERSION" ]] && ver_info=" (${CRUSH_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Crush${ver_info}"
+          ;;
+        reasonix)
+          local ver_info=""
+          [[ -n "$REASONIX_VERSION" ]] && ver_info=" (${REASONIX_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Reasonix${ver_info}"
           ;;
         omp)
           local ver_info=""
@@ -1871,6 +1910,8 @@ OPENCODE_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
 OPENCODE_FAILURE_REASON=""
 CRUSH_STATUS=""  # "created"|"merged"|"skipped"|"failed"
 CRUSH_FAILURE_REASON=""
+REASONIX_STATUS=""  # "created"|"merged"|"skipped"|"failed"
+REASONIX_FAILURE_REASON=""
 OMP_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
 OMP_FAILURE_REASON=""
 POSIT_ASSISTANT_BACKUP=""
@@ -3176,6 +3217,19 @@ def deny(reason):
         "agent_message": reason,
     })
 
+# dcg answers "ask" when it could not finish checking a command (deadline or
+# size exceeded). Cursor supports `permission: "ask"`; mapping it to allow
+# would run exactly the command dcg declined to vouch for.
+def ask(reason):
+    emit({
+        "permission": "ask",
+        "continue": True,
+        "userMessage": reason,
+        "agentMessage": reason,
+        "user_message": reason,
+        "agent_message": reason,
+    })
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -3235,6 +3289,9 @@ def main():
 
     if decision == "deny":
         deny(reason)
+        return 0
+    if decision == "ask":
+        ask(reason)
         return 0
 
     allow()
@@ -4035,6 +4092,46 @@ configure_crush() {
   return 1
 }
 
+configure_reasonix() {
+  # Reasonix runs native `PreToolUse` hooks from <Reasonix home>/settings.json
+  # and reads only their exit status (#358). As with Crush, the freshly
+  # installed binary owns the entry shape: `dcg install --reasonix` merges
+  # `{"match":"bash|pwsh","command":"<abs dcg>","timeout":5000}` into
+  # ${REASONIX_HOME:-~/.reasonix}/settings.json, keeping every other key and
+  # hook, and `--force` refreshes a stale binary path across upgrades.
+  if ! is_agent_detected "reasonix"; then
+    REASONIX_STATUS="skipped"
+    return 0
+  fi
+
+  local dcg_bin="$DEST/dcg"
+  if [ ! -x "$dcg_bin" ]; then
+    REASONIX_STATUS="failed"
+    REASONIX_FAILURE_REASON="dcg binary not found at $dcg_bin"
+    return 1
+  fi
+
+  local settings_path
+  settings_path="$(reasonix_home_dir)/settings.json"
+  local existed=0
+  [ -f "$settings_path" ] && existed=1
+
+  local output
+  if output=$("$dcg_bin" install --reasonix --force 2>&1); then
+    if [ "$existed" -eq 1 ]; then
+      REASONIX_STATUS="merged"
+    else
+      REASONIX_STATUS="created"
+    fi
+    AUTO_CONFIGURED=1
+    return 0
+  fi
+
+  REASONIX_STATUS="failed"
+  REASONIX_FAILURE_REASON=$(printf '%s' "$output" | tail -n 1)
+  return 1
+}
+
 resolve_omp_agent_dir() {
   # Keep the shell installer's status probe in lock-step with OMP/dcg's active
   # profile resolver. In particular, named profiles ignore the legacy
@@ -4216,6 +4313,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
   # Configure Crush (if installed). A failure is a terminal CRUSH_STATUS
   # rendered in the summary; do not let `set -e` abort other install work.
   configure_crush || true
+
+  # Configure Reasonix (if installed); same failure handling as Crush.
+  configure_reasonix || true
 
   # Configure Oh My Pi (if installed)
   # A refusal/failure is a terminal OMP_STATUS state rendered in the summary;
@@ -4511,6 +4611,27 @@ case "$CRUSH_STATUS" in
       summary_lines+=("Crush:       Configuration failed ($CRUSH_FAILURE_REASON)")
     else
       summary_lines+=("Crush:       Configuration failed")
+    fi
+    ;;
+esac
+
+case "$REASONIX_STATUS" in
+  created)
+    summary_lines+=("Reasonix:    Created settings.json with the dcg PreToolUse hook")
+    summary_lines+=("             Restart Reasonix to load it")
+    ;;
+  merged)
+    summary_lines+=("Reasonix:    Merged dcg PreToolUse hook into settings.json")
+    summary_lines+=("             Restart Reasonix to load it")
+    ;;
+  skipped|"")
+    summary_lines+=("Reasonix:    Not installed (skipped)")
+    ;;
+  failed)
+    if [ -n "$REASONIX_FAILURE_REASON" ]; then
+      summary_lines+=("Reasonix:    Configuration failed ($REASONIX_FAILURE_REASON)")
+    else
+      summary_lines+=("Reasonix:    Configuration failed")
     fi
     ;;
 esac

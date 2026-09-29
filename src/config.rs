@@ -62,7 +62,7 @@ pub(crate) enum ConfigSource {
 /// file type can be rejected.
 pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Option<String> {
     #[cfg(not(unix))]
-    if matches!(source, ConfigSource::AutoProject | ConfigSource::System) {
+    if non_unix_source_is_unsupported(source) {
         warn_and_ignore_non_unix_restricted_config(path, source);
         return None;
     }
@@ -142,6 +142,11 @@ fn open_config_file_for_source(path: &Path, source: ConfigSource) -> io::Result<
         }
     }
 
+    #[cfg(windows)]
+    if source == ConfigSource::AutoProject {
+        return open_restricted_windows_project_config(path);
+    }
+
     #[cfg(not(unix))]
     if source != ConfigSource::Untrusted {
         return Err(io::Error::new(
@@ -151,6 +156,67 @@ fn open_config_file_for_source(path: &Path, source: ConfigSource) -> io::Result<
     }
 
     fs::File::open(path)
+}
+
+/// Restricted sources a non-Unix build cannot validate and therefore ignores.
+///
+/// Windows validates the automatic project config (see
+/// [`open_restricted_windows_project_config`]); the system layer stays
+/// ignored there because trusting `%ProgramData%\dcg` needs an ACL check std
+/// cannot express, and standard users may create folders under `ProgramData`.
+#[cfg(not(unix))]
+const fn non_unix_source_is_unsupported(source: ConfigSource) -> bool {
+    match source {
+        ConfigSource::System => true,
+        ConfigSource::AutoProject => !cfg!(windows),
+        ConfigSource::Untrusted => false,
+    }
+}
+
+/// Open an automatic project config on Windows with the Unix policy's
+/// guarantees: never follow a symlink or junction at the leaf, accept only a
+/// regular file, and read from the handle whose identity was checked.
+///
+/// `FILE_FLAG_OPEN_REPARSE_POINT` opens a reparse point as itself rather than
+/// its target (the `O_NOFOLLOW` analogue), so a symlinked `.dcg.toml` shows the
+/// reparse attribute on the opened handle and is rejected. The path is then
+/// re-inspected and must still name a non-reparse regular file with the same
+/// size and timestamps as the handle, which binds the reported path to the
+/// bytes read. Project config is enforcement-only (#218), so this validation
+/// guards what dcg reports and reads, not what the file may authorize.
+#[cfg(windows)]
+fn open_restricted_windows_project_config(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let denied = |message: &str| io::Error::new(io::ErrorKind::PermissionDenied, message);
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(denied(
+            "symlinks and reparse points are not permitted for this config source",
+        ));
+    }
+    if !opened.is_file() {
+        return Err(denied("config source is not a regular file"));
+    }
+
+    let at_path = fs::symlink_metadata(path)?;
+    if at_path.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !at_path.is_file()
+        || at_path.file_size() != opened.file_size()
+        || at_path.creation_time() != opened.creation_time()
+        || at_path.last_write_time() != opened.last_write_time()
+    {
+        return Err(denied("config path changed while it was being validated"));
+    }
+
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -350,7 +416,7 @@ fn failed_config_read_outcome(
         ),
         Ok(_) => {
             #[cfg(not(unix))]
-            if matches!(source, ConfigSource::AutoProject | ConfigSource::System) {
+            if non_unix_source_is_unsupported(source) {
                 return (
                     ConfigFileStatus::IgnoredUnsupported,
                     Some(
@@ -834,6 +900,7 @@ struct LoggingConfigLayer {
     format: Option<crate::logging::LogFormat>,
     redaction: Option<RedactionConfigLayer>,
     events: Option<LogEventFilterLayer>,
+    caller_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -926,9 +993,87 @@ pub(crate) fn system_config_dir() -> PathBuf {
     }
 }
 
+// === Per-user directories =================================================
+//
+// Every per-user path dcg reads or writes resolves through these functions,
+// never through `dirs::*` directly (clippy.toml's `disallowed-methods` enforces
+// it). The reason is Windows: `dirs` resolves the profile and AppData through
+// `SHGetKnownFolderPath`, which ignores `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`.
+// On POSIX `HOME=/tmp/x dcg ...` relocates every file dcg touches; on Windows
+// the same redirection was silently impossible, so a sandboxed test run or a
+// hermetic installer probe read and rewrote the operator's real
+// `~\.claude\settings.json`, allow-once grants and pending codes (bd-b2b1).
+// Honoring the environment first gives Windows the POSIX contract; the known
+// folder remains the fallback when the variable is unset or empty.
+
+/// The user's home directory: `HOME` on POSIX, `USERPROFILE` on Windows,
+/// falling back to the platform lookup when the variable is unset.
+#[must_use]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::home_dir().filter(|path| !path.as_os_str().is_empty())
+}
+
+/// A Windows AppData directory: the environment variable when set, else the
+/// conventional location under [`home_dir`] (so `USERPROFILE` alone relocates
+/// it, as `HOME` does on POSIX), else `None` for the caller's known-folder
+/// fallback.
+#[cfg(windows)]
+fn windows_app_data_dir(env_name: &str, under_profile: &str) -> Option<PathBuf> {
+    std::env::var_os(env_name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(under_profile)))
+}
+
+/// The per-user roaming configuration directory: `%APPDATA%` on Windows,
+/// `$XDG_CONFIG_HOME` / `~/.config` on Linux, `~/Library/Application Support`
+/// on macOS.
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_config_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("APPDATA", r"AppData\Roaming") {
+        return Some(dir);
+    }
+    dirs::config_dir()
+}
+
+/// The per-user roaming data directory (`%APPDATA%` on Windows).
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("APPDATA", r"AppData\Roaming") {
+        return Some(dir);
+    }
+    dirs::data_dir()
+}
+
+/// The per-user machine-local data directory (`%LOCALAPPDATA%` on Windows).
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_data_local_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("LOCALAPPDATA", r"AppData\Local") {
+        return Some(dir);
+    }
+    dirs::data_local_dir()
+}
+
+/// The per-user cache directory (`%LOCALAPPDATA%` on Windows).
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_cache_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("LOCALAPPDATA", r"AppData\Local") {
+        return Some(dir);
+    }
+    dirs::cache_dir()
+}
+
 fn expand_tilde_path(value: &str) -> (PathBuf, bool) {
     if value == "~" {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home_dir() {
             return (home, true);
         }
         return (PathBuf::from(value), false);
@@ -940,7 +1085,7 @@ fn expand_tilde_path(value: &str) -> (PathBuf, bool) {
     else {
         return (PathBuf::from(value), false);
     };
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = home_dir() else {
         return (PathBuf::from(value), false);
     };
     (home.join(rest), true)
@@ -1203,7 +1348,9 @@ pub struct ConfidenceConfig {
 
     /// Confidence threshold below which Deny is downgraded to Warn.
     ///
-    /// Values range from 0.0 (always warn) to 1.0 (never warn).
+    /// A match downgrades when its score is *below* this value, so 0.0 never
+    /// downgrades and 1.0 downgrades every match short of full confidence.
+    /// A direct invocation (`rm -rf ./build`) scores 1.0 and never downgrades.
     /// Recommended range: 0.3 - 0.7
     ///
     /// Default: 0.5
@@ -1724,7 +1871,9 @@ fn content_hash(content: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GeneralConfig {
-    /// Color output mode: "auto", "always", "never".
+    /// Color output mode: "auto", "always", "never". "never" turns color off;
+    /// "auto" and "always" both follow terminal detection (`NO_COLOR`, `CI`,
+    /// and a non-TTY stdout still disable it).
     pub color: String,
 
     /// Path to log file for blocked commands (optional).
@@ -2061,7 +2210,23 @@ impl PacksConfig {
     /// Get enabled pack IDs as a deduplicated set.
     #[must_use]
     pub fn enabled_pack_ids(&self) -> HashSet<String> {
-        Self::resolve_requested_pack_ids(self.requested_pack_ids(cfg!(windows)), &self.disabled)
+        self.enabled_pack_ids_for_payload(false)
+    }
+
+    /// As [`Self::enabled_pack_ids`], but for a caller that has seen the
+    /// payload and knows it is a Windows shell command (#451).
+    ///
+    /// The agent-aware sibling on `Config` takes the same flag. This one
+    /// exists for `dcg hook`'s JSONL reader, which builds its pack set before
+    /// reading any line and so could only ever ask the payload-blind question —
+    /// which is why the same command denied through the plain hook path and
+    /// was allowed through `dcg hook`.
+    #[must_use]
+    pub fn enabled_pack_ids_for_payload(&self, windows_payload: bool) -> HashSet<String> {
+        Self::resolve_requested_pack_ids(
+            self.requested_pack_ids(cfg!(windows) || windows_payload),
+            &self.disabled,
+        )
     }
 
     /// Expand custom_paths, resolving tilde, ${repo_root}, and glob patterns.
@@ -2126,7 +2291,7 @@ impl PacksConfig {
 
             // Then expand tilde.
             let expanded = if after_repo_root.starts_with("~/") || after_repo_root == "~" {
-                if let Some(home) = dirs::home_dir() {
+                if let Some(home) = home_dir() {
                     if after_repo_root == "~" {
                         home.to_string_lossy().into_owned()
                     } else {
@@ -2494,9 +2659,9 @@ pub(crate) fn normalize_literal_target_path(raw: &str) -> Option<String> {
     }
 
     let expanded = if raw == "~" {
-        dirs::home_dir()?.to_string_lossy().into_owned()
+        home_dir()?.to_string_lossy().into_owned()
     } else if let Some(rest) = raw.strip_prefix("~/") {
-        let home = dirs::home_dir()?;
+        let home = home_dir()?;
         format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/'))
     } else if raw.starts_with('~') {
         // `~user` needs the passwd database to resolve; never guess.
@@ -2537,13 +2702,13 @@ fn normalize_target_glob(raw: &str) -> Result<String, String> {
     }
 
     let expanded = if trimmed == "~" {
-        dirs::home_dir()
+        home_dir()
             .ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?
             .to_string_lossy()
             .into_owned()
     } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        let home = dirs::home_dir()
-            .ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?;
+        let home =
+            home_dir().ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?;
         format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/'))
     } else if trimmed.starts_with('~') {
         return Err("only `~` and `~/` are expanded; `~user` is not supported".to_string());
@@ -3193,6 +3358,12 @@ impl std::fmt::Display for StrictnessLevel {
 }
 
 /// Git branch-aware strictness configuration.
+///
+/// **`[git_awareness]` is not applied to hook decisions.** Its strictness can
+/// only relax a denial, and the agent being guarded can choose its branch
+/// before the command it wants run, so honoring them would be a
+/// self-service downgrade. `dcg config` and `dcg doctor` warn when
+/// `enabled = true`.
 ///
 /// This allows different strictness levels based on the current git branch,
 /// providing more protection on important branches and more freedom on
@@ -4134,11 +4305,11 @@ impl Config {
             }
         }
 
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home_dir() {
             push_unique(home.join(".config").join("dcg").join(CONFIG_FILE_NAME));
         }
 
-        if let Some(config_dir) = dirs::config_dir() {
+        if let Some(config_dir) = user_config_dir() {
             push_unique(config_dir.join("dcg").join(CONFIG_FILE_NAME));
         }
 
@@ -4447,6 +4618,9 @@ impl Config {
             if let Some(allow) = events.allow {
                 self.logging.events.allow = allow;
             }
+        }
+        if let Some(caller_env) = logging.caller_env {
+            self.logging.caller_env = Some(caller_env);
         }
     }
 
@@ -4914,6 +5088,32 @@ impl Config {
         self.general.fail_closed
     }
 
+    /// Where allow-once lifecycle events are audited, if anywhere.
+    ///
+    /// The whole event model — code issued, code redeemed, command allowed,
+    /// single-use entry consumed — existed, but every production caller
+    /// passed `None`, so with `general.log_file` set the only allow-once lines
+    /// ever written were `clear` and `revoke`. The step that actually lifts a
+    /// block went unrecorded. Events go to the same `general.log_file` those
+    /// two already use, in `[logging] format`, redacted per
+    /// `[logging] redaction`.
+    #[must_use]
+    pub fn allow_once_audit(&self) -> Option<crate::pending_exceptions::AllowOnceAuditConfig<'_>> {
+        let log_file = self.general.log_file.as_deref()?;
+        Some(crate::pending_exceptions::AllowOnceAuditConfig {
+            log_file,
+            format: match self.logging.format {
+                crate::logging::LogFormat::Json => {
+                    crate::pending_exceptions::AllowOnceLogFormat::Json
+                }
+                crate::logging::LogFormat::Text => {
+                    crate::pending_exceptions::AllowOnceLogFormat::Text
+                }
+            },
+            redaction: &self.logging.redaction,
+        })
+    }
+
     /// Whether an unverified command (deadline exhausted, or over the command
     /// size limit) must be denied instead of routed to `ask` (#338).
     ///
@@ -4953,15 +5153,24 @@ impl Config {
     /// Get enabled pack IDs as a deduplicated set.
     #[must_use]
     pub fn enabled_pack_ids(&self) -> HashSet<String> {
+        self.enabled_pack_ids_for_payload(false)
+    }
+
+    /// As [`Self::enabled_pack_ids`], but for a caller that has already seen
+    /// the payload and knows it is a Windows shell command (#451).
+    #[must_use]
+    pub fn enabled_pack_ids_for_payload(&self, windows_payload: bool) -> HashSet<String> {
         if self.projects.is_empty() {
-            return self.packs.enabled_pack_ids();
+            return self.packs.enabled_pack_ids_for_payload(windows_payload);
         }
 
         if let Ok(cwd) = std::env::current_dir() {
-            return self.effective_packs_for_project(&cwd).enabled_pack_ids();
+            return self
+                .effective_packs_for_project(&cwd)
+                .enabled_pack_ids_for_payload(windows_payload);
         }
 
-        self.packs.enabled_pack_ids()
+        self.packs.enabled_pack_ids_for_payload(windows_payload)
     }
 
     /// Effective end-to-end hook evaluation budget in milliseconds.
@@ -5020,6 +5229,58 @@ impl Config {
     /// on top of the base configuration.
     #[must_use]
     pub fn enabled_pack_ids_for_agent(&self, agent: &crate::agent::Agent) -> HashSet<String> {
+        self.enabled_pack_ids_for_agent_and_payload(agent, false)
+    }
+
+    /// Warnings for configured keys that parse but change nothing, surfaced
+    /// by `dcg config` and `dcg doctor` so a silently ignored key is
+    /// distinguishable from one that simply didn't match.
+    ///
+    /// `[git_awareness] enabled = true` is one. Its strictness is never applied
+    /// to a hook decision, and deliberately so: as implemented it only ever
+    /// relaxes (a relaxed branch turns a High denial into an allow), and the
+    /// agent being guarded can choose its branch (`git checkout -b feature/x`)
+    /// before the command it wants run.
+    #[must_use]
+    pub fn inert_config_warnings(&self) -> Vec<String> {
+        let mut warnings = self.overrides.removed_key_warnings();
+        if self.git_awareness.enabled {
+            warnings.push(
+                "`[git_awareness]` is not applied to hook decisions: its branch strictness \
+                 can only relax a denial, and the agent being guarded can pick the branch \
+                 (`git checkout -b feature/x`) before the command it wants run. To loosen a \
+                 rule, allowlist it with a reason (`dcg allowlist add`)."
+                    .to_string(),
+            );
+        }
+        // Hook decisions are never graduated: dcg runs once per command, so
+        // the session count is always 1, and graduating would make every
+        // first High finding a warning rather than a block.
+        if self.response.enabled {
+            warnings.push(
+                "`[response]` graduation is advisory: `dcg test` reports the graduated \
+                 response, but hook decisions are not graduated (a first High finding \
+                 still blocks)."
+                    .to_string(),
+            );
+        }
+        warnings
+    }
+
+    /// [`Self::enabled_pack_ids_for_agent`], for a request whose payload is
+    /// known to be PowerShell or Cmd.
+    ///
+    /// The `windows.*` packs are default-on for Windows *payloads*, wherever
+    /// dcg itself runs (#451). A PowerShell tool on macOS or Linux (pwsh) runs
+    /// the same `Clear-Content`/`Format-Volume` cmdlets as one on Windows, and
+    /// keying the default on the build host left those cmdlets unguarded
+    /// there. `disabled = ["windows"]` still wins, as it does on Windows.
+    #[must_use]
+    pub fn enabled_pack_ids_for_agent_and_payload(
+        &self,
+        agent: &crate::agent::Agent,
+        windows_payload: bool,
+    ) -> HashSet<String> {
         let profile = self.agents.profile_for_agent(agent);
         let packs_config = if self.projects.is_empty() {
             self.packs.clone()
@@ -5032,7 +5293,7 @@ impl Config {
         // A profile can cancel a preset contribution from the base config, but
         // it must not remove member packs that were also enabled independently
         // (including Windows' default-on filesystem/system packs).
-        let mut base_requested = packs_config.requested_pack_ids(cfg!(windows));
+        let mut base_requested = packs_config.requested_pack_ids(cfg!(windows) || windows_payload);
         PacksConfig::remove_disabled_preset_markers(&mut base_requested, &profile.disabled_packs);
         let mut packs =
             PacksConfig::resolve_requested_pack_ids(base_requested, &packs_config.disabled);
@@ -5140,15 +5401,15 @@ impl Config {
 
         let config_dir = if let Some(config_dir) = config_dir {
             config_dir
-        } else if let Some(home) = dirs::home_dir() {
+        } else if let Some(home) = home_dir() {
             let xdg_dir = home.join(".config").join("dcg");
             if xdg_dir.exists() {
                 home.join(".config")
             } else {
-                dirs::config_dir().unwrap_or_else(|| home.join(".config"))
+                user_config_dir().unwrap_or_else(|| home.join(".config"))
             }
         } else {
-            dirs::config_dir()?
+            user_config_dir()?
         };
         let guard_dir = config_dir.join("dcg");
 
@@ -5510,7 +5771,8 @@ max_size_mb = 500
 [response]
 # Enable the graduated response system.
 # When enabled, repeated occurrences of the same command escalate
-# from warning → soft block → hard block.
+# from warning → soft block → hard block. Advisory: `dcg test` reports the
+# graduated response; hook decisions are not graduated.
 enabled = false
 
 # Global graduation mode: "paranoid" | "strict" | "standard" | "lenient" | "warning_only" | "disabled"
@@ -6425,7 +6687,7 @@ batch_flush_interval_ms = 29
 
     #[test]
     fn test_history_database_path_expansion() {
-        if dirs::home_dir().is_none() {
+        if home_dir().is_none() {
             return;
         }
 
@@ -8044,6 +8306,21 @@ enabled = false
         assert!(overrides.removed_key_warnings().is_empty());
     }
 
+    /// Opt-in features that never change a hook decision say so, rather than
+    /// parsing and silently doing nothing.
+    #[test]
+    fn inert_opt_in_features_are_reported() {
+        let mut config = Config::default();
+        assert!(config.inert_config_warnings().is_empty());
+
+        config.git_awareness.enabled = true;
+        config.response.enabled = true;
+        let warnings = config.inert_config_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("[git_awareness]"));
+        assert!(warnings[1].contains("[response]"));
+    }
+
     // ========================================================================
     // PolicyConfig Tests (git_safety_guard-1gt.3)
     // ========================================================================
@@ -9590,12 +9867,12 @@ low = "disabled"
             true,
         );
         let traced_outcome = traced_outcome.expect("tracing requested");
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             assert!(traced_layer.is_some());
             assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             assert!(traced_layer.is_none());
             assert_eq!(traced_outcome.status, ConfigFileStatus::IgnoredUnsupported);
@@ -9784,7 +10061,54 @@ low = "disabled"
         assert!(read_config_file_bounded(&path, ConfigSource::System).is_none());
     }
 
-    #[cfg(not(unix))]
+    /// Windows loads a regular automatic project config and refuses a
+    /// symlinked one, matching the Unix `O_NOFOLLOW` policy; the system layer
+    /// stays ignored there (no ACL validation).
+    #[cfg(windows)]
+    #[test]
+    fn windows_auto_project_config_loads_regular_files_and_rejects_reparse_points() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(".dcg.toml");
+        std::fs::write(&path, "[general]\nfail_closed = true\n").unwrap();
+
+        assert!(read_config_file_bounded(&path, ConfigSource::AutoProject).is_some());
+        let (layer, outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert!(layer.is_some());
+        assert_eq!(
+            outcome.expect("tracing requested").status,
+            ConfigFileStatus::Loaded
+        );
+        assert!(
+            read_config_file_bounded(
+                &temp.path().join("missing.dcg.toml"),
+                ConfigSource::AutoProject
+            )
+            .is_none()
+        );
+        assert!(
+            read_config_file_bounded(temp.path(), ConfigSource::AutoProject).is_none(),
+            "a directory is not a regular file"
+        );
+
+        // Symlink creation needs Developer Mode or elevation; when the host
+        // allows it, the link itself must be refused.
+        let link = temp.path().join("linked.dcg.toml");
+        if std::os::windows::fs::symlink_file(&path, &link).is_ok() {
+            assert!(read_config_file_bounded(&link, ConfigSource::AutoProject).is_none());
+        }
+
+        assert!(read_config_file_bounded(&path, ConfigSource::System).is_none());
+    }
+
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn non_unix_auto_project_config_is_ignored_even_when_regular() {
         use tempfile::TempDir;
@@ -9804,13 +10128,6 @@ low = "disabled"
         assert_eq!(
             outcome.expect("tracing requested").status,
             ConfigFileStatus::IgnoredUnsupported
-        );
-        assert!(
-            read_config_file_bounded(
-                &temp.path().join("missing.dcg.toml"),
-                ConfigSource::AutoProject
-            )
-            .is_none()
         );
     }
 

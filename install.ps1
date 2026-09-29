@@ -785,6 +785,10 @@ function Remove-DcgPredecessor {
 # an absolute Unix or Windows path, and the PowerShell quoted-invocation form
 # `& 'C:\...\dcg.exe' [args]` (issue #282: naively splitting that on [\\/]
 # leaves a trailing quote + args, so the hook looked missing every session).
+# The single-quoted form is read as a PowerShell literal, so a doubled `''`
+# (`C:\Users\O''Brien\...`) does not end the path early. `dcg install` repairs
+# a stale copy of this block in place (#503); the Rust copy in src/cli.rs
+# (DCG_PROFILE_CHECK_BLOCK) is pinned to this one by a test.
 $script:DcgProfileCheckMarker = "# dcg: warn if the Claude Code hook was silently removed"
 $script:DcgProfileCheckBlock = @'
 if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
@@ -794,7 +798,8 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
       foreach ($dcgH in @($dcgE.hooks)) {
         $dcgCmd = ([string]$dcgH.command).Trim()
-        if ($dcgCmd -match '^&\s*[''"](.+?)[''"]') { $dcgExe = $Matches[1] }
+        if ($dcgCmd -match '^&\s*''((?:[^'']|'''')*)''') { $dcgExe = $Matches[1] -replace '''''', '''' }
+        elseif ($dcgCmd -match '^&\s*"([^"]*)"') { $dcgExe = $Matches[1] }
         else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
         if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
       }
@@ -1059,6 +1064,11 @@ function Send-Allow {
 function Send-Deny($r) {
   Write-CursorOut @{ permission = 'deny'; continue = $false; userMessage = $r; agentMessage = $r; user_message = $r; agent_message = $r }
 }
+# dcg answers 'ask' when it could not finish checking a command; Cursor
+# supports permission=ask, and mapping it to allow would run that command.
+function Send-Ask($r) {
+  Write-CursorOut @{ permission = 'ask'; continue = $true; userMessage = $r; agentMessage = $r; user_message = $r; agent_message = $r }
+}
 try { $raw = [Console]::In.ReadToEnd() } catch { Send-Allow; exit 0 }
 if ([string]::IsNullOrWhiteSpace($raw)) { Send-Allow; exit 0 }
 try { $payload = $raw | ConvertFrom-Json } catch { Send-Allow; exit 0 }
@@ -1073,7 +1083,9 @@ try { $dcg = $out | ConvertFrom-Json } catch { Send-Allow; exit 0 }
 $decision = $dcg.hookSpecificOutput.permissionDecision
 $reason = $dcg.hookSpecificOutput.permissionDecisionReason
 if ([string]::IsNullOrEmpty($reason)) { $reason = 'Blocked by dcg' }
-if ($decision -eq 'deny') { Send-Deny $reason } else { Send-Allow }
+if ($decision -eq 'deny') { Send-Deny $reason }
+elseif ($decision -eq 'ask') { Send-Ask $reason }
+else { Send-Allow }
 exit 0
 '@
   $header + $body
@@ -1136,7 +1148,10 @@ function Configure-CursorHook {
   if ($null -eq $hooks) { $hooks = [pscustomobject][ordered]@{} }
   if (-not (Test-JsonObject $hooks)) { return "invalid" }
 
-  $entries = Get-JsonArray (Get-ObjectPropertyValue $hooks "beforeShellExecution")
+  # @(): PowerShell unrolls a one-element array returned from a function, and a
+  # bare PSCustomObject has no .Count on Windows PowerShell 5.1, so an already
+  # configured hooks.json was reported "merged" and rewritten on every run.
+  $entries = @(Get-JsonArray (Get-ObjectPropertyValue $hooks "beforeShellExecution"))
   $isDcg = { param($e) (Test-JsonObject $e) -and ($e.command -eq $hookCmd) }
   $matching = @($entries | Where-Object { & $isDcg $_ })
   $first = if ($entries.Count -gt 0 -and (Test-JsonObject $entries[0])) { $entries[0].command } else { $null }
@@ -1826,6 +1841,22 @@ function Detect-Agents {
   } else {
     Join-Path (Join-Path $HomeDir '.config') 'crush'
   }
+  # Reasonix (#358): REASONIX_HOME (trimmed, leading `~` expanded, as Reasonix
+  # reads it), else %APPDATA%\reasonix, plus the legacy ~\.reasonix it still
+  # reads settings from.
+  $reasonixOverride = if ([string]::IsNullOrWhiteSpace($env:REASONIX_HOME)) {
+    $null
+  } else {
+    $trimmed = $env:REASONIX_HOME.Trim()
+    if ($trimmed -eq '~') { $HomeDir }
+    elseif ($trimmed.StartsWith('~/') -or $trimmed.StartsWith('~\')) { Join-Path $HomeDir $trimmed.Substring(2) }
+    else { $trimmed }
+  }
+  $reasonixHomes = @(
+    $reasonixOverride,
+    $(if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) { Join-Path $env:APPDATA 'reasonix' }),
+    (Join-Path $HomeDir '.reasonix')
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
   [ordered]@{
     'Claude'  = ((_dir '.claude')  -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
@@ -1849,6 +1880,9 @@ function Detect-Agents {
       (Test-Path Env:OMP_PROFILE) -or (_has 'omp'))
     'Crush'   = ((Test-Path -LiteralPath $crushConfigDir -PathType Container -ErrorAction SilentlyContinue) -or
       (_has 'crush'))
+    'Reasonix' = ((@($reasonixHomes | Where-Object {
+          Test-Path -LiteralPath $_ -PathType Container -ErrorAction SilentlyContinue
+        }).Count -gt 0) -or (_has 'reasonix'))
   }
 }
 
@@ -1856,7 +1890,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush', 'Reasonix')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -1893,6 +1927,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Posit Assistant (~/.posit/assistant/settings.json)
   Oh My Pi     (active profile's extensions/dcg-guard.ts via dcg install --omp)
   Crush        (~/.config/crush/crush.json hooks.PreToolUse via dcg install --crush)
+  Reasonix     (%APPDATA%\reasonix\settings.json hooks.PreToolUse via dcg install --reasonix)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2326,6 +2361,22 @@ if ($detectedAgents['Crush'] -or $forceConfig) {
   }
 } else {
   Write-Info "Crush not detected; re-run with -EasyMode to configure its hook anyway"
+}
+
+# Configure Reasonix through the Rust installer (#358): it resolves the
+# settings.json Reasonix actually loads (including the legacy ~\.reasonix
+# fallback) and merges a hooks.PreToolUse entry, keeping every other key.
+if ($detectedAgents['Reasonix'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    & $dcgExe install --reasonix --force | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Ok "Configured Reasonix hook via 'dcg install --reasonix'" }
+    else { Write-Warn "'dcg install --reasonix' exited with code $LASTEXITCODE" }
+  } catch {
+    Write-Warn "Reasonix hook configuration failed: $_"
+  }
+} else {
+  Write-Info "Reasonix not detected; re-run with -EasyMode to configure its hook anyway"
 }
 
 # Grok (xAI) and Antigravity (agy): configured via the dcg binary itself rather

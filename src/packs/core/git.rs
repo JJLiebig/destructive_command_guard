@@ -10,10 +10,17 @@ use crate::normalize::{
 };
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 
 const MAX_GIT_SEMANTIC_BYTES: usize = 64 * 1024;
 const MAX_GIT_SEMANTIC_TOKENS: usize = 512;
+
+/// This pack, used to decide which reading of an ambiguous dashed built-in to
+/// present in the matching view (#428). Built once: the path is rare (it needs
+/// a symbolic executable with a `git-` prefix) but must not pay for pack
+/// construction each time it is taken.
+static AMBIGUITY_ARBITER: std::sync::LazyLock<Pack> = std::sync::LazyLock::new(create_pack);
 const MAX_GIT_ALIAS_DEPTH: usize = 64;
 
 pub(crate) const GIT_ALIAS_UNVERIFIED_RULE: &str = "git-alias-semantic-unverified";
@@ -829,7 +836,7 @@ fn decoded_words_execute_git(words: &[String]) -> bool {
         return executable.eq_ignore_ascii_case("git")
             || CORE_GIT_DASHED_BUILTINS
                 .iter()
-                .any(|builtin| executable.eq_ignore_ascii_case(builtin));
+                .any(|(bare, _, _)| executable.eq_ignore_ascii_case(bare));
     }
     false
 }
@@ -903,7 +910,7 @@ fn first_literal_posix_git_token_offset(segment: &str) -> Option<usize> {
             (stripped.eq_ignore_ascii_case("git")
                 || CORE_GIT_DASHED_BUILTINS
                     .iter()
-                    .any(|builtin| stripped.eq_ignore_ascii_case(builtin)))
+                    .any(|(bare, _, _)| stripped.eq_ignore_ascii_case(bare)))
             .then_some(token.byte_range.start)
         })
 }
@@ -1112,16 +1119,24 @@ fn command_after_posix_control_prefixes_bounded(
 /// and stays outside the pack entirely. `git-lfs` IS listed because the pack
 /// carries `lfs-migrate-rewrite` / `lfs-prune` / `lfs-uninstall` rules; entering
 /// the pack is harmless for `git-lfs install`, which matches no rule.
-const CORE_GIT_DASHED_BUILTINS: &[&str] = &[
-    "git-branch",
-    "git-checkout",
-    "git-clean",
-    "git-lfs",
-    "git-push",
-    "git-reset",
-    "git-restore",
-    "git-show",
-    "git-stash",
+/// Each entry is a triple: the bare name, the `.exe` spelling, and the
+/// subcommand the dashed builtin stands for.
+///
+/// The `.exe` spelling is stored rather than built on demand: this table is
+/// consulted on the hook's hot path for every command that reaches `core.git`
+/// executable resolution, and formatting nine strings per call to append a
+/// constant suffix is pure waste. Storing the subcommand explicitly also keeps
+/// a future entry from silently deriving the wrong one by prefix-stripping.
+const CORE_GIT_DASHED_BUILTINS: &[(&str, &str, &str)] = &[
+    ("git-branch", "git-branch.exe", "branch"),
+    ("git-checkout", "git-checkout.exe", "checkout"),
+    ("git-clean", "git-clean.exe", "clean"),
+    ("git-lfs", "git-lfs.exe", "lfs"),
+    ("git-push", "git-push.exe", "push"),
+    ("git-reset", "git-reset.exe", "reset"),
+    ("git-restore", "git-restore.exe", "restore"),
+    ("git-show", "git-show.exe", "show"),
+    ("git-stash", "git-stash.exe", "stash"),
 ];
 
 /// Whether a decoded executable word can resolve to Git, under either the bare
@@ -1131,23 +1146,44 @@ const CORE_GIT_DASHED_BUILTINS: &[&str] = &[
 fn git_semantic_word_is_git_executable(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
     git_semantic_executable_may_equal(word, dialect, "git")
         || git_semantic_executable_may_equal(word, dialect, "git.exe")
-        || dashed_git_builtin_subcommand(word, dialect).is_some()
+        || is_dashed_git_builtin(word, dialect)
 }
 
-/// The subcommand a dashed Git built-in stands for, if this executable word is
-/// one: `git-reset` → `reset`.
+/// Whether this executable word can be one of the dashed built-ins. Short
+/// circuits and allocates nothing, because this runs per word while resolving
+/// the executable index.
+fn is_dashed_git_builtin(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
+    CORE_GIT_DASHED_BUILTINS.iter().any(|(bare, exe, _)| {
+        git_semantic_executable_may_equal(word, dialect, bare)
+            || git_semantic_executable_may_equal(word, dialect, exe)
+    })
+}
+
+/// Every subcommand a dashed Git built-in word can stand for: `git-reset` →
+/// `[reset]`.
 ///
 /// Used to spell the subcommand back out when the pattern-matching view is
 /// synthesized, so a dashed spelling reaches the same rule as the spaced one.
-fn dashed_git_builtin_subcommand(
+///
+/// **All of them, not the first one (#428).** A literal word equals exactly one
+/// entry, but a *bounded symbolic* word can equal several: `git-c$X` may be
+/// `git-checkout` or `git-clean`, and taking the first table match resolved it
+/// to `checkout`, synthesized `git checkout -fdx`, and matched nothing — while
+/// `git-cl$X -fdx` was unambiguous and denied. Reading an unknown as whichever
+/// candidate the table happens to list first is a fail-open, so the caller is
+/// given every candidate and spells out every reading.
+fn dashed_git_builtin_subcommands(
     word: &GitSemanticWord,
     dialect: ShellDialect,
-) -> Option<&'static str> {
-    CORE_GIT_DASHED_BUILTINS.iter().find_map(|builtin| {
-        let matches_name = git_semantic_executable_may_equal(word, dialect, builtin)
-            || git_semantic_executable_may_equal(word, dialect, &format!("{builtin}.exe"));
-        matches_name.then(|| builtin.strip_prefix("git-").unwrap_or(builtin))
-    })
+) -> SmallVec<[&'static str; 4]> {
+    CORE_GIT_DASHED_BUILTINS
+        .iter()
+        .filter_map(|(bare, exe, subcommand)| {
+            let matches_name = git_semantic_executable_may_equal(word, dialect, bare)
+                || git_semantic_executable_may_equal(word, dialect, exe);
+            matches_name.then_some(*subcommand)
+        })
+        .collect()
 }
 
 fn semantic_git_executable_index(
@@ -1205,10 +1241,18 @@ fn symbolic_posix_may_execute_git(command: &str) -> bool {
                 .to_string(),
             unquoted_dynamic: word.unquoted_dynamic,
         };
+        // Every dashed built-in counts, not just `git-branch`. This is the
+        // fallback the pack takes whenever a POSIX command carries an
+        // unresolvable `$(…)` or backtick, and it decides whether `core.git`
+        // evaluates the command AT ALL — a `false` here returns before any rule
+        // runs. While it knew only `git-branch`, `git-reset --hard $(git
+        // rev-parse HEAD~1)` skipped the entire pack, so the #400 widening of
+        // the rules never got the chance to fire.
         if basename.may_equal("git")
             || basename.may_equal("git.exe")
-            || basename.may_equal("git-branch")
-            || basename.may_equal("git-branch.exe")
+            || CORE_GIT_DASHED_BUILTINS
+                .iter()
+                .any(|(bare, exe, _)| basename.may_equal(bare) || basename.may_equal(exe))
         {
             return true;
         }
@@ -1271,11 +1315,19 @@ struct VisibleAliasDefinition {
 /// POSIX-family shells expand a brace group only when it closes in the same
 /// word and contains a `,` alternative or a `..` sequence — `{}` (xargs's
 /// conventional replacement token) and `{word}` are literal text.
-fn posix_brace_remainder_may_expand(remainder: &str) -> bool {
-    remainder.find('}').is_some_and(|close| {
-        let inner = &remainder[..close];
-        inner.contains(',') || inner.contains("..")
-    })
+/// For a `{` whose text starts at `from`: the first `}` after it (or
+/// `usize::MAX`), and the last position before that `}` where a `,` or a
+/// whole `..` starts. A `{` at `index < close` has a `,`/`..` between it and
+/// its `}` (so the brace may expand) exactly when that position is after it,
+/// so every `{` sharing the `}` reuses one scan instead of rescanning the
+/// rest of the word (`{{{…`, 20,000 of them, was quadratic).
+fn posix_brace_region(raw: &str, from: usize) -> (usize, Option<usize>) {
+    let Some(inner_len) = raw.get(from..).and_then(|rest| rest.find('}')) else {
+        return (usize::MAX, None);
+    };
+    let inner = &raw[from..from + inner_len];
+    let last = inner.rfind(',').max(inner.rfind("..")).map(|at| from + at);
+    (from + inner_len, last)
 }
 
 fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
@@ -1284,6 +1336,11 @@ fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
             let mut chars = raw.char_indices().peekable();
             let mut single = false;
             let mut double = false;
+            // The lookahead for a bracket's `]` and a brace's `}` is computed
+            // once, not per `[`/`{`: a word of 20,000 unclosed `[` rescanned
+            // its remainder at each one.
+            let last_bracket_close = raw.rfind(']');
+            let mut brace_region: Option<(usize, Option<usize>)> = None;
             while let Some((index, ch)) = chars.next() {
                 match ch {
                     '\\' if !single => {
@@ -1303,14 +1360,21 @@ fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
                     // can glob-expand into a different executable. Brace
                     // groups additionally need a `,`/`..` inside — `{}` and
                     // `{word}` are literal.
-                    '[' if !single && !double && raw[index + ch.len_utf8()..].contains(']') => {
-                        return true;
-                    }
-                    '{' if !single
+                    '[' if !single
                         && !double
-                        && posix_brace_remainder_may_expand(&raw[index + ch.len_utf8()..]) =>
+                        && last_bracket_close.is_some_and(|at| at > index) =>
                     {
                         return true;
+                    }
+                    '{' if !single && !double => {
+                        let (close, last_expanding) = match brace_region {
+                            Some(region) if index < region.0 => region,
+                            _ => posix_brace_region(raw, index + 1),
+                        };
+                        brace_region = Some((close, last_expanding));
+                        if last_expanding.is_some_and(|at| at > index) {
+                            return true;
+                        }
                     }
                     '<' | '>' if !single && matches!(chars.peek(), Some((_, '('))) => return true,
                     _ => {}
@@ -1368,6 +1432,9 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
             let mut chars = raw.char_indices().peekable();
             let mut single = false;
             let mut double = false;
+            // Linear lookahead, as in `git_token_has_active_expansion`.
+            let last_bracket_close = raw.rfind(']');
+            let mut brace_region: Option<(usize, Option<usize>)> = None;
             while let Some((index, ch)) = chars.next() {
                 match ch {
                     '\\' if !single => {
@@ -1379,14 +1446,21 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
                     // See `git_token_has_active_expansion`: `[`/`{` without a
                     // later closing delimiter in the same word are literal,
                     // and brace groups additionally need a `,`/`..` inside.
-                    '[' if !single && !double && raw[index + ch.len_utf8()..].contains(']') => {
-                        return true;
-                    }
-                    '{' if !single
+                    '[' if !single
                         && !double
-                        && posix_brace_remainder_may_expand(&raw[index + ch.len_utf8()..]) =>
+                        && last_bracket_close.is_some_and(|at| at > index) =>
                     {
                         return true;
+                    }
+                    '{' if !single && !double => {
+                        let (close, last_expanding) = match brace_region {
+                            Some(region) if index < region.0 => region,
+                            _ => posix_brace_region(raw, index + 1),
+                        };
+                        brace_region = Some((close, last_expanding));
+                        if last_expanding.is_some_and(|at| at > index) {
+                            return true;
+                        }
                     }
                     '<' | '>' if !single && !double && matches!(chars.peek(), Some((_, '('))) => {
                         return true;
@@ -4332,6 +4406,14 @@ const fn symbolic_scan_decision(
 /// regex-backed rules. Unknown callers retain the historical conservative
 /// behavior.
 pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDialect) -> bool {
+    command_executes_git_in_dialect_at(command, dialect, 0)
+}
+
+/// How many `watch`/`xargs`/`parallel`/`find -exec` layers are looked
+/// through before the answer is "may execute git" (the conservative one).
+const MAX_EXEC_WRAPPER_DEPTH: usize = 8;
+
+fn command_executes_git_in_dialect_at(command: &str, dialect: ShellDialect, depth: usize) -> bool {
     if dialect == ShellDialect::Unknown {
         return true;
     }
@@ -4380,6 +4462,18 @@ pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDiale
     {
         return true;
     }
+    if dialect == ShellDialect::Posix {
+        let payloads = exec_wrapper_payloads(command, &tokens);
+        if !payloads.is_empty() && depth >= MAX_EXEC_WRAPPER_DEPTH {
+            return true;
+        }
+        if payloads
+            .iter()
+            .any(|payload| command_executes_git_in_dialect_at(payload, dialect, depth + 1))
+        {
+            return true;
+        }
+    }
     let Some(decoded) = decode_git_semantic_words(command, dialect) else {
         return false;
     };
@@ -4391,6 +4485,267 @@ pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDiale
         return true;
     }
     dialect == ShellDialect::Posix && frontend_bail_may_execute_git(&decoded.words, dialect)
+}
+
+/// The commands a POSIX `watch`, `xargs`, `parallel` or `find -exec` runs.
+///
+/// Each runs its operand words as a command of its own, as `nice` or
+/// `timeout` does, but none is a wrapper
+/// [`crate::normalize::strip_wrapper_prefixes`] strips, so `git` there was
+/// never in executable position: `watch git reset --hard`,
+/// `echo a | xargs git reset --hard` and `find . -exec git reset --hard \;`
+/// were allowed while `rm -rf` behind the same wrappers denied (the
+/// filesystem rules are not position-gated). Returns each command the
+/// wrapper can run; the caller recurses, which handles `xargs sudo git …` and
+/// nested wrappers.
+///
+/// An option this does not know may take a value, so the word after that
+/// value is tried as the command too: `parallel --retries 3 git …` was read as
+/// running `3`. (A command these run from one quoted string, `watch 'git …'`
+/// or `parallel ::: 'git …'`, is extracted and re-evaluated whole by
+/// `heredoc::extract_command_string_runner_scripts`.)
+fn exec_wrapper_payloads<'a>(
+    command: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Vec<&'a str> {
+    let words: Vec<(&str, usize)> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| Some((token.text(command)?, token.byte_range.start)))
+        .collect();
+    let Some(&(first, _)) = words.first() else {
+        return Vec::new();
+    };
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let from = |index: usize| {
+        words
+            .get(index)
+            .and_then(|(_, start)| command.get(*start..))
+    };
+    // (options whose value is the next word, options known to take none)
+    let (value_options, flag_options): (&[&str], &[&str]) = match name {
+        "find" | "gfind" => {
+            return words
+                .iter()
+                .enumerate()
+                .filter(|(_, (word, _))| matches!(*word, "-exec" | "-execdir" | "-ok" | "-okdir"))
+                .filter_map(|(index, _)| from(index + 1))
+                .collect();
+        }
+        "xargs" | "gxargs" => (
+            &[
+                "-a",
+                "-d",
+                "-E",
+                "-I",
+                "-J",
+                "-L",
+                "-n",
+                "-P",
+                "-R",
+                "-s",
+                "-S",
+                "--arg-file",
+                "--delimiter",
+                "--max-args",
+                "--max-procs",
+                "--max-chars",
+                "--max-lines",
+                "--process-slot-var",
+            ],
+            &[
+                "-0",
+                "-e",
+                "-i",
+                "-l",
+                "-o",
+                "-p",
+                "-r",
+                "-t",
+                "-x",
+                "--null",
+                "--eof",
+                "--replace",
+                "--open-tty",
+                "--interactive",
+                "--no-run-if-empty",
+                "--show-limits",
+                "--verbose",
+                "--exit",
+            ],
+        ),
+        "watch" => (
+            &["-n", "--interval", "-q", "--equexit"],
+            &[
+                "-b",
+                "-c",
+                "-C",
+                "-d",
+                "-e",
+                "-g",
+                "-p",
+                "-r",
+                "-t",
+                "-w",
+                "-x",
+                "--beep",
+                "--color",
+                "--no-color",
+                "--differences",
+                "--errexit",
+                "--chgexit",
+                "--precise",
+                "--no-rerun",
+                "--no-title",
+                "--no-wrap",
+                "--exec",
+            ],
+        ),
+        "parallel" => (
+            &[
+                "-a",
+                "-C",
+                "-I",
+                "-j",
+                "-L",
+                "-N",
+                "-P",
+                "-S",
+                "--arg-file",
+                "--colsep",
+                "--delay",
+                "--jobs",
+                "--joblog",
+                "--max-args",
+                "--results",
+                "--sshlogin",
+                "--timeout",
+            ],
+            &[
+                "-0",
+                "-k",
+                "-q",
+                "-r",
+                "-u",
+                "-v",
+                "-X",
+                "-m",
+                "--bar",
+                "--dry-run",
+                "--eta",
+                "--group",
+                "--keep-order",
+                "--line-buffer",
+                "--null",
+                "--pipe",
+                "--progress",
+                "--quote",
+                "--tag",
+                "--ungroup",
+                "--verbose",
+                "--xargs",
+            ],
+        ),
+        _ => return Vec::new(),
+    };
+    let mut payloads: Vec<&'a str> = Vec::new();
+    let mut index = 1usize;
+    while let Some(&(word, _)) = words.get(index) {
+        if word == "--" {
+            payloads.extend(from(index + 1));
+            return payloads;
+        }
+        if word.len() > 1 && word.starts_with('-') {
+            if value_options.contains(&word) {
+                index += 2;
+                continue;
+            }
+            let known_flag = flag_options.contains(&word)
+                || word.contains('=')
+                || value_options
+                    .iter()
+                    .chain(flag_options)
+                    .any(|option| option.len() == 2 && word.len() > 2 && word.starts_with(option));
+            if !known_flag {
+                payloads.extend(from(index + 2));
+            }
+            index += 1;
+            continue;
+        }
+        payloads.extend(from(index));
+        return payloads;
+    }
+    payloads
+}
+
+/// Programs that run the rest of their words as a command but whose options
+/// this does not model: when one of those words may be git, git may run.
+/// Pure wrappers take any later word; subcommand runners only behind their
+/// run subcommand.
+pub(crate) fn unmodeled_exec_wrapper(basename: &str, next: Option<&str>) -> bool {
+    matches!(
+        basename,
+        "sudo"
+            | "doas"
+            | "chronic"
+            | "unbuffer"
+            | "caffeinate"
+            | "flock"
+            | "taskset"
+            | "numactl"
+            | "cpulimit"
+            | "prlimit"
+            | "strace"
+            | "ltrace"
+            | "valgrind"
+            | "systemd-run"
+            | "runuser"
+            | "unshare"
+            | "nsenter"
+            | "chroot"
+            | "firejail"
+            | "bwrap"
+            | "xvfb-run"
+            | "dbus-run-session"
+            | "entr"
+            | "watchexec"
+            | "sem"
+            | "tsp"
+            | "retry"
+            | "catchsegv"
+            | "faketime"
+            | "proxychains"
+            | "proxychains4"
+            | "torsocks"
+            | "tini"
+            | "dumb-init"
+            | "gosu"
+            | "su-exec"
+            | "setpriv"
+            | "systemd-inhibit"
+            | "script"
+            | "gdb"
+            | "eatmydata"
+            | "fakeroot"
+            | "cgexec"
+            | "flatpak-spawn"
+            | "pkexec"
+            | "run0"
+            // The remote command `ssh` runs is judged like a local one
+            // (#326); unquoted it was never extracted, and git there was
+            // never in executable position.
+            | "ssh"
+    ) || matches!(
+        (basename, next),
+        (
+            "direnv" | "bundle" | "docker" | "podman" | "kubectl" | "oc",
+            Some("exec")
+        ) | ("nix", Some("develop" | "shell" | "run"))
+            | (
+                "uv" | "poetry" | "pipenv" | "pdm" | "rye" | "hatch" | "pixi",
+                Some("run")
+            )
+    )
 }
 
 /// #260 deny-direction backstop: a command whose executable is a *known*
@@ -4422,14 +4777,22 @@ fn frontend_bail_may_execute_git(words: &[GitSemanticWord], dialect: ShellDialec
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(&first.decoded);
-    if !crate::normalize::is_posix_execution_frontend_basename(basename) {
+    let next = words.get(index + 1).map(|word| word.decoded.as_str());
+    if !crate::normalize::is_posix_execution_frontend_basename(basename)
+        && !unmodeled_exec_wrapper(basename, next)
+    {
         return false;
     }
     words[index + 1..].iter().any(|word| {
         git_semantic_executable_may_equal(word, dialect, "git")
             || git_semantic_executable_may_equal(word, dialect, "git.exe")
-            || git_semantic_executable_may_equal(word, dialect, "git-branch")
-            || git_semantic_executable_may_equal(word, dialect, "git-branch.exe")
+            // Same stale-list hazard as `symbolic_posix_may_execute_git`: a
+            // wrapper whose strip bailed must still be able to name any dashed
+            // built-in, not only `git-branch` (#400).
+            || CORE_GIT_DASHED_BUILTINS.iter().any(|(bare, exe, _)| {
+                git_semantic_executable_may_equal(word, dialect, bare)
+                    || git_semantic_executable_may_equal(word, dialect, exe)
+            })
     })
 }
 
@@ -4602,18 +4965,55 @@ pub(crate) fn syntax_view_for_pattern_matching(
     // every other dashed built-in synthesized a bare `git` and *dropped its
     // subcommand*, which is why `git-reset --hard` was read as `git --hard` and
     // matched nothing at all.
+    // A bounded symbolic word can stand for several built-ins, and picking the
+    // first table entry is a guess that lands on the benign reading (#428):
+    // `git-c$X` resolved to `checkout`, synthesized `git checkout -fdx`, and
+    // matched nothing, while the unambiguous `git-cl$X -fdx` denied.
+    //
+    // The view has to stay a single command — `syntax_view_in_dialect` drops
+    // any view carrying a separator, so the candidate readings cannot simply be
+    // joined — so the ambiguity is resolved by the pack's own verdict rather
+    // than by table order: the reading presented is one this pack would deny,
+    // if any candidate reading is. `check` is safe-patterns-first, so
+    // `git-c$X -n` still presents a benign reading (`git clean -n` is exempt,
+    // and `checkout -n` is nothing), while `git-c$X -fdx` presents
+    // `git clean -fdx`. Every argv word here is literal — a dynamic one
+    // returned the sanitized view above — so each reading is a faithful
+    // spelling of what that candidate would run.
     let executable_unbounded = git_semantic_executable_is_unbounded(executable, dialect);
-    let mut synthetic = match (
-        executable_unbounded,
-        dashed_git_builtin_subcommand(executable, dialect),
-    ) {
-        (false, Some(subcommand)) => format!("git {subcommand}"),
-        _ => String::from("git"),
-    };
+    let mut args = String::new();
     for word in decoded.words.iter().skip(executable_index + 1) {
-        synthetic.push(' ');
-        synthetic.push_str(&shell_words::quote(&word.decoded));
+        args.push(' ');
+        args.push_str(&shell_words::quote(&word.decoded));
     }
+    let subcommands = if executable_unbounded {
+        SmallVec::<[&'static str; 4]>::new()
+    } else {
+        dashed_git_builtin_subcommands(executable, dialect)
+    };
+    let synthetic = match subcommands.as_slice() {
+        [] => format!("git{args}"),
+        [only] => format!("git {only}{args}"),
+        candidates => {
+            let readings = candidates
+                .iter()
+                .map(|subcommand| format!("git {subcommand}{args}"));
+            let mut fallback = None;
+            let mut destructive = None;
+            for reading in readings {
+                if AMBIGUITY_ARBITER.check(&reading).is_some() {
+                    destructive = Some(reading);
+                    break;
+                }
+                if fallback.is_none() {
+                    fallback = Some(reading);
+                }
+            }
+            destructive
+                .or(fallback)
+                .unwrap_or_else(|| format!("git{args}"))
+        }
+    };
     let sanitized = crate::context::sanitize_for_pattern_matching(&synthetic);
     syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::Posix)
 }
@@ -5028,8 +5428,12 @@ pub fn create_pack() -> Pack {
     }
 }
 
-/// Every rule in this pack spells its executable as
-/// `git(?:\s+(?:\S+\s+)*|-)<subcommand>` — whitespace *or* a hyphen (#400).
+/// Most rules in this pack spell their executable as two alternatives (#400):
+///
+/// ```text
+/// (?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*      the spaced spelling
+/// (?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-   the dashed builtin
+/// ```
 ///
 /// Git ships its subcommands as dashed helper executables under
 /// `git --exec-path`, so `git-reset --hard`, `git-clean -fdx`, and
@@ -5039,28 +5443,89 @@ pub fn create_pack() -> Pack {
 /// pack's own rules were a rename away from bypass. `strict_git` had already
 /// been through this (#367); `core.git` had no equivalent.
 ///
-/// The hyphen branch takes no intermediate words on purpose: a dashed builtin
-/// carries its options *after* the subcommand, so `git-<sub>` must be followed
-/// immediately by that rule's own argument shape. That is what keeps
-/// `git-lfs install`, `git-crypt unlock`, and any other `git-*` third-party
-/// executable unmatched — the subcommand token after `git-` has to be this
-/// rule's, not merely something hyphenated onto `git`. The leading
-/// `[^[:alnum:]_-]` guard is unchanged, so `mygit-reset` and `--no-git-reset`
-/// stay unmatched too.
+/// **The two branches carry different leading guards, and that asymmetry is the
+/// point.** The spaced branch may begin after anything that is not a word
+/// character, because what follows is `git` plus a *separate* subcommand token.
+/// The dashed branch may only begin where a command can actually start — string
+/// start, or after `;`, `&`, `|`, `(`, or a newline, optionally through one
+/// path component. Sharing the loose guard let the dashed branch re-anchor on
+/// any argv token that merely *contained* `git-<sub>`, which broke both ways:
+/// `git log --grep="git-reset --hard"` and `git status bin/git-restore .`
+/// became denials, and a safe pattern could re-anchor *past* the flag that was
+/// supposed to disqualify it, so `git clean -fdx -- . git-clean -n` matched
+/// `clean-dry-run-short` and the genuinely destructive `git clean -fdx -- .`
+/// rode through on the exemption.
 ///
-/// Safe patterns carry the same prefix, so the dry-run spellings
+/// **The spaced branch's `(?:\S+\s+)*` accepts any token. That is a hole in the
+/// SAFE direction only, and the two directions are now spelled differently.**
+/// See #429: the wildcard swallows the real subcommand, so a safe pattern can
+/// match a flag that belongs to a later pathspec — `git clean -fdx -- . clean
+/// -n` matched `clean-dry-run-short` and the destructive `git clean -fdx -- .`
+/// rode through on the exemption, while real git accepted the trailing tokens
+/// as pathspecs and deleted the tree.
+///
+/// Narrowing the prefix for *every* rule was tried in a887a5f and reverted in
+/// 58daf61, and the measurement is worth keeping: with a grammar-accurate
+/// prefix, `evaluator::tests::explicit_shell_dialects_close_core_git_escape_bypasses`
+/// stops denying `PART=i; g${PART}t reset --hard` under Posix, re-opening a
+/// proven escape-sequence bypass. Reverting *only* the `reset-hard` prefix makes
+/// it pass again, so the prefix is the cause; admitting assignment-shaped tokens
+/// (`\S+=\S*`) as well does not fix it, because the leftover is a bare word.
+/// These patterns do not run against a command line — they run against a
+/// synthesized view, and for a variable-spliced executable that view carries a
+/// bare fragment where a subcommand would be.
+///
+/// **The asymmetry is what makes the narrow prefix safe on the allow side.** A
+/// destructive pattern that stops matching is a missed denial, so its prefix
+/// stays permissive and keeps the bypass guard above. A safe pattern that stops
+/// matching only withdraws an exemption: the command then faces the pack's
+/// destructive rules, which is the conservative direction. So `create_safe_patterns`
+/// spells Git's real grammar — `git [global-options] <subcommand>`, where an
+/// intermediate word is an option or the value of one of the global options that
+/// take a separate value (the same set `resolve_visible_alias_invocation` walks)
+/// — and `create_destructive_patterns` keeps `(?:\S+\s+)*`. Do not unify them.
+///
+/// The safe patterns whose evidence is a *flag* carry a second constraint for
+/// the same reason. Git's `parse_options` permutes, so `git clean . -n` really
+/// is a dry run and the flag cannot be required to sit immediately after the
+/// subcommand; but a bare `--` ends option parsing, so everything after it is a
+/// pathspec and `git clean -fdx -- . clean -n` deletes. The walk from the
+/// subcommand to the flag therefore accepts any token except a bare `--`, and
+/// stops at a quote as well: a quoted `'--'` is still the separator to git,
+/// and the walk runs on a view that may have lost the quotes.
+///
+/// The dashed branch takes no intermediate words on purpose: a dashed builtin
+/// carries its options *after* the subcommand, so `git-<sub>` must be followed
+/// immediately by that rule's own argument shape. That, plus the
+/// `command_executes_git_in_dialect` executable gate, is what keeps
+/// `git-lfs install`, `git-crypt unlock`, and any other `git-*` third-party
+/// executable unmatched. `mygit-reset` and `--no-git-reset` stay unmatched too.
+///
+/// Two rules spell their executable differently and are deliberately not part
+/// of this shape: `branch-force-delete` carries its own
+/// `(?i:…|git-branch(?:\.exe)?)` alternation, and the `push-force-*` rules use
+/// `[^\s&;|`()<>]+` rather than `\S+`.
+///
+/// Safe patterns keep a dashed branch too, so the dry-run spellings
 /// (`git-clean -n`, `git-lfs prune --dry-run`) keep their exemption rather than
-/// falling through to the destructive rule.
+/// falling through to the destructive rule — but it anchors at the start of the
+/// text only, where the destructive branch also accepts `;`, `&`, `|`, `(` and a
+/// newline. #431: safe matching runs on a view with the quotes removed, so a
+/// *quoted* separator arrives as a bare one and satisfies a guard that means "a
+/// command really starts here"; `git clean -fdx -- . '(' git-clean -n` was
+/// allowed, and git treats the extra tokens as pathspecs. Quote removal cannot
+/// manufacture a string start, and safe matching is per segment, so a dashed
+/// builtin in real command position is the segment's first word.
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         // Branch creation is safe
         safe_pattern!(
             "checkout-new-branch",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)checkout\s+-b\s+"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)checkout\s+-b\s+"
         ),
         safe_pattern!(
             "checkout-orphan",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)checkout\s+--orphan\s+"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)checkout\s+--orphan\s+"
         ),
         // restore --staged only affects the index, not the working tree, so it
         // is safe. `--staged`/`-S` is a flag that may appear in ANY position
@@ -5070,20 +5535,20 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // the restore touch the working tree (handled by `restore-worktree-explicit`).
         safe_pattern!(
             "restore-staged-long",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree|-W)\b)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--staged\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         safe_pattern!(
             "restore-staged-short",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree|-W)\b)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+-S\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         // clean dry-run just previews, doesn't delete
         safe_pattern!(
             "clean-dry-run-short",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)clean\s+-[a-z]*n[a-z]*"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+-[a-z]*n[a-z]*"
         ),
         safe_pattern!(
             "clean-dry-run-long",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)clean\s+--dry-run"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--dry-run"
         ),
         // `git lfs prune --dry-run` reports what it would delete and deletes
         // nothing (Refs PR #383). The flag must be a whole token — `--dry-runx`
@@ -5091,11 +5556,20 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // walk stops at a quote or a redirection glyph.
         safe_pattern!(
             "lfs-prune-dry-run",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)lfs\s+prune(?:\s+[^\s;&|<>\x22']+)*\s+--dry-run(?:\s|$)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--dry-run(?:\s|$)"
         ),
     ]
 }
 
+/// The destructive patterns for `core.git`.
+///
+/// Like `core.filesystem`, this pack is argv-inert: the evaluator discards any
+/// match here whose first alphanumeric byte lands in an operand span, quoted or
+/// not, which is what keeps `git commit -m "rm -rf /"` from being read as the
+/// command it quotes. Rules must therefore key on the command word or an
+/// option, never on a path sitting in argv. The full statement of the
+/// constraint, and where a path-keyed rule belongs instead, is on
+/// `core::filesystem::create_destructive_patterns` (#460).
 #[allow(clippy::too_many_lines)]
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // Severity levels:
@@ -5163,7 +5637,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // checkout -- discards uncommitted changes
         destructive_pattern!(
             "checkout-discard",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)checkout\s+--\s+",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+--\s+",
             "git checkout -- discards uncommitted changes permanently. Use 'git stash' first.",
             High,
             "git checkout -- <path> discards all uncommitted changes to the specified files \
@@ -5194,7 +5668,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "checkout-ref-discard",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)checkout\s+(?!-b\b)(?!--orphan\b)[^\s]+\s+--\s+",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+(?!-b\b)(?!--orphan\b)[^\s]+\s+--\s+",
             "git checkout <ref> -- <path> overwrites working tree. Use 'git stash' first.",
             High,
             "git checkout <ref> -- <path> replaces your working tree files with versions from \
@@ -5224,6 +5698,154 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
+        // `git checkout .` / `git checkout <ref> .` (no `--`) discards every
+        // uncommitted change under the pathspec, exactly like the blocked
+        // `git checkout -- .` and `git restore .`. The `--`-only rules above
+        // deliberately leave the general `git checkout <pathspec>` alone
+        // because a bare word is ambiguous with a branch name — but `.` (and
+        // `./…`) is NEVER a valid ref, so it is an unambiguous working-tree
+        // discard that was slipping through.
+        destructive_pattern!(
+            "checkout-discard-cwd",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+(?!-b\b)(?!--orphan\b)(?:[^\s;&|<>()]+\s+)*\.(?:/[^\s;&|<>()]*)?(?:\s|$|[;&|<>)])",
+            "git checkout . discards all uncommitted changes in the path. Use 'git stash' first.",
+            High,
+            "git checkout . (or git checkout <ref> .) overwrites the working tree from the \
+             index or a commit, discarding every uncommitted change under the current \
+             directory. The changes were never committed, so they cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes first, restore later with 'git stash pop'\n\
+             - git diff: review exactly what would be discarded\n\
+             - git checkout <ref> -- <specific-file>: limit the overwrite to reviewed files"
+        ),
+        // `git filter-branch` rewrites every commit in the history it touches
+        // and can silently drop commits; `git-filter-repo` (its recommended
+        // replacement) is already treated as unverifiable. Rewritten history
+        // must be reviewed before it is force-pushed over a shared branch.
+        destructive_pattern!(
+            "filter-branch",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)filter-branch\b",
+            "git filter-branch rewrites repository history and can permanently drop commits. Back up the refs first.",
+            High,
+            "git filter-branch rewrites every commit in the selected range, changing their \
+             hashes and, with the wrong filter, silently dropping commits or files. The \
+             original commits survive only in the reflog until it expires or is pruned.\n\n\
+             Safer alternatives:\n\
+             - Back up first: git branch backup-before-rewrite\n\
+             - Prefer git-filter-repo (faster, safer) and review the result\n\
+             - Force-push a rewritten branch only with --force-with-lease"
+        ),
+        // `git reflog expire --expire=now` (and `--expire-unreachable=now`)
+        // destroys the reflog entries that are the last recovery path for
+        // reset/rebase/branch-deletion mistakes; paired with `gc --prune=now`
+        // the lost commits become truly unrecoverable.
+        destructive_pattern!(
+            "reflog-expire-now",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reflog\s+expire\b[^|;&\r\n]*--expire(?:-(?:u(?:n(?:r(?:e(?:a(?:c(?:h(?:a(?:b(?:le?)?)?)?)?)?)?)?)?)?)?)?=(?:now|all|0)\b",
+            "git reflog expire --expire=now destroys the reflog, removing the ability to recover lost commits.",
+            High,
+            "The reflog records where HEAD and each branch pointed, and is what lets you \
+             recover from a bad reset, rebase, or branch deletion. Expiring it with \
+             --expire=now deletes those entries immediately; after a subsequent \
+             gc --prune=now the orphaned commits cannot be recovered at all.\n\n\
+             Safer alternatives:\n\
+             - Let the reflog expire on its default schedule (90 days)\n\
+             - Recover what you need first: git reflog, then git branch <name> <sha>"
+        ),
+        // `git checkout -f <branch>` / `--force`: switching with force throws
+        // away every uncommitted change to tracked files — the effect of the
+        // Critical `reset --hard`, and the reflex an agent reaches for when a
+        // plain checkout refuses ("your local changes would be overwritten").
+        // fe556e9 deferred it as a posture call; the posture this project
+        // states is that an extra prompt beats lost work. `-f` inside a short
+        // cluster counts (`-qf`); `--ours`/`--theirs`/`--conflict=` do not.
+        destructive_pattern!(
+            "checkout-force",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\b[^;&|\n<>()]*?\s(?:--f(?:o(?:r(?:ce?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            "git checkout -f/--force discards all uncommitted changes to tracked files. Use 'git stash' first.",
+            High,
+            "git checkout --force switches branches (or rewrites paths) even when that \
+             overwrites local modifications, and those modifications are discarded. They \
+             were never committed, so they cannot be recovered — the same outcome as \
+             git reset --hard.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes, switch, then 'git stash pop'\n\
+             - git worktree add ../other <branch>: check the branch out alongside\n\
+             - git status / git diff: see exactly what the force would discard"
+        ),
+        // `git switch -f` / `--force` / `--discard-changes`: the modern
+        // spelling of the same force-switch discard.
+        destructive_pattern!(
+            "switch-discard",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)switch\b[^;&|\n<>()]*?\s(?:--force|--di(?:s(?:c(?:a(?:r(?:d(?:-(?:c(?:h(?:a(?:n(?:g(?:es?)?)?)?)?)?)?)?)?)?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            "git switch --discard-changes/-f discards all uncommitted changes to tracked files. Use 'git stash' first.",
+            High,
+            "git switch --discard-changes (alias -f/--force) switches branches and throws \
+             away local modifications that would otherwise block the switch. They were never \
+             committed, so they cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes, switch, then 'git stash pop'\n\
+             - git switch -c <new-branch>: carry the changes to a new branch instead\n\
+             - git worktree add ../other <branch>: check the branch out alongside"
+        ),
+        // `git rm -f` deletes the files from the working tree even when they
+        // carry uncommitted modifications — the up-to-date check `-f` exists
+        // to override. `git rm -rf .` was only denied by accident, by the
+        // filesystem `rm -rf` text rule, and `git rm -f <file>` was allowed.
+        // `--cached` (index only, worktree kept) and dry runs stay allowed.
+        destructive_pattern!(
+            "rm-force",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)rm\b(?![^;&|\n]*\s(?:--cached|--dry-run|-[A-Za-z]*n[A-Za-z]*)(?:\s|$))[^;&|\n<>()]*?\s(?:--f(?:o(?:r(?:ce?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            "git rm -f deletes files even when they have uncommitted modifications. Commit or stash them first.",
+            High,
+            "git rm --force removes the named files from the index AND the working tree, \
+             bypassing the check that would otherwise refuse when they differ from HEAD. \
+             Committed content can be restored from history, but any uncommitted edits to \
+             those files are gone.\n\n\
+             Safer alternatives:\n\
+             - git rm --cached <path>: stop tracking but keep the file on disk\n\
+             - git rm -n <path>: preview which files would be removed\n\
+             - git stash or git commit first, then git rm without -f"
+        ),
+        // `git update-ref -d <ref>` deletes a branch or any other ref outright
+        // — the plumbing spelling of `git branch -D`, which already requires
+        // approval (README FAQ: every branch deletion is an approval boundary).
+        destructive_pattern!(
+            "update-ref-delete",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)update-ref\b[^;&|\n<>()]*?\s(?:-d|--delete)(?:\s|$)",
+            "git update-ref -d deletes a ref (e.g. a branch) outright, like git branch -D.",
+            High,
+            "git update-ref -d is the plumbing form of deleting a ref. Pointed at \
+             refs/heads/<branch> it is git branch -D without the safety messages; commits \
+             reachable only from that ref survive only in the reflog.\n\n\
+             Safer alternatives:\n\
+             - git branch -vv: review the ref first\n\
+             - git branch backup/<name> <ref>: keep a pointer before deleting\n\
+             - git branch -d <branch>: the porcelain delete, which refuses unmerged branches"
+        ),
+        // `git read-tree --reset -u <tree>` is the plumbing under `git reset
+        // --hard`: `--reset` loads the tree into the index discarding every
+        // staged and unmerged entry, and `-u` then rewrites the working tree
+        // to match, overwriting uncommitted modifications. It was allowed
+        // while its porcelain was Critical. `--reset` needs `-u` to touch the
+        // worktree, so both must be present (either order, `-u` alone or in a
+        // short cluster such as `-vu`; git accepts `--res`/`--rese` too).
+        // `-m -u` is not matched: a merge refuses to overwrite local changes.
+        destructive_pattern!(
+            "read-tree-reset",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)read-tree\b(?=[^;&|\n<>()]*\s--res(?:e(?:t)?)?(?:\s|$|[;&|)]))(?=[^;&|\n<>()]*\s-[A-Za-z]*u[A-Za-z]*(?:\s|$|[;&|)]))",
+            "git read-tree --reset -u overwrites the working tree like git reset --hard, destroying uncommitted changes.",
+            Critical,
+            "git read-tree --reset -u is the plumbing form of git reset --hard. It replaces \
+             the index with the given tree, discarding staged and unmerged entries, and -u \
+             then rewrites the working tree to match, overwriting every uncommitted \
+             modification to tracked files. Those changes were never committed, so they \
+             cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes first, restore later with 'git stash pop'\n\
+             - git read-tree -m -u <tree>: a merge that refuses to overwrite local changes\n\
+             - git status / git diff: see exactly what would be discarded"
+        ),
         // `git show <ref>:<path>` is safe on its own (stdout only), and the
         // checkout-ref-discard remediation above recommends it. But redirected
         // back onto the SAME path it reaches the identical end state that rule
@@ -5237,7 +5859,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // it instead.
         destructive_pattern!(
             "show-redirect-overwrite-source",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)show\s+[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
             "git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'.",
             High,
             "Redirecting `git show <ref>:<path>` back onto `<path>` replaces the working-tree \
@@ -5276,7 +5898,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `restore-worktree-explicit` below regardless of `--staged`.
         destructive_pattern!(
             "restore-worktree",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)restore\b(?=\s)(?!.*\s(?:--staged|-S)\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?!.*\s(?:--staged|-S)\b)",
             "git restore discards uncommitted changes. Use 'git stash' or 'git diff' first.",
             High,
             "git restore <path> discards uncommitted changes in your working directory, \
@@ -5312,7 +5934,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "restore-worktree-explicit",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)restore\s+.*(?:--worktree|-W\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\s+.*(?:--worktree|-W\b)",
             "git restore --worktree/-W discards uncommitted changes permanently.",
             High,
             "git restore --worktree (or -W) explicitly targets your working directory, \
@@ -5340,9 +5962,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             }
         ),
         // reset --hard destroys uncommitted work (CRITICAL - extremely common mistake)
+        //
+        // `--hard` may follow other arguments (`git reset HEAD~1 --hard`,
+        // `git reset -q --hard`), and git accepts any unambiguous prefix of a
+        // long option, down to `--h` here. Both were allowed while only
+        // `reset --hard` in first position denied.
         destructive_pattern!(
             "reset-hard",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)reset\s+--hard",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--h(?:a(?:rd?)?)?\b",
             "git reset --hard destroys uncommitted changes. Use 'git stash' first.",
             Critical,
             "git reset --hard discards ALL uncommitted changes in your working directory \
@@ -5380,7 +6007,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "reset-merge",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)reset\s+--merge",
+            // Anywhere in the reset, and down to `--me` (`--m` is ambiguous
+            // with `--mixed`), for the same reasons as `reset-hard`.
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--me(?:r(?:ge?)?)?\b",
             "git reset --merge can lose uncommitted changes.",
             High,
             "git reset --merge resets the index and updates files in the working tree that \
@@ -5408,7 +6037,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // clean -f deletes untracked files (CRITICAL - permanently removes files)
         destructive_pattern!(
             "clean-force",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)clean\s+(?:-[a-z]*f|--force\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()]+)*\s+(?:-[a-z]*f|--f(?:o(?:r(?:ce?)?)?)?\b)",
             "git clean -f/--force removes untracked files permanently. Review with 'git clean -n' first.",
             Critical,
             "git clean -f permanently deletes untracked files from your working directory. \
@@ -5529,6 +6158,35 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
+        // `git push origin +main` / `+HEAD:main` / `+refs/heads/*:refs/heads/*`:
+        // a leading `+` on a refspec is git's per-ref force flag — the same
+        // overwrite as `--force` for that ref, with no flag for the two rules
+        // above to see. Same bounded walker, so it stays inside one command.
+        destructive_pattern!(
+            "push-force-refspec",
+            r#"(?:^|[^[:alnum:]_-])git(?:\s+(?:[^\s&;|`()<>]+\s+)*|-)push\s+(?:[^\s&;|`()<>]+\s+)*['"]?\+[^\s&;|`()<>]+"#,
+            "A '+' refspec force-pushes that ref and can destroy remote history. Use --force-with-lease if necessary.",
+            Critical,
+            "In `git push <remote> +<ref>`, the leading `+` forces that one update exactly as \
+             --force would, overwriting remote history with your local history. Commits \
+             others already pushed to that ref are discarded from the remote.\n\n\
+             Safer alternative:\n\
+             - git push --force-with-lease <remote> <ref>: only forces if the remote still \
+             matches what you last fetched\n\n\
+             Check remote state first:\n  git fetch && git log origin/<branch>..HEAD",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git push --force-with-lease origin {branch}",
+                        "Fails if remote has new commits you haven't fetched",
+                    ),
+                    PatternSuggestion::new(
+                        "git fetch && git log origin/{branch}..HEAD",
+                        "Preview what you're about to overwrite on the remote",
+                    ),
+                ]
+            }
+        ),
         // Branch deletion and forced ref updates cross a user-intent boundary.
         // Lowercase `-d` checks merge state, but still removes the branch name,
         // tracking configuration, and convenient reflog anchor. Agents must
@@ -5590,7 +6248,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // stash destruction (Medium: single stash, recoverable via fsck/unreachable objects)
         destructive_pattern!(
             "stash-drop",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)stash\s+drop",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)stash\s+drop",
             "git stash drop deletes a single stash. Recoverable via `git fsck` (unreachable objects).",
             Medium,
             "git stash drop removes a specific stash entry from your stash list. The stashed \
@@ -5627,7 +6285,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // stash clear destroys ALL stashes (CRITICAL)
         destructive_pattern!(
             "stash-clear",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)stash\s+clear",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)stash\s+clear",
             "git stash clear permanently deletes ALL stashed changes.",
             Critical,
             "git stash clear removes ALL stash entries at once. Unlike git stash drop, \
@@ -5665,7 +6323,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rewrite history do.
         destructive_pattern!(
             "lfs-migrate-rewrite",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)lfs\s+migrate\s+(?:import|export)(?![\w-])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+migrate\s+(?:import|export)(?![\w-])",
             "git lfs migrate import/export rewrites history — every commit in the range gets a new SHA.",
             High,
             "git lfs migrate import/export rewrites the commits it touches:\n\n\
@@ -5694,7 +6352,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "lfs-prune",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)lfs\s+prune(?![\w-])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?![\w-])",
             "git lfs prune deletes local LFS objects; with --force it deletes objects the remote does not have.",
             Medium,
             "git lfs prune deletes local Git LFS objects from .git/lfs/objects:\n\n\
@@ -5722,7 +6380,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "lfs-uninstall",
-            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*|-)lfs\s+uninstall(?![\w-])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+uninstall(?![\w-])",
             "git lfs uninstall removes the LFS filters and hooks, so LFS files check out as pointer text.",
             Medium,
             "git lfs uninstall removes Git LFS from the git configuration:\n\n\
@@ -5883,6 +6541,72 @@ mod tests {
                 .is_some_and(|view| view.contains("git branch")),
             "proven git-branch keeps its synthesis: {view:?}"
         );
+    }
+
+    /// #428: a bounded symbolic executable can stand for several dashed
+    /// built-ins, and the first table match is a guess. `git-c$X` resolved to
+    /// `checkout`, synthesized `git checkout -fdx`, and matched nothing —
+    /// while the unambiguous `git-cl$X -fdx` denied. Every candidate reading
+    /// is now spelled out, so the destructive one is still seen.
+    #[test]
+    fn an_ambiguous_dashed_builtin_spells_out_every_candidate() {
+        let command = "git-c$X -fdx";
+        let sanitized = crate::context::sanitize_for_pattern_matching(command);
+        let view =
+            syntax_view_for_pattern_matching(command, sanitized.as_ref(), ShellDialect::Posix)
+                .expect("a bounded symbolic git executable synthesizes a view");
+        // Since `checkout-force`, `git checkout -fdx` is itself destructive
+        // (a force-checkout discards uncommitted changes), so either reading
+        // satisfies #428; what must never be presented is only a benign one.
+        assert!(
+            view.contains("git clean -fdx") || view.contains("git checkout -fdx"),
+            "a destructive reading must be the one presented: {view:?}"
+        );
+        assert!(
+            create_pack().check(&view).is_some(),
+            "the presented reading must deny: {view:?}"
+        );
+
+        // The benign candidate is still presented when no reading is
+        // destructive, so this is not "always pick the scariest subcommand":
+        // `git clean -n` is exempt and `git checkout -n` is nothing.
+        let benign = "git-c$X -n";
+        let sanitized_benign = crate::context::sanitize_for_pattern_matching(benign);
+        let benign_view = syntax_view_for_pattern_matching(
+            benign,
+            sanitized_benign.as_ref(),
+            ShellDialect::Posix,
+        )
+        .expect("a bounded symbolic git executable synthesizes a view");
+        assert!(
+            AMBIGUITY_ARBITER.check(&benign_view).is_none(),
+            "a dry-run reading must not be presented as destructive: {benign_view:?}"
+        );
+
+        // An unambiguous word still resolves to exactly one subcommand, and a
+        // proven literal is unaffected.
+        for (command, expected, unexpected) in [
+            ("git-cl$X -fdx", "git clean -fdx", "git checkout"),
+            ("git-clean -fdx", "git clean -fdx", "git checkout"),
+            (
+                "git-checkout -- src/f",
+                "git checkout -- src/f",
+                "git clean",
+            ),
+        ] {
+            let sanitized = crate::context::sanitize_for_pattern_matching(command);
+            let view =
+                syntax_view_for_pattern_matching(command, sanitized.as_ref(), ShellDialect::Posix)
+                    .unwrap_or_else(|| panic!("{command} synthesizes a view"));
+            assert!(
+                view.contains(expected),
+                "{command} must read as {expected:?}: {view:?}"
+            );
+            assert!(
+                !view.contains(unexpected),
+                "{command} must not also read as {unexpected:?}: {view:?}"
+            );
+        }
     }
 
     #[test]
@@ -6282,6 +7006,64 @@ mod tests {
             assert!(
                 !command_executes_git_in_dialect(command, ShellDialect::Posix),
                 "unknown program argv keeps the documented default: {command}"
+            );
+        }
+    }
+
+    /// `watch`, `xargs`, `parallel` and `find -exec` run their operand words
+    /// as a command, so a git invocation there executes. All of these were
+    /// allowed through the Posix hook while `rm -rf` behind the same wrappers
+    /// denied (found reviewing #498).
+    #[test]
+    fn exec_wrappers_put_git_in_executable_position() {
+        let deep = "xargs ".repeat(5000);
+        for command in [
+            "watch git reset --hard",
+            "watch -n 1 git reset --hard",
+            "watch -n1 -d git clean -fdx",
+            "xargs git reset --hard",
+            "xargs -I {} git reset --hard {}",
+            "xargs -0 -n 1 git branch -D",
+            "xargs sudo git reset --hard",
+            "xargs -- git reset --hard",
+            "parallel git reset --hard ::: a",
+            "parallel -j 4 git reset --hard ::: a",
+            "find . -exec git reset --hard \\;",
+            "find . -name x -execdir git clean -fdx \\;",
+            "find . -ok git reset --hard \\;",
+            "find . -exec true \\; -exec git reset --hard \\;",
+            "/usr/bin/find . -exec /usr/bin/git reset --hard {} +",
+            "watch xargs git reset --hard",
+            // An option the table does not know may take a value.
+            "parallel --retries 3 git reset --hard ::: a",
+            "xargs --foo 1 git reset --hard",
+            // Wrappers whose options are not modeled.
+            "doas -u root git reset --hard",
+            "sudo --user=bob git reset --hard",
+            "strace -f -o /tmp/t git reset --hard",
+            "uv run git reset --hard",
+            "docker exec app git reset --hard",
+            // Past the depth cap the answer is the conservative one, not a
+            // stack overflow.
+            deep.as_str(),
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command}"
+            );
+        }
+        for command in [
+            "watch ls",
+            "xargs echo git reset --hard",
+            "find . -name git",
+            "find . -exec grep git {} \\;",
+            "parallel echo ::: git",
+            "uv pip install git",
+            "docker run git",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command}"
             );
         }
     }
@@ -6885,6 +7667,53 @@ git x",
     // Critical Severity Pattern Tests
     // =========================================================================
 
+    /// An option may follow other arguments, and git accepts any unambiguous
+    /// prefix of a long option. Every row below was allowed while the full,
+    /// first-position spelling denied. The prefix floors are the shortest
+    /// forms git 2.50 accepts: `--m`, `--d` and switch's `--f`..`--forc` are
+    /// ambiguous (`--mixed`, `--detach`, `--force-create`) and git rejects them.
+    #[test]
+    fn abbreviated_and_trailing_long_options_still_deny() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git reset HEAD~1 --hard", "reset-hard"),
+            ("git reset -q --hard", "reset-hard"),
+            ("git reset origin/main --hard", "reset-hard"),
+            ("git reset --har", "reset-hard"),
+            ("git reset --ha HEAD~1", "reset-hard"),
+            ("git reset --h", "reset-hard"),
+            ("git reset HEAD --merge", "reset-merge"),
+            ("git reset --me", "reset-merge"),
+            ("git clean --forc -d", "clean-force"),
+            ("git clean --f", "clean-force"),
+            ("git checkout --forc", "checkout-force"),
+            ("git checkout --f main", "checkout-force"),
+            ("git switch --discard main", "switch-discard"),
+            ("git switch --di main", "switch-discard"),
+            ("git rm --forc file.txt", "rm-force"),
+            ("git rm --f file.txt", "rm-force"),
+            (
+                "git reflog expire --expire-unr=now --all",
+                "reflog-expire-now",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "git reset --soft HEAD~1",
+            "git reset --mixed HEAD~1",
+            "git reset HEAD file.txt",
+            "git reset --keep HEAD~1",
+            "git clean -n",
+            "git clean --dry-run",
+            "git checkout main",
+            "git switch --detach main",
+            "git switch -c feature",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
     #[test]
     fn test_reset_hard_critical() {
         let pack = create_pack();
@@ -6900,6 +7729,81 @@ git x",
         );
     }
 
+    /// #429 and #431: a safe pattern shadows every destructive pattern in the
+    /// pack, so anything that lets one match past the flag that should have
+    /// disqualified it is an under-block. Both doors are pinned here, including
+    /// the de-quoted spelling the evaluator hands the pack for #431 — quote
+    /// removal is what turned `'('` into a command boundary.
+    #[test]
+    fn a_safe_pattern_cannot_be_reached_past_a_pathspec_separator() {
+        let pack = create_pack();
+
+        for command in [
+            "git clean -fdx -- . clean -n",
+            "git clean -xfd -- . clean --dry-run",
+            "git clean -fdx -- . lfs prune --dry-run",
+            "git clean -fdx -- . restore --staged x",
+            "git clean -fdx -- . checkout -b x",
+            "git clean -fdx --quiet -- . clean -n",
+            // #431, as the pack receives it: the quotes are already gone.
+            "git clean -fdx -- . ( git-clean -n",
+            "git clean -fdx -- . & git-clean -n",
+            "git clean -fdx -- . | git-clean -n",
+            "git clean -fdx -- . ; git-clean -n",
+            // A quoted bare `--` is still the separator to git, and the walk to
+            // the flag stops at a quote rather than reading through it.
+            "git clean -fdx '--' . -n",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "clean-force");
+        }
+    }
+
+    /// The exemptions the fix above must leave intact. `parse_options` permutes,
+    /// so a dry-run flag after a pathspec is still a dry run; and a global
+    /// option — including the ones that take a separate value — does not change
+    /// which subcommand runs.
+    #[test]
+    fn a_permuted_dry_run_flag_still_earns_its_exemption() {
+        let pack = create_pack();
+
+        for command in [
+            "git clean -n",
+            "git clean --dry-run",
+            "git clean -fdxn",
+            "git clean -fdx -n",
+            "git clean . -n",
+            "git clean -fdx src -n",
+            "git clean -fdx src --dry-run",
+            "git -C /tmp/repo clean -n",
+            "git -c core.pager=cat clean --dry-run",
+            "git --no-pager clean -n",
+            "git --git-dir=/tmp/repo/.git clean -n",
+            "git --git-dir /tmp/repo/.git clean -n",
+            "git --work-tree /tmp/repo clean -n",
+            "git restore --staged file.txt",
+            "git restore . --staged",
+            "git checkout -b feature/x",
+            "git checkout --orphan gh-pages",
+            "git lfs prune --dry-run",
+            "git-clean -n",
+            "/usr/libexec/git-core/git-clean -n",
+        ] {
+            assert_allows(&pack, command);
+        }
+
+        // For these the exemption is load-bearing: `clean-force` matches the
+        // same text, so `assert_allows` alone would also pass if the safe
+        // pattern had stopped matching and the destructive one had too.
+        for command in [
+            "git clean -fdx -n",
+            "git clean -fdx src -n",
+            "git clean -fdx src --dry-run",
+            "git -C /tmp/repo clean -fdx -n",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+        }
+    }
+
     #[test]
     fn test_clean_force_critical() {
         let pack = create_pack();
@@ -6908,6 +7812,26 @@ git x",
         assert_blocks_with_pattern(&pack, "git clean -f", "clean-force");
         assert_blocks(&pack, "git clean -fd", "removes untracked files");
         assert_blocks(&pack, "git clean -xf", "removes untracked files");
+
+        // #434: git's `parse_options` permutes, so a force flag after a
+        // pathspec is still a force flag and the tree is still deleted. Proven
+        // against git 2.55.0 with an invalid switch, which git reports as an
+        // unknown switch only if it parsed the token as an option at all:
+        // `git clean . -Z -n` -> "error: unknown switch `Z'".
+        assert_blocks_with_pattern(&pack, "git clean . -f", "clean-force");
+        assert_blocks_with_pattern(&pack, "git clean src -fdx", "clean-force");
+        assert_blocks_with_pattern(&pack, "git clean . --force", "clean-force");
+
+        // A bare `--` ends option parsing, so what follows cannot be a force
+        // flag; git refuses the command instead of deleting. It is still
+        // reported, because the flag before the `--` is genuine.
+        assert_blocks_with_pattern(&pack, "git clean -fdx -- . -f", "clean-force");
+
+        // The dry-run exemption is evaluated first, so the shapes where git
+        // itself would not delete stay allowed even though a force flag is
+        // present.
+        assert_allows(&pack, "git clean -n . -f");
+        assert_allows(&pack, "git clean --dry-run . --force");
     }
 
     #[test]
@@ -7009,9 +7933,106 @@ git x",
         assert_blocks_with_pattern(&pack, "git stash clear", "stash-clear");
     }
 
+    /// `git read-tree --reset -u` is the plumbing under `reset --hard` and was
+    /// allowed. It needs both flags, in either order; a merge (`-m -u`) and
+    /// an index-only reset keep the working tree and stay allowed.
+    #[test]
+    fn read_tree_reset_update_is_denied_like_reset_hard() {
+        let pack = create_pack();
+        for command in [
+            "git read-tree --reset -u HEAD",
+            "git read-tree -u --reset HEAD~3",
+            "git read-tree --reset -vu HEAD",
+            "git read-tree --res -u origin/main",
+            "git -C sub read-tree --reset -u HEAD",
+            "git read-tree --reset -u HEAD && git status",
+            "/usr/lib/git-core/git-read-tree --reset -u HEAD",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "read-tree-reset");
+            assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+        for command in [
+            "git read-tree HEAD",
+            "git read-tree --reset HEAD",
+            "git read-tree -m -u HEAD origin/main",
+            "git read-tree -u -m HEAD",
+            "git read-tree --prefix=sub/ -u HEAD",
+            "git read-tree --reset HEAD; git checkout-index --all",
+            "git read-tree --reset HEAD && echo -u",
+        ] {
+            assert!(
+                pack.check(command)
+                    .is_none_or(|m| m.name != Some("read-tree-reset")),
+                "{command} must not match read-tree-reset"
+            );
+        }
+    }
+
     // =========================================================================
     // High Severity Pattern Tests
     // =========================================================================
+
+    /// Force-switches, forced `git rm` and ref deletion discard work the same
+    /// way the blocked `reset --hard`, `checkout -- .` and `branch -D` do, and
+    /// were all allowed. Their read-only and non-forcing neighbours are not.
+    #[test]
+    fn force_switch_forced_rm_and_ref_delete_are_denied() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git checkout -f", "checkout-force"),
+            ("git checkout --force main", "checkout-force"),
+            ("git checkout -qf main", "checkout-force"),
+            ("git -C sub checkout -f main", "checkout-force"),
+            ("git switch -f main", "switch-discard"),
+            ("git switch --force main", "switch-discard"),
+            ("git switch --discard-changes main", "switch-discard"),
+            ("git rm -f src/main.rs", "rm-force"),
+            ("git rm -r --force src", "rm-force"),
+            ("git rm -rf .", "rm-force"),
+            ("git update-ref -d refs/heads/main", "update-ref-delete"),
+            ("git push origin +main", "push-force-refspec"),
+            ("git push origin +HEAD:main", "push-force-refspec"),
+            (
+                "git push origin '+refs/heads/*:refs/heads/*'",
+                "push-force-refspec",
+            ),
+            (
+                "git update-ref --delete refs/heads/main",
+                "update-ref-delete",
+            ),
+            (
+                "git update-ref -m why -d refs/heads/main",
+                "update-ref-delete",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "git checkout main",
+            "git checkout -b feature",
+            "git checkout --ours file.txt",
+            "git checkout --theirs file.txt",
+            "git checkout --conflict=diff3 file.txt",
+            "git switch main",
+            "git switch -c feature",
+            "git switch -C feature",
+            "git rm src/main.rs",
+            "git rm -r --cached src",
+            "git rm -rf --cached .",
+            "git rm -n -rf .",
+            "git rm --dry-run -f src",
+            "git update-ref refs/heads/main HEAD",
+            "git push origin main",
+            "git push origin main+fix",
+            "git push --force-with-lease origin main",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|m| m.name)
+            );
+        }
+    }
 
     #[test]
     fn test_checkout_discard_high() {
@@ -7702,5 +8723,109 @@ git x",
                 "{command:?} must not be treated as a git built-in"
             );
         }
+    }
+
+    /// Working-tree/history/recovery destroyers that were previously fail-open:
+    /// `git checkout .` (the no-`--` twin of the blocked `git restore .`),
+    /// `git filter-branch`, and `git reflog expire --expire=now`.
+    #[test]
+    fn checkout_cwd_filter_branch_and_reflog_expire_block() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git checkout .", "checkout-discard-cwd"),
+            ("git checkout ./src", "checkout-discard-cwd"),
+            ("git checkout HEAD .", "checkout-discard-cwd"),
+            ("git checkout origin/main .", "checkout-discard-cwd"),
+            ("git filter-branch -f HEAD", "filter-branch"),
+            ("git-filter-branch --force", "filter-branch"),
+            ("git reflog expire --expire=now --all", "reflog-expire-now"),
+            (
+                "git reflog expire --expire-unreachable=now main",
+                "reflog-expire-now",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // Branch switches, dotted branch names, quoted mentions, and the
+        // default-schedule reflog expiry must stay allowed — `.` is the only
+        // unambiguous pathspec, so ambiguous bare words are left alone.
+        // (A `.`/`filter-branch`/`checkout .` mention inside a quoted argument,
+        // e.g. `git commit -m 'git checkout .'`, is allowed in production
+        // because the evaluator masks quoted strings before matching — a
+        // property of the evaluator, not `Pack::check`, so it is not asserted
+        // at this raw-regex layer.)
+        for command in [
+            "git checkout main",
+            "git checkout -b feature",
+            "git checkout --orphan gh-pages",
+            "git checkout feature.branch",
+            "git checkout release/1.2",
+            "git log --grep=filter-branch",
+            "git reflog expire --all",
+            "git reflog",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+    }
+
+    /// Fifth review (#498/#502 follow-up): the bracket and brace lookahead
+    /// rescanned the rest of the word at every `[`/`{`, quadratic in a run of
+    /// unclosed ones; the answers themselves are unchanged.
+    #[test]
+    fn expansion_lookahead_is_linear_and_keeps_its_answers() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (raw, expands) in [
+                ("git", false),
+                ("[", false),
+                ("[[", false),
+                ("g[i]t", true),
+                ("[a", false),
+                ("[a]", true),
+                ("{", false),
+                ("{}", false),
+                ("{git}", false),
+                ("{a,b}", true),
+                ("{a..c}", true),
+                ("{a.}", false),
+                ("{a}{b,c}", true),
+                ("{{a}", false),
+                ("{,{a}", true),
+                ("{a,{b}", true),
+                ("{.}.", false),
+                ("'{a,b}'", false),
+                ("\"[a]\"", false),
+            ] {
+                assert_eq!(
+                    git_token_has_active_expansion(raw, dialect),
+                    expands,
+                    "{raw:?} {dialect:?}"
+                );
+                assert_eq!(
+                    git_token_expansion_may_split(raw, dialect),
+                    expands,
+                    "{raw:?} {dialect:?}"
+                );
+            }
+        }
+        let started = std::time::Instant::now();
+        for raw in [
+            "[".repeat(200_000),
+            "[:".repeat(100_000),
+            "{".repeat(200_000),
+            format!("{}}}", "{".repeat(200_000)),
+        ] {
+            assert!(!git_token_has_active_expansion(&raw, ShellDialect::Posix));
+            assert!(!git_token_expansion_may_split(&raw, ShellDialect::Posix));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

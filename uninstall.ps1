@@ -606,6 +606,53 @@ function Unconfigure-CrushHook {
   $removed
 }
 
+function Get-ReasonixHomeOverride {
+  # REASONIX_HOME as Reasonix reads it (#358): trimmed, with a leading `~`
+  # expanded; $null when unset or blank.
+  param([string]$HomeDir = $HOME)
+  if ([string]::IsNullOrWhiteSpace($env:REASONIX_HOME)) { return $null }
+  $dir = $env:REASONIX_HOME.Trim()
+  if ($dir -eq '~') { return $HomeDir }
+  if ($dir.StartsWith('~/') -or $dir.StartsWith('~\')) { return (Join-Path $HomeDir $dir.Substring(2)) }
+  $dir
+}
+
+function Get-ReasonixSettingsPaths {
+  # Every user-level settings file a dcg Reasonix hook can live in (#358):
+  # REASONIX_HOME, %APPDATA%\reasonix (or %USERPROFILE%\AppData\Roaming\reasonix),
+  # and the legacy ~\.reasonix that Reasonix still reads while the primary file
+  # is missing. All are cleaned: an install made under different settings may
+  # have written any of them, and only dcg's own entries are removed.
+  param([string]$HomeDir = $HOME)
+  $base = if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+    $env:APPDATA
+  } else {
+    Join-Path (Join-Path $HomeDir 'AppData') 'Roaming'
+  }
+  $homes = @(
+    (Get-ReasonixHomeOverride -HomeDir $HomeDir),
+    (Join-Path $base 'reasonix'),
+    (Join-Path $HomeDir '.reasonix')
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  @($homes | ForEach-Object { Join-Path $_ 'settings.json' } | Select-Object -Unique)
+}
+
+function Unconfigure-ReasonixHook {
+  # User-level settings plus any repo-local .reasonix\settings.json written by
+  # `dcg install --reasonix --project`. The entries are `hooks.PreToolUse[]`
+  # objects with a `command`, the shape the Crush editor already handles.
+  param([string]$HomeDir = $HOME, [string]$RepoRoot = '')
+  $paths = @(Get-ReasonixSettingsPaths -HomeDir $HomeDir)
+  if (-not [string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $paths += (Join-Path (Join-Path $RepoRoot '.reasonix') 'settings.json')
+  }
+  $removed = $false
+  foreach ($path in $paths) {
+    if (Remove-DcgHooksFromCrushConfig -Path $path) { $removed = $true }
+  }
+  $removed
+}
+
 function Get-DcgRepositoryRoot {
   param([string]$StartDir = (Get-Location).Path)
   try {
@@ -878,6 +925,8 @@ if (Remove-DcgHooksFromJsonFile -Path $agyHooks -DeleteEmptyFile) {
 if (Unconfigure-OmpExtension) { Write-Ok "Removed Oh My Pi extension" }
 
 if (Unconfigure-CrushHook -RepoRoot (Get-DcgRepositoryRoot)) { Write-Ok "Removed Crush hook" }
+
+if (Unconfigure-ReasonixHook -RepoRoot (Get-DcgRepositoryRoot)) { Write-Ok "Removed Reasonix hook" }
 
 if (Test-Path $binary -PathType Leaf) {
   Remove-Item -Force -Path $binary

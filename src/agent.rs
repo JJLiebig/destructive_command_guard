@@ -7,11 +7,13 @@
 //!
 //! 1. **Explicit flag**: `--agent=<name>` CLI flag for manual override
 //! 2. **Environment variables**: Most agents set identifying env vars
-//! 3. **Parent process inspection** (fallback): Check process tree for agent names
+//! 3. **Parent process inspection** (fallback, Unix only): Check the parent
+//!    process name for an agent
 //!
 //! # Supported Agents
 //!
-//! - Claude Code: `CLAUDE_CODE=1` or `CLAUDE_SESSION_ID` env var
+//! - Claude Code: `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`
+//!   (what Claude Code exports), or the older `CLAUDE_CODE` / `CLAUDE_SESSION_ID`
 //! - Augment Code: `AUGMENT_AGENT=1` or `AUGMENT_CONVERSATION_ID` env var
 //! - Aider: `AIDER_SESSION=1` env var
 //! - Continue: `CONTINUE_SESSION_ID` env var
@@ -66,6 +68,7 @@ use serde::{Deserialize, Serialize};
 /// Agent detection is stable within a process, so we use a longer TTL.
 const CACHE_TTL: Duration = Duration::from_secs(300);
 
+#[cfg(any(unix, test))]
 const WINDOWS_EXECUTABLE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat", ".ps1"];
 
 /// Known AI coding agents that dcg can detect and configure per-agent policies for.
@@ -122,6 +125,13 @@ pub enum Agent {
     /// "tool_input":{"command":...}}` to the hook's stdin, and sets `CRUSH=1`
     /// in every hook and `bash`-tool subprocess (#388).
     Crush,
+    /// Reasonix (<https://github.com/esengine/DeepSeek-Reasonix>). Reads
+    /// `hooks.PreToolUse[{match, command, timeout}]` from
+    /// `~/.reasonix/settings.json` (`%APPDATA%\reasonix\settings.json` on
+    /// Windows), pipes `{"event":"PreToolUse","cwd":...,"toolName":"bash",
+    /// "toolArgs":{"command":...}}` to the hook's stdin, and blocks on exit 2
+    /// (#358). Identified from that wire shape; it sets no marker variable.
+    Reasonix,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -152,6 +162,7 @@ impl Agent {
             Self::OpenCode => "opencode",
             Self::Omp => "omp",
             Self::Crush => "crush",
+            Self::Reasonix => "reasonix",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -178,6 +189,7 @@ impl Agent {
                 | Self::OpenCode
                 | Self::Omp
                 | Self::Crush
+                | Self::Reasonix
         )
     }
 
@@ -203,6 +215,7 @@ impl Agent {
     /// - `"posit-assistant"`, `"posit_assistant"`, `"posit"`, `"pa"` -> `PositAssistant`
     /// - `"omp"`, `"oh-my-pi"` -> `Omp`
     /// - `"crush"`, `"charm-crush"` -> `Crush`
+    /// - `"reasonix"`, `"deepseek-reasonix"` -> `Reasonix`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -225,6 +238,7 @@ impl Agent {
             "opencode" | "opencodecli" => Self::OpenCode,
             "omp" | "ohmypi" => Self::Omp,
             "crush" | "charmcrush" | "crushcli" => Self::Crush,
+            "reasonix" | "deepseekreasonix" => Self::Reasonix,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -250,6 +264,7 @@ impl fmt::Display for Agent {
             Self::OpenCode => write!(f, "OpenCode"),
             Self::Omp => write!(f, "Oh My Pi"),
             Self::Crush => write!(f, "Crush"),
+            Self::Reasonix => write!(f, "Reasonix"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -450,7 +465,25 @@ fn non_empty_agent_name(value: &str) -> Option<String> {
 ///
 /// Checks for known environment variables set by AI coding agents.
 fn detect_from_environment() -> Option<DetectionResult> {
-    // Claude Code detection
+    // Claude Code detection. What Claude Code actually exports to its tool and
+    // hook processes is `CLAUDECODE=1`, `CLAUDE_CODE_ENTRYPOINT` and
+    // `CLAUDE_CODE_SESSION_ID`; only the older `CLAUDE_CODE` /
+    // `CLAUDE_SESSION_ID` spellings were checked, so a live Claude Code session
+    // was detected as `unknown` — `[agents.claude-code]` profiles never applied,
+    // and on Windows every hook paid the parent-process fallback.
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+    ] {
+        if std::env::var_os(marker).is_some() {
+            return Some(DetectionResult::new(
+                Agent::ClaudeCode,
+                DetectionMethod::Environment,
+                Some(marker.to_string()),
+            ));
+        }
+    }
     if std::env::var("CLAUDE_CODE").is_ok() {
         return Some(DetectionResult::new(
             Agent::ClaudeCode,
@@ -738,40 +771,18 @@ fn parent_process_args_from_ps(pid: &str) -> Option<String> {
     first_non_empty_line(&String::from_utf8_lossy(&output.stdout)).map(str::to_string)
 }
 
-/// Detect agent from parent process on Windows.
+/// Windows has no parent-process fallback.
+///
+/// It used to launch `powershell.exe` with two `Get-CimInstance` queries on
+/// every hook invocation that had no agent environment marker. Measured on a
+/// Windows 11 host, that took each Bash command from ~33 ms to ~1010 ms, and
+/// it rarely identified anything: agents run hooks through a shell (Claude
+/// Code's Windows hook entry is `"shell": "powershell"`), so the parent is the
+/// shell, not the agent. std exposes no safe parent-pid API on Windows, so the
+/// environment markers are the detection path there.
 #[cfg(windows)]
-fn detect_from_parent_process() -> Option<DetectionResult> {
-    parent_process_name_from_windows(std::process::id())
-        .and_then(|name| detection_from_process_name(&name))
-}
-
-#[cfg(windows)]
-fn parent_process_name_from_windows(current_pid: u32) -> Option<String> {
-    let script = format!(
-        "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {current_pid}'; \
-         if ($null -eq $p) {{ exit 1 }}; \
-         $parent = Get-CimInstance Win32_Process -Filter \"ProcessId = $($p.ParentProcessId)\"; \
-         if ($null -eq $parent) {{ exit 1 }}; \
-         Write-Output $parent.Name"
-    );
-
-    ["powershell.exe", "powershell", "pwsh"]
-        .iter()
-        .find_map(|program| windows_parent_name_with(program, &script))
-}
-
-#[cfg(windows)]
-fn windows_parent_name_with(program: &str, script: &str) -> Option<String> {
-    let output = std::process::Command::new(program)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    first_non_empty_line(&String::from_utf8_lossy(&output.stdout)).map(str::to_string)
+const fn detect_from_parent_process() -> Option<DetectionResult> {
+    None
 }
 
 /// Detect agent from parent process on platforms without a safe implementation.
@@ -780,6 +791,8 @@ fn detect_from_parent_process() -> Option<DetectionResult> {
     None
 }
 
+// Process-name matching backs only the Unix parent-process fallback.
+#[cfg(any(unix, test))]
 fn detection_from_process_name(raw_process_name: &str) -> Option<DetectionResult> {
     let process_name = normalize_process_name(raw_process_name)?;
     let agent = agent_from_process_name(&process_name)?;
@@ -790,10 +803,12 @@ fn detection_from_process_name(raw_process_name: &str) -> Option<DetectionResult
     ))
 }
 
+#[cfg(any(unix, test))]
 fn normalize_process_name(raw_process_name: &str) -> Option<String> {
     first_non_empty_line(raw_process_name).map(str::to_lowercase)
 }
 
+#[cfg(any(unix, test))]
 fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().map(str::trim).find(|line| !line.is_empty())
 }
@@ -834,6 +849,7 @@ fn nul_separated_args_to_string(bytes: &[u8]) -> Option<String> {
 /// executable, while later tokens are only considered when they look like
 /// path-like executable/script arguments. This avoids misclassifying ordinary
 /// arguments such as `cargo test codex` or URL paths ending in `/codex`.
+#[cfg(any(unix, test))]
 fn agent_from_process_name(process_name: &str) -> Option<Agent> {
     for (index, token) in process_name.split_whitespace().enumerate() {
         if index > 0 && !is_path_like_process_token(token) {
@@ -847,6 +863,7 @@ fn agent_from_process_name(process_name: &str) -> Option<Agent> {
     None
 }
 
+#[cfg(any(unix, test))]
 fn is_path_like_process_token(token: &str) -> bool {
     let token = token.trim_matches(['"', '\'']);
     !token.starts_with('-')
@@ -854,6 +871,7 @@ fn is_path_like_process_token(token: &str) -> bool {
         && (token.contains('/') || token.contains('\\'))
 }
 
+#[cfg(any(unix, test))]
 fn executable_basename(token: &str) -> String {
     let normalized = token
         .trim_matches(['"', '\''])
@@ -868,6 +886,7 @@ fn executable_basename(token: &str) -> String {
     last.to_string()
 }
 
+#[cfg(any(unix, test))]
 fn agent_for_basename(basename: &str) -> Option<Agent> {
     // Exact-match table. New aliases for the same agent go in the same arm.
     // Substring matching is intentionally NOT used: a tool whose name merely
@@ -889,6 +908,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "opencode" => Some(Agent::OpenCode),
         "omp" | "oh-my-pi" => Some(Agent::Omp),
         "crush" => Some(Agent::Crush),
+        "reasonix" => Some(Agent::Reasonix),
         // "pa" is a dangerous prefix (pacman, pactl, pass, patch, ...); the
         // exact-match table is what keeps those from misclassifying.
         "pa" | "posit-assistant" => Some(Agent::PositAssistant),
@@ -1357,14 +1377,13 @@ mod tests {
 #[cfg(test)]
 mod env_tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Mutex to serialize tests that manipulate environment variables.
-    /// This prevents race conditions when tests run in parallel.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env;
 
     /// All known agent environment variable keys.
     const AGENT_ENV_VARS: &[&str] = &[
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_CODE",
         "CLAUDE_SESSION_ID",
         "AUGMENT_AGENT",
@@ -1399,14 +1418,12 @@ mod env_tests {
     where
         F: FnOnce() -> R,
     {
-        // Acquire lock to prevent race conditions with parallel tests
-        let _lock = ENV_LOCK.lock().unwrap();
+        // The crate-wide lock, so a writer in `hook` or `interactive` cannot
+        // run concurrently with this one (#445).
+        let _lock = test_env::lock();
 
         // Clear cache before test
         clear_cache();
-
-        // SAFETY: We hold ENV_LOCK during all tests that modify environment
-        // variables, preventing concurrent modifications.
 
         // Save and clear all agent env vars (to avoid ambient env interference)
         let saved: Vec<_> = AGENT_ENV_VARS
@@ -1460,6 +1477,25 @@ mod env_tests {
             assert_eq!(result.method, DetectionMethod::Environment);
             assert_eq!(result.matched_value, Some("CLAUDE_SESSION_ID".to_string()));
         });
+    }
+
+    /// The markers Claude Code really exports to hook and tool processes.
+    /// Checked against a live session: `CLAUDECODE=1`, `CLAUDE_CODE_ENTRYPOINT`
+    /// and `CLAUDE_CODE_SESSION_ID` are set; `CLAUDE_CODE` is not.
+    #[test]
+    fn test_detect_claude_code_live_markers() {
+        for marker in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_SESSION_ID",
+        ] {
+            with_env_var(marker, "1", || {
+                let result = detect_agent_with_details();
+                assert_eq!(result.agent, Agent::ClaudeCode, "{marker}");
+                assert_eq!(result.method, DetectionMethod::Environment, "{marker}");
+                assert_eq!(result.matched_value.as_deref(), Some(marker));
+            });
+        }
     }
 
     #[test]
@@ -1663,6 +1699,24 @@ mod env_tests {
         assert_eq!(agent_from_process_name("crush-tui"), None);
     }
 
+    /// #358: Reasonix sets no environment marker, so its process name (and
+    /// the hook protocol) are what identify it.
+    #[test]
+    fn test_reasonix_identity_mappings() {
+        assert_eq!(Agent::Reasonix.config_key(), "reasonix");
+        assert!(Agent::Reasonix.is_known());
+        assert_eq!(Agent::from_name("reasonix"), Agent::Reasonix);
+        assert_eq!(Agent::from_name("Reasonix"), Agent::Reasonix);
+        assert_eq!(Agent::from_name("deepseek-reasonix"), Agent::Reasonix);
+        assert_eq!(format!("{}", Agent::Reasonix), "Reasonix");
+        assert_eq!(agent_from_process_name("reasonix"), Some(Agent::Reasonix));
+        assert_eq!(
+            agent_from_process_name("/opt/homebrew/bin/reasonix"),
+            Some(Agent::Reasonix)
+        );
+        assert_eq!(agent_from_process_name("reasonixd"), None);
+    }
+
     #[test]
     fn test_omp_identity_mappings() {
         assert_eq!(Agent::Omp.config_key(), "omp");
@@ -1742,8 +1796,8 @@ mod env_tests {
 
     #[test]
     fn test_detect_unknown_no_env() {
-        // Acquire lock to prevent race conditions with parallel tests
-        let _lock = ENV_LOCK.lock().unwrap();
+        // The crate-wide lock (#445).
+        let _lock = test_env::lock();
 
         let saved: Vec<_> = AGENT_ENV_VARS
             .iter()
@@ -1752,8 +1806,8 @@ mod env_tests {
 
         // Ensure no agent env vars are set
         clear_cache();
-        // SAFETY: We hold ENV_LOCK during this test, preventing concurrent
-        // modifications to environment variables.
+        // SAFETY: this test holds `test_env::lock()`, which excludes every
+        // other env WRITER in the crate. Readers are not excluded; see #445.
         unsafe {
             for &k in AGENT_ENV_VARS {
                 std::env::remove_var(k);

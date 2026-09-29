@@ -19,34 +19,62 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::time::Duration;
 
 /// Input structure from supported hook protocols.
+///
+/// Every envelope field is shape-tolerant: a value of an unexpected JSON type
+/// degrades that one field instead of failing the whole parse, because a
+/// failed parse fails open and allows the command unexamined. Strings are
+/// read through [`deserialize_string_tolerant`], and open-ended fields are
+/// kept as raw [`serde_json::Value`]s.
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
     /// Hook event name (used by some clients, e.g. Copilot CLI: "pre-tool-use").
+    #[serde(default, deserialize_with = "deserialize_string_tolerant")]
     pub event: Option<String>,
 
     /// Gemini hook event name (e.g., "BeforeTool").
-    #[serde(alias = "hookEventName")]
+    #[serde(
+        alias = "hookEventName",
+        default,
+        deserialize_with = "deserialize_string_tolerant"
+    )]
     pub hook_event_name: Option<String>,
 
     /// Session id (Gemini snake_case; VS Code Agent Host camelCase).
-    #[serde(alias = "sessionId")]
+    #[serde(
+        alias = "sessionId",
+        default,
+        deserialize_with = "deserialize_string_tolerant"
+    )]
     pub session_id: Option<String>,
 
     /// Gemini transcript path.
+    #[serde(default, deserialize_with = "deserialize_string_tolerant")]
     pub transcript_path: Option<String>,
 
     /// Gemini working directory.
+    #[serde(default, deserialize_with = "deserialize_string_tolerant")]
     pub cwd: Option<String>,
 
-    /// Gemini event timestamp.
-    pub timestamp: Option<String>,
+    /// Event timestamp: an RFC 3339 string from Gemini, a number (epoch
+    /// milliseconds) from GitHub Copilot CLI. Raw JSON value, like
+    /// `tool_use_id`: typed as a string, every native Copilot payload failed
+    /// the whole parse and so failed open, allowing the command unexamined.
+    pub timestamp: Option<serde_json::Value>,
 
     /// The name of the tool being invoked (e.g., "Bash", "runTerminalCommand").
-    #[serde(alias = "toolName")]
+    #[serde(
+        alias = "toolName",
+        default,
+        deserialize_with = "deserialize_string_tolerant"
+    )]
     pub tool_name: Option<String>,
 
     /// Tool-specific input parameters.
-    #[serde(alias = "toolInput")]
+    #[serde(
+        alias = "toolInput",
+        default,
+        deserialize_with = "deserialize_tool_input_tolerant"
+    )]
     pub tool_input: Option<ToolInput>,
 
     /// Alternate tool arguments format used by some clients.
@@ -63,12 +91,28 @@ pub struct HookInput {
     /// `turn_id` is present and non-blank we switch to Codex's minimal
     /// `hookSpecificOutput` deny payload because Codex's parser can reject the
     /// dcg-only fields carried by the extended Claude-compatible response.
-    #[serde(alias = "turnId")]
+    #[serde(
+        alias = "turnId",
+        default,
+        deserialize_with = "deserialize_string_tolerant"
+    )]
     pub turn_id: Option<String>,
 
     /// Codex++ capability marker for Guardian-backed `ask` decisions. Presence
     /// identifies Codex++; the value selects `ask` (`true`) or `deny` (`false`).
     pub permission_decision_ask_supported: Option<bool>,
+
+    /// Tool-use identifier. Claude Code's are Anthropic tool-use ids
+    /// (`toolu_…`); Codex's are OpenAI call ids (`call_…`). Kept as a raw JSON
+    /// value so an unexpected type degrades to "unknown" instead of failing
+    /// the whole payload parse (a parse failure fails open). No camelCase
+    /// alias: Grok sends both spellings, and serde would reject the pair.
+    pub tool_use_id: Option<serde_json::Value>,
+
+    /// Claude-shaped permission mode (`default`, `acceptEdits`,
+    /// `bypassPermissions`, `dontAsk`, …). Raw JSON value for the same
+    /// parse-robustness reason as `tool_use_id`; no camelCase alias (Grok).
+    pub permission_mode: Option<serde_json::Value>,
 
     /// Antigravity CLI (`agy`) tool-call envelope. Unlike Claude/Gemini/Grok,
     /// `agy` nests the tool name and arguments under a `toolCall` object:
@@ -76,7 +120,11 @@ pub struct HookInput {
     /// "Cwd": "..."}}, "conversationId": "...", "stepIdx": 4, ...}`. The shell
     /// command lives in `toolCall.args.CommandLine`. Verified empirically by
     /// capturing the stdin `agy` passes to a `PreToolUse` hook.
-    #[serde(alias = "toolCall")]
+    #[serde(
+        alias = "toolCall",
+        default,
+        deserialize_with = "deserialize_tool_call_tolerant"
+    )]
     pub tool_call: Option<ToolCall>,
 
     /// VS Code "Agent Host" batched tool-call envelope (issue #252). The
@@ -131,6 +179,7 @@ pub struct ToolInput {
 #[derive(Debug, Deserialize)]
 pub struct ToolCall {
     /// The tool name (e.g. `"run_command"` for the shell tool).
+    #[serde(default, deserialize_with = "deserialize_string_tolerant")]
     pub name: Option<String>,
 
     /// Tool arguments. For `run_command`, this carries `CommandLine`.
@@ -167,6 +216,111 @@ where
             .filter_map(|entry| serde_json::from_value::<ToolCall>(entry).ok())
             .collect(),
     ))
+}
+
+/// Replace every unpaired UTF-16 surrogate escape (`\uD800`–`\uDFFF` without
+/// its partner) with `�` before parsing.
+///
+/// JavaScript strings can hold a lone surrogate, and `JSON.stringify` emits
+/// it as exactly such an escape -- so a Node-based host (Claude Code, Gemini
+/// CLI, Copilot CLI) that `JSON.parse`d a model's tool input containing the
+/// escape `\ud800` forwards it. serde_json rejects a lone surrogate, the whole
+/// parse failed, and a failed parse fails open: `rm -rf ~ # \ud800` was
+/// allowed. The replacement character is inert text, so the rest of the
+/// command is judged as written. `\\` pairs are consumed together, so an
+/// escaped backslash followed by `u` stays literal text.
+fn neutralize_lone_surrogate_escapes(json: &str) -> Cow<'_, str> {
+    fn hex4(bytes: &[u8], at: usize) -> Option<u16> {
+        let digits = bytes.get(at..at + 4)?;
+        let text = std::str::from_utf8(digits).ok()?;
+        u16::from_str_radix(text, 16).ok()
+    }
+    fn is_escape_u(bytes: &[u8], at: usize) -> bool {
+        bytes.get(at) == Some(&b'\\') && matches!(bytes.get(at + 1), Some(b'u' | b'U'))
+    }
+
+    let bytes = json.as_bytes();
+    if !bytes.windows(2).any(|pair| pair == b"\\u") {
+        return Cow::Borrowed(json);
+    }
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        if !is_escape_u(bytes, index) {
+            // Any other escape, including `\\`, is two bytes.
+            index += 2;
+            continue;
+        }
+        let Some(unit) = hex4(bytes, index + 2) else {
+            index += 2;
+            continue;
+        };
+        let high = (0xD800..=0xDBFF).contains(&unit);
+        let low = (0xDC00..=0xDFFF).contains(&unit);
+        if high
+            && is_escape_u(bytes, index + 6)
+            && hex4(bytes, index + 8).is_some_and(|next| (0xDC00..=0xDFFF).contains(&next))
+        {
+            index += 12; // A well-formed pair.
+            continue;
+        }
+        if high || low {
+            let buffer = out.get_or_insert_with(|| String::with_capacity(json.len()));
+            buffer.push_str(&json[copied..index]);
+            buffer.push_str("\\uFFFD");
+            copied = index + 6;
+        }
+        index += 6;
+    }
+    match out {
+        Some(mut buffer) => {
+            buffer.push_str(&json[copied..]);
+            Cow::Owned(buffer)
+        }
+        None => Cow::Borrowed(json),
+    }
+}
+
+/// A string envelope field whose value has an unexpected type degrades to
+/// `None` (a number keeps its text) instead of failing the whole parse, which
+/// would fail open. A GitHub Copilot CLI `timestamp` arrives as a number and
+/// did exactly that until it was made a raw value.
+fn deserialize_string_tolerant<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::String(text)) => Some(text),
+            Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+            _ => None,
+        },
+    )
+}
+
+/// `tool_input` degraded to `None` when it is not an object.
+fn deserialize_tool_input_tolerant<'de, D>(deserializer: D) -> Result<Option<ToolInput>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value::<ToolInput>(value).ok()))
+}
+
+/// The `agy` `toolCall` object, degraded to `None` when it does not fit
+/// [`ToolCall`] -- the single-object counterpart of
+/// [`deserialize_tool_calls_tolerant`].
+fn deserialize_tool_call_tolerant<'de, D>(deserializer: D) -> Result<Option<ToolCall>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value::<ToolCall>(value).ok()))
 }
 
 /// Output structure for denying a command.
@@ -543,6 +697,20 @@ pub enum HookProtocol {
     /// `permissionDecision` envelope Crush does not read, so a block was
     /// silently downgraded to "no opinion" — dcg failed open under Crush.
     Crush,
+    /// Reasonix (DeepSeek-Reasonix) native hooks (#358). Wire shape: stdin
+    /// carries one line of camelCase JSON, `{"event": "PreToolUse", "cwd":
+    /// "...", "toolName": "bash", "toolArgs": {"command": "..."}}`, with no
+    /// session id and no `tool_input`. Reasonix reads **only the exit
+    /// status**: exit 2 (or a timeout) blocks, and stderr, falling back to
+    /// stdout, becomes the reason shown to the user and the model. Exit 0
+    /// passes, and any other non-zero status is a non-blocking warning.
+    /// There is no `ask`. So every blocking verdict (deny, review,
+    /// indeterminate) exits 2 with dcg's plain-text reason on stderr, and a
+    /// warning exits 1. Before this variant the payload matched the
+    /// Copilot arm (`event` + `toolArgs`), dcg exited 0 with a JSON deny
+    /// Reasonix never reads, and the command ran.
+    /// Documented in `docs/DESKTOP_HOOKS.zh-CN.md` of esengine/DeepSeek-Reasonix.
+    Reasonix,
 }
 
 impl HookProtocol {
@@ -563,9 +731,10 @@ impl HookProtocol {
     /// | `Copilot` | blocks (`preToolUse` hooks that exit 2 deny the call) |
     /// | `Crush` | blocks; stderr is the reason (`internal/hooks/runner.go`) |
     /// | `Grok` | blocks (exit 2 is a documented explicit deny) |
-    /// | `Codex` | logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON |
-    /// | `Hermes` | warning logged, never aborts — same as exit 0 with no JSON |
+    /// | `Codex` | blocks in current releases ("use exit code 2 and write the blocking reason to stderr", Codex hooks docs); some earlier builds logged it as a hook failure and failed open |
+    /// | `Hermes` | blocks in current releases (a `pre_tool_call` hook that exits 2 "blocks the tool call even when its stdout carries no block JSON"); earlier builds only logged a warning |
     /// | `Antigravity` | logged, does not reliably abort — same as exit 0 with no JSON |
+    /// | `Reasonix` | blocks — exit 2 is its only blocking channel (see [`Self::blocks_by_exit_status`]) |
     ///
     /// Every arm maps to [`EXIT_HOOK_BLOCK`] today; the match is spelled out
     /// so a new protocol has to state its contract here rather than inherit
@@ -582,13 +751,26 @@ impl HookProtocol {
     pub const fn undeliverable_block_exit_code(self) -> i32 {
         match self {
             // Exit 2 is the blocking status of the protocol itself.
-            Self::ClaudeCompatible | Self::Gemini | Self::Copilot | Self::Crush | Self::Grok => {
-                EXIT_HOOK_BLOCK
-            }
+            Self::ClaudeCompatible
+            | Self::Gemini
+            | Self::Copilot
+            | Self::Crush
+            | Self::Grok
+            | Self::Reasonix => EXIT_HOOK_BLOCK,
             // Non-zero is logged and fails open: no worse than exit 0, and
             // visibly a hook failure rather than a silent allow.
             Self::Codex | Self::CodexAsk | Self::Hermes | Self::Antigravity => EXIT_HOOK_BLOCK,
         }
+    }
+
+    /// Whether the host reads the verdict from the exit status alone.
+    ///
+    /// Every other protocol reads JSON from stdout and dcg exits 0 beside it.
+    /// Reasonix never reads stdout for `PreToolUse`: a blocking verdict must
+    /// exit 2, with the reason on stderr, or the command runs.
+    #[must_use]
+    pub const fn blocks_by_exit_status(self) -> bool {
+        matches!(self, Self::Reasonix)
     }
 }
 
@@ -710,8 +892,39 @@ pub enum HookReadError {
         /// Codex++ capability recovered without retaining bytes past the scan cap.
         permission_decision_ask_supported: Option<bool>,
     },
+    /// The payload bytes were not valid UTF-8.
+    ///
+    /// Distinct from [`HookReadError::Io`] because the two have opposite trust
+    /// properties, and conflating them disabled the guard. A transient stdin
+    /// read failure is not attacker-influenceable and rightly fails open; the
+    /// *content* of the payload is exactly what an attacker controls. While
+    /// this was reported as an `Io(InvalidData)`, it inherited the always-open
+    /// posture, so appending one stray `0xFF` to any payload allowed the
+    /// command even under `DCG_FAIL_CLOSED=1` — the same class of evasion
+    /// #160 closed for oversized input.
+    InvalidUtf8 {
+        /// Where decoding failed, for the operator-facing diagnostic.
+        error: std::str::Utf8Error,
+        /// The payload decoded lossily.
+        ///
+        /// Carried for the same reason [`HookReadError::InputTooLarge`] carries
+        /// its prefix: without bytes to look at, the best-effort scanner cannot
+        /// run and appending one stray byte to an otherwise ordinary payload
+        /// silently skips every pack in the DEFAULT posture. Making the variant
+        /// merely blockable only closed the `DCG_FAIL_CLOSED=1` half.
+        lossy: String,
+    },
     /// Failed to parse JSON input.
-    Json(serde_json::Error),
+    Json {
+        /// The parser's error, for the operator-facing diagnostic.
+        error: serde_json::Error,
+        /// The payload text, carried for the best-effort scanner like the
+        /// oversized and invalid-UTF-8 variants' bytes. Every specific parse
+        /// hole closed so far (a numeric `timestamp`, a wrong-typed field, a
+        /// lone surrogate escape) failed open with the destructive command in
+        /// plain view; this lets the next unforeseen one still be judged.
+        raw: String,
+    },
 }
 
 /// Hard cap on how much stdin is drained into the best-effort scan buffer once
@@ -740,9 +953,10 @@ const MAX_OVERSIZED_METADATA_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Returns [`HookReadError::Io`] if stdin cannot be read, [`HookReadError::Json`]
-/// if the input is not valid hook JSON, or [`HookReadError::InputTooLarge`] if
-/// the input exceeds `max_bytes`.
+/// Returns [`HookReadError::Io`] if stdin cannot be read,
+/// [`HookReadError::InvalidUtf8`] if the bytes are not valid UTF-8,
+/// [`HookReadError::Json`] if the input is not valid hook JSON, or
+/// [`HookReadError::InputTooLarge`] if the input exceeds `max_bytes`.
 pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     {
@@ -778,8 +992,10 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         });
     }
 
-    let input = String::from_utf8(buf)
-        .map_err(|e| HookReadError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+    let input = String::from_utf8(buf).map_err(|e| HookReadError::InvalidUtf8 {
+        error: e.utf8_error(),
+        lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })?;
 
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Some text tools prepend
     // a BOM; without this, BOM-prefixed but otherwise-valid hook input would
@@ -788,7 +1004,10 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     // not skip a leading BOM on its own.
     let to_parse = input.strip_prefix('\u{feff}').unwrap_or(input.as_str());
 
-    parse_hook_input(to_parse).map_err(HookReadError::Json)
+    parse_hook_input(to_parse).map_err(|error| HookReadError::Json {
+        error,
+        raw: to_parse.to_string(),
+    })
 }
 
 /// Snake_case hook fields that also accept a camelCase spelling, with every
@@ -802,9 +1021,18 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
 /// *zero* protection under either one (issue #410). This table is what
 /// [`parse_hook_input`] uses to reconcile those envelopes.
 ///
-/// Only aliased fields belong here. `transcript_path`, `permission_mode`, and
-/// `tool_use_id` declare no alias, so their camelCase spellings are ordinary
-/// unknown keys that serde already ignores.
+/// Only fields that both exist on [`HookInput`] and declare a `serde(alias)`
+/// belong here. A camelCase spelling of anything else — including keys dcg does
+/// not model at all, such as `transcript_path`, `permission_mode` and
+/// `tool_use_id` — is an ordinary unknown key that serde already ignores, and
+/// an unknown key cannot produce the `duplicate field` abort this table exists
+/// to repair.
+///
+/// Known residual: two *identical* key spellings (`"tool_input"` twice) are not
+/// reconciled. `serde_json::Value` resolves same-key duplicates last-wins, so
+/// the earlier value is gone before this table is consulted. Such a payload
+/// still warns on stderr and still blocks under `DCG_FAIL_CLOSED=1`; catching
+/// the displaced value would require a duplicate-preserving JSON reader.
 const HOOK_INPUT_ALIAS_GROUPS: &[(&str, &[&str])] = &[
     ("hook_event_name", &["hookEventName"]),
     ("session_id", &["sessionId"]),
@@ -840,6 +1068,8 @@ const HOOK_INPUT_ALIAS_GROUPS: &[(&str, &[&str])] = &[
 /// carries no reconcilable alias conflict, or still does not fit [`HookInput`]
 /// after canonicalization. Behaviour for those inputs is unchanged.
 pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
+    let neutralized = neutralize_lone_surrogate_escapes(json);
+    let json = neutralized.as_ref();
     let first_error = match serde_json::from_str::<HookInput>(json) {
         Ok(input) => return Ok(input),
         Err(err) => err,
@@ -849,6 +1079,17 @@ pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
     // inspecting the error message: `duplicate field` is not a stable,
     // machine-checkable contract, and a `Value` parse resolves nothing about
     // the alias groups on its own (the two spellings are distinct JSON keys).
+    //
+    // Bounded on purpose: this re-read keeps serde_json's 128-level recursion
+    // limit. A payload whose *unrelated* sibling key nests deeper than that is
+    // reconcilable in principle — the typed parse aborted earlier, at the
+    // duplicate field — but it stops being reconciled here and is reported as
+    // the original parse error instead. That is the documented malformed-input
+    // path, not a silent hole: it warns on stderr and blocks under
+    // `DCG_FAIL_CLOSED=1`. Lifting the limit would mean parsing (and dropping)
+    // an arbitrarily deep `Value` recursively, and with `panic = "abort"` a
+    // stack overflow on a 256 KiB payload is a worse failure than a warned
+    // fail-open.
     let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str::<serde_json::Value>(json)
     else {
         return Err(first_error);
@@ -1117,6 +1358,48 @@ pub fn shell_tool_from_truncated_json(prefix: &str) -> Option<(String, ShellDial
         })
 }
 
+/// The hook protocol a truncated or undecodable payload declares through its
+/// envelope markers, when they are unambiguous.
+///
+/// A payload dcg cannot parse is otherwise answered in the protocol of the
+/// env/process-detected agent. Reasonix (#358) sets no env marker and is
+/// often undetected, and the Claude-shaped fallback answers with exit 0,
+/// which Reasonix treats as a pass. Its envelope is recognized here with the
+/// same markers [`detect_protocol`] reads on the parsed path: a `PreToolUse`
+/// `event`, a `toolArgs` *object*, and no `tool_input` (which would make it
+/// Crush). Reasonix writes those markers before the tool arguments, so they
+/// survive truncation. A command string cannot forge a key: inside a JSON
+/// string its quotes are escaped. Returns `None` for every other shape.
+#[must_use]
+pub fn protocol_from_truncated_json(prefix: &str) -> Option<HookProtocol> {
+    let pre_tool_use_event = extract_string_values_for_key(prefix, "\"event\"")
+        .iter()
+        .any(|event| event.eq_ignore_ascii_case("PreToolUse"));
+    let object_tool_args = ["\"toolArgs\"", "\"tool_args\""]
+        .iter()
+        .any(|key| has_object_value_for_key(prefix, key));
+    let tool_input = prefix.contains("\"tool_input\"") || prefix.contains("\"toolInput\"");
+    (pre_tool_use_event && object_tool_args && !tool_input).then_some(HookProtocol::Reasonix)
+}
+
+/// Whether a raw JSON `key` (given with its surrounding quotes) is followed by
+/// an object value anywhere in a possibly-truncated prefix.
+fn has_object_value_for_key(prefix: &str, key: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(found) = prefix[search_from..].find(key) {
+        let key_start = search_from + found;
+        search_from = key_start + 1;
+        let rest = prefix[key_start + key.len()..].trim_start();
+        if rest
+            .strip_prefix(':')
+            .is_some_and(|value| value.trim_start().starts_with('{'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Collect every cleanly decodable string value for a raw JSON `key` (given
 /// with its surrounding quotes) in a possibly-truncated prefix.
 fn extract_string_values_for_key(prefix: &str, key: &str) -> Vec<String> {
@@ -1329,6 +1612,24 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         return HookProtocol::Crush;
     }
 
+    // --- Reasonix indicators (checked before Copilot) ---
+    // Reasonix's native envelope is `{"event": "PreToolUse", "cwd",
+    // "toolName": "bash", "toolArgs": {"command": ...}}` (#358). It shares
+    // Copilot's `toolArgs` key, but Copilot's event is the hyphenated
+    // "pre-tool-use" and its `toolArgs` is a JSON-encoded *string*; Reasonix
+    // sends PascalCase "PreToolUse" and a JSON *object*, and no `tool_input`
+    // (which is Crush's). Misrouted to Copilot, dcg exited 0 beside a JSON
+    // deny that Reasonix never reads, and the command ran.
+    if is_crush_event
+        && input.tool_input.is_none()
+        && input
+            .tool_args
+            .as_ref()
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return HookProtocol::Reasonix;
+    }
+
     // --- Copilot indicators (checked first) ---
     // Copilot sends a distinctive `event` field (e.g. "pre-tool-use") that
     // neither Claude Code nor Gemini use. The `tool_args` field is also
@@ -1398,9 +1699,9 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     }
 
     // Explicit Windows-shell tool names ("powershell"/"pwsh"/"cmd"/"cmd.exe")
-    // are only ever emitted by Codex-style payloads -- Claude Code's shell
-    // tool is always "Bash" (or "launch-process"), so this cannot collide with
-    // Claude Code. On Windows, Codex does not always populate `turn_id`
+    // are emitted by Codex-style payloads and by Claude Code's Windows
+    // `PowerShell` tool; the two are told apart by the tool-use id below.
+    // On Windows, Codex does not always populate `turn_id`
     // (issue #125), so the turn_id-gated check above misses these tools and the
     // destructive command would otherwise slip through as a ClaudeCompatible
     // result whose extension fields Codex's strict parser drops. Classify an
@@ -1412,7 +1713,20 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         tool_name.as_str(),
         "powershell" | "pwsh" | "cmd" | "cmd.exe"
     );
-    if is_explicit_windows_shell {
+    // Claude Code on Windows DOES send `PowerShell` (dcg's own installer
+    // registers its Claude hook for `Bash|PowerShell`), and classifying those
+    // payloads as Codex answered every deny in the minimal shape — no ruleId,
+    // packId, severity, allow-once code or remediation. An Anthropic tool-use
+    // id (`toolu_…`) is the precise wire marker: Codex never emits one. The
+    // environment is deliberately not consulted — a Codex session launched
+    // inside Claude Code inherits `CLAUDECODE`, and answering Codex in Claude
+    // shape is the direction that fails open.
+    let has_anthropic_tool_use_id = input
+        .tool_use_id
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| id.starts_with("toolu_"));
+    if is_explicit_windows_shell && !has_anthropic_tool_use_id {
         return codex_protocol(input);
     }
 
@@ -1529,6 +1843,28 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
         )
 }
 
+impl HookInput {
+    /// Whether the payload declares a permission mode in which no human is
+    /// guaranteed to answer a prompt (`bypassPermissions`, `dontAsk`).
+    ///
+    /// Claude Code documents that a hook `deny` blocks in every mode,
+    /// including `bypassPermissions`, but not what a hook `ask` does there.
+    /// dcg answers an unverified command (deadline or size exhausted) with
+    /// `ask` by default, which in these modes may be waved through for
+    /// exactly the command dcg declined to inspect, so such payloads get the
+    /// `unverified_decision = "deny"` posture automatically.
+    #[must_use]
+    pub fn declares_unattended_permission_mode(&self) -> bool {
+        self.permission_mode
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mode| {
+                mode.eq_ignore_ascii_case("bypassPermissions")
+                    || mode.eq_ignore_ascii_case("dontAsk")
+            })
+    }
+}
+
 /// Infer the command parser's dialect from an explicit, trustworthy shell
 /// tool name.
 ///
@@ -1549,7 +1885,8 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
     }
 }
 
-/// Resolve the dialect a `Bash`-labeled Codex payload is evaluated under.
+/// Resolve the dialect a `Bash`-labeled Codex or Reasonix payload is evaluated
+/// under.
 ///
 /// Codex names its shell tool `Bash` on every platform (its hooks schema
 /// mirrors Claude Code's), but its PreToolUse payload carries only
@@ -1575,12 +1912,17 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
 /// (#322). A command the parser refuses for its size says nothing about the
 /// shell and keeps the union.
 ///
+/// Reasonix (#358) has the same ambiguity. Its shell tool is named `bash`
+/// unless the host rebinds it as `pwsh`, and the interpreter behind the name
+/// is "real bash, or PowerShell on a Windows host without bash"
+/// (`internal/tool/builtin/bash.go`). So a `bash`-labeled Reasonix payload on
+/// Windows gets the same resolution.
+///
 /// Claude Code's `Bash` tool on Windows is Git Bash, so the resolution is
-/// gated on the Codex protocol; and because a hook always runs on the host
-/// that executes the command, `host_is_windows` (`cfg!(windows)` at the call
-/// site) is the platform signal — a Codex session under WSL runs a Linux dcg
-/// and keeps POSIX. Explicit `powershell`/`pwsh`/`cmd` labels are never
-/// touched.
+/// gated on those two protocols. A hook always runs on the host that executes
+/// the command, so `host_is_windows` (`cfg!(windows)` at the call site) is
+/// the platform signal: a Codex session under WSL runs a Linux dcg and keeps
+/// POSIX. Explicit `powershell`/`pwsh`/`cmd` labels are never touched.
 #[must_use]
 pub(crate) fn codex_host_shell_dialect(
     labeled: ShellDialect,
@@ -1588,7 +1930,11 @@ pub(crate) fn codex_host_shell_dialect(
     host_is_windows: bool,
     command: &str,
 ) -> ShellDialect {
-    if labeled != ShellDialect::Posix || protocol != HookProtocol::Codex || !host_is_windows {
+    let label_is_ambiguous = matches!(
+        protocol,
+        HookProtocol::Codex | HookProtocol::CodexAsk | HookProtocol::Reasonix
+    );
+    if labeled != ShellDialect::Posix || !label_is_ambiguous || !host_is_windows {
         return labeled;
     }
     if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
@@ -1739,6 +2085,82 @@ fn is_powershell_cmdlet_token(token: &str) -> bool {
 /// shape (see [`segment_is_windows_alias_invocation`]).
 const WINDOWS_DESTRUCTIVE_ALIASES: &[&str] = &["rm", "ri", "del", "rd", "rmdir", "erase"];
 
+/// Cmd built-ins that write, rename or link a file the credential/`.git`
+/// classifier already judges. `core::credential_files::shell::windows_shells`
+/// implements every one of them, but `classify_cmd_builtin` is reached only
+/// under `ShellDialect::Cmd`, and a `Bash`-labeled payload never became `Cmd`:
+/// `command_has_powershell_shape` recognised cmd *deleters* (`del /s /q`) and
+/// `format D:` but no cmd *writer*, so `copy nul .git\config` kept the Posix
+/// dialect, where `\config` is an escape rather than a separator, and was
+/// allowed. Prepending an unrelated `Get-Item z;` to the identical command
+/// denied it, which is what isolates this to the dialect rather than to the
+/// rules behind it.
+///
+/// These are ordinary English words, so — exactly as with the aliases above —
+/// the bare verb is never enough; see [`segment_is_cmd_writer_invocation`].
+const CMD_WRITER_VERBS: &[&str] = &[
+    "copy", "xcopy", "robocopy", "move", "ren", "rename", "mklink",
+];
+
+/// Executable names with no POSIX counterpart, each already a keyword on a
+/// default-on `windows.*` row with a rule behind it.
+///
+/// Unlike [`WINDOWS_DESTRUCTIVE_ALIASES`] and [`CMD_WRITER_VERBS`], these need
+/// no corroborating argument shape: nothing on a POSIX system is called
+/// `diskpart` or `bcdedit`, so the command word alone settles the payload.
+///
+/// Each was MEASURED allow-by-default and deny-when-the-pack-is-named before
+/// being listed, because a name with no rule behind it would widen the hot
+/// path and buy nothing — the same trade `KEYWORDS_DEAD_BUT_COVERED` records
+/// for the registry rows:
+///
+/// ```text
+/// diskpart /s script.txt                 -> windows.system:diskpart
+/// bcdedit /deletevalue safeboot          -> windows.system:bcdedit-delete
+/// cipher /w:C:\                          -> windows.system:cipher-wipe
+/// wbadmin delete catalog -quiet          -> windows.system:wbadmin-delete
+/// fsutil file setzerodata … C:\data.db   -> windows.system:fsutil-setzerodata
+/// fsutil volume dismount C:              -> windows.system:fsutil-volume-dismount
+/// ```
+///
+/// `icacls`, `cacls` and `takeown` are NOT here even though
+/// `system.permissions` now claims them: that pack is opt-in, so the name would
+/// widen the dialect for every host while buying coverage only where the pack
+/// is enabled. They reach their rules through that pack's own keyword rows.
+///
+/// Deliberately absent, each for its own reason: `reg`, `sc` and `net` collide
+/// with POSIX (samba ships `net`) and belong to the opt-in `windows.misc`;
+/// `schtasks` and `attrib` have no rule claiming them yet, so listing them
+/// would be a dead widening; and `format` keeps its drive-letter requirement in
+/// [`segment_is_format_drive_invocation`] because the bare word is ordinary
+/// English.
+const WINDOWS_ONLY_EXECUTABLES: &[&str] = &["diskpart", "bcdedit", "cipher", "wbadmin", "fsutil"];
+
+/// Windows verbs that delete a single FILE, as opposed to a tree.
+///
+/// [`WINDOWS_DESTRUCTIVE_ALIASES`] already covers the tree deletes, but it
+/// requires a Windows-shell-only SWITCH (`-Recurse`, `/s`) to corroborate the
+/// name — which is right for `rm`/`rd`, and is exactly what a single-file
+/// delete never carries. So `del .git\config` and
+/// `del %USERPROFILE%\.ssh\authorized_keys` kept the Posix dialect, and the
+/// protected-file rule written for precisely them (`parse_cmd_protected_file_segment`,
+/// #486) never ran: measured allowed while `rm .git/config` and
+/// `rm ~/.ssh/authorized_keys` denied (#491).
+///
+/// `rm` is DELIBERATELY ABSENT. It is the most common destructive command
+/// there is, and it takes POSIX escapes — `rm foo\ bar` would widen every
+/// ordinary Bash deletion of a filename containing an escaped space. `rd` and
+/// `rmdir` are absent for a different reason: they are directory verbs, the
+/// switch rule already covers them, and `rd /s /q` is the spelling that
+/// matters.
+///
+/// `ri` is PowerShell's `Remove-Item` alias and is here rather than in the
+/// executables list because it is also Ruby's documentation browser: `ri Array`
+/// must keep the Posix dialect, which the operand requirement below enforces
+/// and `the_unknown_dialect_fanout_does_not_claim_ordinary_posix_deletes`
+/// pins.
+const WINDOWS_FILE_DELETE_VERBS: &[&str] = &["del", "erase", "ri"];
+
 /// PowerShell `Remove-Item` parameter names used as the discriminator. A
 /// single-dash token whose name is a >=3-character prefix of one of these is
 /// unmistakably PowerShell: POSIX/GNU `rm` never accepts a single-dash
@@ -1815,10 +2237,180 @@ fn segment_is_windows_alias_invocation(segment: &str) -> bool {
         .any(|token| is_powershell_parameter_token(token) || is_cmd_switch_token(token))
 }
 
+/// Return whether `token` is a Windows *path* rather than a POSIX word: a
+/// drive-letter root (`C:\tmp\x`), a `%VAR%` expansion (`%USERPROFILE%\…`), or
+/// a backslash used as a separator (`.git\config`).
+///
+/// The separator test requires the byte after `\` to be alphanumeric, which is
+/// what keeps POSIX escapes out: `foo\ bar` (escaped space), `a\*b` and `a\$b`
+/// all put punctuation there. A quoted `\n` would qualify, but this predicate
+/// is only ever consulted once the leading token is already a cmd writer verb,
+/// so that is not a shape a POSIX command reaches.
+/// Return whether `token` is a cmd.exe `%VAR%` expansion.
+///
+/// Split out of [`is_windows_path_token`] so the command-word test can ask for
+/// it WITHOUT the backslash-separator branch: `\rm -rf /tmp/x` is an ordinary
+/// POSIX idiom for bypassing an alias, and a command word carrying a backslash
+/// must not widen the dialect on that alone.
+fn is_percent_expansion(token: &str) -> bool {
+    token
+        .split_once('%')
+        .and_then(|(_, rest)| rest.split_once('%'))
+        .is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+}
+
+/// Return whether the segment's COMMAND WORD is assembled with cmd.exe syntax:
+/// a `^` escape (`doc^ker`) or a `%VAR%` expansion (`%COMSPEC%`).
+///
+/// `cmd_caret_escaped_executable_denies_under_unknown_dialect` proves the
+/// decoder behind this works — but it forces `ShellDialect::Unknown`, and
+/// nothing widened a bare caret, so through the real hook
+/// `doc^ker system prune -af` was ALLOWED while `docker system prune -af`
+/// denied. A test that supplies the dialect cannot prove the dialect is
+/// reachable.
+///
+/// A caret ANYWHERE is emphatically not the signal. `grep -rn '^fn main' src/`
+/// and `sed -n 's/^use //p' src/lib.rs` are ordinary Bash, and widening on
+/// those would down-trust a large fraction of real commands into the
+/// fail-closed union. Restricting the test to the FIRST token is what
+/// separates them, and it is exactly where the obfuscation has to sit to
+/// change which executable runs. A quoted first token is data to whatever
+/// shell runs it, not an executable name being assembled, so it is excluded.
+fn segment_command_word_is_cmd_assembled(segment: &str) -> bool {
+    let Some(first) = segment.split_whitespace().next() else {
+        return false;
+    };
+    if first.starts_with(['"', '\'']) {
+        return false;
+    }
+    first.contains('^') || is_percent_expansion(first)
+}
+
+fn is_windows_path_token(token: &str) -> bool {
+    let token = token.trim_matches(['"', '\'']);
+    let bytes = token.as_bytes();
+    let drive_root = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let percent_expansion = token
+        .split_once('%')
+        .and_then(|(_, rest)| rest.split_once('%'))
+        .is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+    let backslash_separator = bytes
+        .windows(2)
+        .any(|pair| pair[0] == b'\\' && pair[1].is_ascii_alphanumeric());
+    drive_root || percent_expansion || backslash_separator
+}
+
+/// Return whether a single statement segment is a cmd *writer* invocation:
+/// one of [`CMD_WRITER_VERBS`] carrying a Windows-path-shaped operand.
+///
+/// The operand requirement is the same discipline
+/// [`segment_is_windows_alias_invocation`] applies, and for the same reason —
+/// `copy`, `move` and `rename` are ordinary words, and a POSIX script named
+/// `copy` must keep the Posix dialect. `--` ends the scan as POSIX
+/// end-of-options.
+fn segment_is_cmd_writer_invocation(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let lowered = first.to_ascii_lowercase();
+    let name = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+    if !CMD_WRITER_VERBS.contains(&name) {
+        return false;
+    }
+    tokens
+        .take_while(|token| *token != "--")
+        .any(is_windows_path_token)
+}
+
+/// Return whether a segment is a Windows single-FILE delete of a Windows path:
+/// one of [`WINDOWS_FILE_DELETE_VERBS`] carrying a Windows-path-shaped operand.
+///
+/// The operand requirement is the same discipline the aliases and the cmd
+/// writers are held to, and here it is what separates `del .git\config` from
+/// `del notes.txt` and `ri .git\config` from `ri Array`.
+fn segment_is_windows_file_delete_invocation(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let lowered = first.to_ascii_lowercase();
+    let name = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+    if !WINDOWS_FILE_DELETE_VERBS.contains(&name) {
+        return false;
+    }
+    tokens
+        .take_while(|token| *token != "--")
+        .any(is_windows_path_token)
+}
+
+/// Return whether a segment's command word is one of
+/// [`WINDOWS_ONLY_EXECUTABLES`].
+///
+/// The name is taken after stripping any directory prefix and an `.exe`
+/// suffix, so `C:\Windows\System32\diskpart.exe` and a git-bash
+/// `/c/Windows/System32/bcdedit` both count.
+fn segment_is_windows_only_executable(segment: &str) -> bool {
+    let Some(first) = segment.split_whitespace().next() else {
+        return false;
+    };
+    let lowered = first.trim_matches(['"', '\'']).to_ascii_lowercase();
+    let base = lowered
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(lowered.as_str());
+    let name = base.strip_suffix(".exe").unwrap_or(base);
+    WINDOWS_ONLY_EXECUTABLES.contains(&name)
+}
+
+/// Return whether a segment runs Windows `format` against a drive letter
+/// (`format D: /q`, `/c/Windows/System32/format.com E:`).
+///
+/// On a Windows host the Bash tool is git-bash, where `format.com` is on PATH,
+/// but under the Posix dialect the `windows.filesystem` pack is skipped, so
+/// `format D: /q` was allowed on exactly the platform its rule exists for.
+/// Nothing on a POSIX system is spelled `format <letter>:`, so widening to the
+/// fail-closed `Unknown` union costs nothing there.
+fn segment_is_format_drive_invocation(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    if !["format", "format.com", "format.exe"]
+        .iter()
+        .any(|name| base.eq_ignore_ascii_case(name))
+    {
+        return false;
+    }
+    tokens.any(|token| {
+        let token = token.trim_matches(['"', '\'']);
+        let bytes = token.as_bytes();
+        bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2..].iter().all(|&b| b == b'\\' || b == b'/')
+    })
+}
+
 /// Return whether any statement/pipeline segment of `command` is unmistakably
 /// Windows shell: a PowerShell cmdlet-shaped leading token (`Remove-Item …`,
-/// `… ; Clear-Content …`) or a destructive alias carrying a Windows-shell-only
-/// argument (`rm -Recurse -Force …`, `del /s /q …`).
+/// `… ; Clear-Content …`), a destructive alias carrying a Windows-shell-only
+/// argument (`rm -Recurse -Force …`, `del /s /q …`), or a cmd writer carrying a
+/// Windows path (`copy nul .git\config`).
 fn command_has_powershell_shape(command: &str) -> bool {
     command
         .split(['|', ';', '&', '\n', '\r', '(', '{'])
@@ -1828,6 +2420,11 @@ fn command_has_powershell_shape(command: &str) -> bool {
                 .next()
                 .is_some_and(is_powershell_cmdlet_token)
                 || segment_is_windows_alias_invocation(segment)
+                || segment_is_cmd_writer_invocation(segment)
+                || segment_is_windows_file_delete_invocation(segment)
+                || segment_is_windows_only_executable(segment)
+                || segment_command_word_is_cmd_assembled(segment)
+                || segment_is_format_drive_invocation(segment)
         })
 }
 
@@ -1862,6 +2459,27 @@ pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialec
     } else {
         labeled
     }
+}
+
+/// Whether the command's own shape marks it a Windows-shell payload, which is
+/// what `windows.*` pack activation asks (#451).
+///
+/// Activation matched `PowerShell | Cmd` only, and [`refine_shell_dialect`]
+/// down-trusts a mislabeled `Bash` payload to `Unknown` — so on a non-Windows
+/// host the packs never activated for the very payload shape #451 exists to
+/// cover, and six rules that deny when the packs are explicitly enabled were
+/// allowed by default. `format D: /q` is the sharpest case:
+/// [`segment_is_format_drive_invocation`] was added *specifically* so that
+/// command would reach `windows.filesystem:format-drive`, and the widening it
+/// performs could not activate the pack it was widening for.
+///
+/// `Unknown` on its own must not activate the packs — it is also what an
+/// unrecognised tool name produces, which proves nothing about the payload.
+/// The command's shape is the signal, and it is the same one the refinement
+/// already trusts enough to re-decide the entire dialect on.
+pub fn command_is_windows_shell_payload(command: &str) -> bool {
+    let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    command_has_powershell_shape(visible.as_ref())
 }
 
 pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
@@ -1978,7 +2596,36 @@ fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<Strin
 /// deny on any of them answers for the payload.
 #[must_use]
 pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCommand> {
-    let mut extracted = extract_command_with_context_inner(input)?;
+    let mut extracted = match extract_command_with_context_inner(input) {
+        Some(extracted) => extracted,
+        // The retained spelling of a conflicting alias pair carried no command,
+        // but a displaced one did. Returning `None` here dropped it silently:
+        // the payload PARSES, so there is no read error, no stderr warning, no
+        // history row, and `DCG_FAIL_CLOSED` cannot catch it either — strictly
+        // worse than the pre-#410 behaviour, where the duplicate key produced a
+        // parse error that fail-closed operators did block. `{"tool_input":{},
+        // "toolInput":{"command":"rm -rf /"}}` is the whole exploit.
+        //
+        // The `is_shell_hook_candidate` gate still applies, so a non-shell tool
+        // is as ignored as it ever was.
+        None => {
+            let first = input
+                .alias_conflict_commands
+                .first()
+                .filter(|_| is_shell_hook_candidate(input))?;
+            let labeled = shell_dialect_for_tool_name(input.tool_name.as_deref());
+            let protocol = detect_protocol(input);
+            ExtractedHookCommand {
+                command: first.clone(),
+                protocol,
+                dialect: refine_shell_dialect(
+                    first,
+                    codex_host_shell_dialect(labeled, protocol, cfg!(windows), first),
+                ),
+                additional_commands: Vec::new(),
+            }
+        }
+    };
     if !input.alias_conflict_commands.is_empty() {
         let labeled = shell_dialect_for_tool_name(input.tool_name.as_deref());
         for command in &input.alias_conflict_commands {
@@ -2039,8 +2686,23 @@ fn extract_command_with_context_inner(input: &HookInput) -> Option<ExtractedHook
     // "tool_input":{"command":"rm -rf /"},"toolCalls":[{"name":"bash",
     // "args":"{\"command\":\"ls -la\"}"}]}` was silently allowed because the
     // benign batch entry answered for the whole payload.
+    // One collection for every envelope shape (#428). The batch branch used to
+    // be the only one that gathered the sibling fields; the fall-through
+    // returned on the first field it found, so a command in a
+    // lower-precedence field was never evaluated:
+    //
+    //   {"tool_name":"Bash","tool_input":{"command":"ls"},
+    //    "tool_args":{"command":"rm -rf /"}}                 -> was allowed
+    //   {"tool_name":"Bash","tool_calls":[], …same fields…}   -> denied
+    //
+    // Adding an *empty* `tool_calls` array flipped the verdict, which is what
+    // showed the difference was accidental. Collecting in one place keeps the
+    // primary command exactly where it was for every existing shape —
+    // `toolCalls[]` entries, then a singular `toolCall` (Antigravity nests the
+    // command under `toolCall.args.CommandLine`), then `tool_input`, then
+    // `tool_args` — and stops dropping the rest.
+    let mut commands: Vec<(String, ShellDialect)> = Vec::new();
     if let Some(calls) = input.tool_calls.as_ref() {
-        let mut commands: Vec<(String, ShellDialect)> = Vec::new();
         for call in calls {
             if !is_batch_shell_call(call) {
                 continue;
@@ -2051,77 +2713,40 @@ fn extract_command_with_context_inner(input: &HookInput) -> Option<ExtractedHook
                 commands.push((command, entry_dialect));
             }
         }
-        if let Some(tool_call) = input.tool_call.as_ref() {
-            if let Some(command) = extract_command_from_tool_call(tool_call) {
-                let entry_dialect = resolve(&command, labeled);
-                commands.push((command, entry_dialect));
-            }
-        }
-        if let Some(command) = input
-            .tool_input
-            .as_ref()
-            .and_then(extract_command_from_tool_input)
-        {
-            let entry_dialect = resolve(&command, labeled);
-            commands.push((command, entry_dialect));
-        }
-        if let Some(command) = input
-            .tool_args
-            .as_ref()
-            .and_then(extract_command_from_tool_args)
-        {
-            let entry_dialect = resolve(&command, labeled);
-            commands.push((command, entry_dialect));
-        }
-        let mut entries = commands.into_iter();
-        if let Some((command, primary_dialect)) = entries.next() {
-            return Some(ExtractedHookCommand {
-                command,
-                protocol,
-                dialect: primary_dialect,
-                additional_commands: entries.collect(),
-            });
-        }
+    }
+    if let Some(command) = input
+        .tool_call
+        .as_ref()
+        .and_then(extract_command_from_tool_call)
+    {
+        let entry_dialect = resolve(&command, labeled);
+        commands.push((command, entry_dialect));
+    }
+    if let Some(command) = input
+        .tool_input
+        .as_ref()
+        .and_then(extract_command_from_tool_input)
+    {
+        let entry_dialect = resolve(&command, labeled);
+        commands.push((command, entry_dialect));
+    }
+    if let Some(command) = input
+        .tool_args
+        .as_ref()
+        .and_then(extract_command_from_tool_args)
+    {
+        let entry_dialect = resolve(&command, labeled);
+        commands.push((command, entry_dialect));
     }
 
-    // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
-    if let Some(tool_call) = input.tool_call.as_ref() {
-        if let Some(command) = extract_command_from_tool_call(tool_call) {
-            let dialect = resolve(&command, labeled);
-            return Some(ExtractedHookCommand {
-                command,
-                protocol,
-                dialect,
-                additional_commands: Vec::new(),
-            });
-        }
-    }
-
-    if let Some(tool_input) = input.tool_input.as_ref() {
-        if let Some(command) = extract_command_from_tool_input(tool_input) {
-            let dialect = resolve(&command, labeled);
-            return Some(ExtractedHookCommand {
-                command,
-                protocol,
-                dialect,
-                additional_commands: Vec::new(),
-            });
-        }
-    }
-
-    if let Some(tool_args) = input.tool_args.as_ref() {
-        if let Some(command) = extract_command_from_tool_args(tool_args) {
-            let dialect = resolve(&command, labeled);
-            return Some(ExtractedHookCommand {
-                command,
-                protocol,
-                dialect,
-                additional_commands: Vec::new(),
-            });
-        }
-    }
-
-    None
+    let mut entries = commands.into_iter();
+    let (command, primary_dialect) = entries.next()?;
+    Some(ExtractedHookCommand {
+        command,
+        protocol,
+        dialect: primary_dialect,
+        additional_commands: entries.collect(),
+    })
 }
 
 /// Extract command and protocol from hook input.
@@ -2250,6 +2875,14 @@ pub fn format_denial_message(
     pattern: Option<&str>,
     allow_once_code: Option<&str>,
 ) -> String {
+    // An external pack may author the closing instruction (#416): for a
+    // redirect-style rule, "have the user run it by hand" is the wrong
+    // recovery. The `BLOCKED` header, rule and reason stay dcg's.
+    let trailer = pack
+        .and_then(|pack_id| crate::packs::external_denial_trailer(pack_id, pattern))
+        .unwrap_or(
+            "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+        );
     let mut message = format_matched_message(
         "BLOCKED by dcg",
         command,
@@ -2257,7 +2890,7 @@ pub fn format_denial_message(
         explanation,
         pack,
         pattern,
-        "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+        trailer,
     );
     if let Some(code) = allow_once_code {
         use std::fmt::Write as _;
@@ -2364,9 +2997,14 @@ pub(crate) fn print_colorful_warning_to(
         .map(to_output_severity)
         .unwrap_or(ThemeSeverity::High);
 
-    let explanation_text = explanation.map(str::trim).filter(|text| !text.is_empty());
+    // `[output] explanations_enabled` / `highlight_enabled` (default on). The
+    // JSON denial on stdout is unaffected: these shape the human box only.
+    let explanation_text = explanation
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && crate::output::explanations_enabled());
 
     let span = matched_span
+        .filter(|_| crate::output::highlight_enabled())
         .map(|s| HighlightSpan::new(s.start, s.end))
         .unwrap_or_else(|| HighlightSpan::new(0, 0));
 
@@ -2584,6 +3222,18 @@ pub fn write_denial_to(
     branch_context: Option<&crate::evaluator::BranchContext>,
 ) {
     let allow_once_code = allow_once.map(|info| info.code.as_str());
+
+    // Reasonix reads the exit status and shows stderr, verbatim, to the user
+    // and the model (#358). The reason goes there as the same plain text other
+    // hosts receive as `permissionDecisionReason`, without the decorated
+    // terminal box, and nothing goes to stdout. The caller exits 2.
+    if protocol.blocks_by_exit_status() {
+        let message =
+            format_denial_message(command, reason, explanation, pack, pattern, allow_once_code);
+        let _ = writeln!(stderr, "{message}");
+        return;
+    }
+
     let warning_audience = match protocol {
         HookProtocol::Codex | HookProtocol::CodexAsk => WarningAudience::CodexModel,
         HookProtocol::ClaudeCompatible
@@ -2592,7 +3242,8 @@ pub fn write_denial_to(
         | HookProtocol::Hermes
         | HookProtocol::Grok
         | HookProtocol::Antigravity
-        | HookProtocol::Crush => WarningAudience::HumanOperator,
+        | HookProtocol::Crush
+        | HookProtocol::Reasonix => WarningAudience::HumanOperator,
     };
 
     print_colorful_warning_to(
@@ -2813,6 +3464,8 @@ pub fn write_denial_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        // Returned above: exit-status protocols get their reason on stderr.
+        HookProtocol::Reasonix => {}
     }
 }
 
@@ -2919,7 +3572,8 @@ pub fn write_review_request_to(
         | HookProtocol::Hermes
         | HookProtocol::Grok
         | HookProtocol::Antigravity
-        | HookProtocol::Crush => {
+        | HookProtocol::Crush
+        | HookProtocol::Reasonix => {
             unreachable!("non-review protocols returned through write_denial_to")
         }
     }
@@ -3214,6 +3868,10 @@ pub fn write_indeterminate_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        // No `ask` exists: the reason above is on stderr, and the caller exits
+        // 2 (`blocks_by_exit_status`), so an unverified command is blocked
+        // whatever `unverified_decision` says.
+        HookProtocol::Reasonix => {}
     }
 
     // A deadline response is useful only if the hook runner receives it before
@@ -3290,6 +3948,9 @@ pub(crate) fn write_warning_to(
         | HookProtocol::Copilot
         | HookProtocol::Codex
         | HookProtocol::CodexAsk => {}
+        // The warning above is on stderr; the caller exits 1, which Reasonix
+        // shows as a non-blocking warning (exit 0 would hide it).
+        HookProtocol::Reasonix => {}
         HookProtocol::Gemini => {
             // Gemini hooks support allow/deny only. Preserve dcg warn as
             // non-blocking while still surfacing the warning text to Gemini.
@@ -3442,7 +4103,7 @@ pub fn log_blocked_command(
 
     // Expand ~ in path
     let path = if log_file.starts_with("~/") {
-        dirs::home_dir().map_or_else(
+        crate::config::home_dir().map_or_else(
             || std::path::PathBuf::from(log_file),
             |h| h.join(&log_file[2..]),
         )
@@ -3489,7 +4150,7 @@ pub fn log_budget_skip(
 
     // Expand ~ in path
     let path = if log_file.starts_with("~/") {
-        dirs::home_dir().map_or_else(
+        crate::config::home_dir().map_or_else(
             || std::path::PathBuf::from(log_file),
             |h| h.join(&log_file[2..]),
         )
@@ -3539,9 +4200,7 @@ fn chrono_lite_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env;
 
     #[derive(Default)]
     struct FlushProbe {
@@ -3567,18 +4226,26 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        // SAFETY, for every `set_var`/`remove_var` below: the caller holds
+        // `test_env::lock()`, which is now the single lock for env-mutating
+        // tests in this crate, so no other test WRITES the environment
+        // concurrently.
+        //
+        // That is the whole of the justification, and it is not sufficient on
+        // its own: readers take no lock, and native readers cannot. The
+        // previous wording here claimed "no concurrent access to environment
+        // variables", which was never true — it was three per-module locks,
+        // each serialising only against itself. Tracked in #445; closing it
+        // means not mutating the environment from a threaded test process.
+
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
-            // SAFETY: We hold ENV_LOCK during all tests that use this guard,
-            // ensuring no concurrent access to environment variables.
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
-            // SAFETY: We hold ENV_LOCK during all tests that use this guard,
-            // ensuring no concurrent access to environment variables.
             unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
@@ -3587,12 +4254,11 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = self.previous.take() {
-                // SAFETY: We hold ENV_LOCK during all tests that use this guard,
-                // ensuring no concurrent access to environment variables.
+                // SAFETY: as on the constructors above — the caller holds
+                // `test_env::lock()`, which excludes other env WRITERS only.
                 unsafe { std::env::set_var(self.key, value) };
             } else {
-                // SAFETY: We hold ENV_LOCK during all tests that use this guard,
-                // ensuring no concurrent access to environment variables.
+                // SAFETY: as above.
                 unsafe { std::env::remove_var(self.key) };
             }
         }
@@ -3737,6 +4403,34 @@ mod tests {
         for command in std::iter::once(ps_only).chain(posix_parseable) {
             assert_eq!(
                 codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, false, command),
+                ShellDialect::Posix,
+                "{command:?}"
+            );
+        }
+        // Reasonix's `bash` tool is PowerShell on a Windows host without bash
+        // (#358), so it resolves exactly like Codex, and keeps POSIX elsewhere.
+        assert_eq!(
+            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Reasonix, true, ps_only),
+            ShellDialect::PowerShell
+        );
+        for command in posix_parseable {
+            assert_eq!(
+                codex_host_shell_dialect(
+                    ShellDialect::Posix,
+                    HookProtocol::Reasonix,
+                    true,
+                    command
+                ),
+                ShellDialect::Unknown,
+                "{command:?}"
+            );
+            assert_eq!(
+                codex_host_shell_dialect(
+                    ShellDialect::Posix,
+                    HookProtocol::Reasonix,
+                    false,
+                    command
+                ),
                 ShellDialect::Posix,
                 "{command:?}"
             );
@@ -3893,6 +4587,13 @@ mod tests {
             "erase /q /s C:\\tmp",
             "cd build; rm -Recurse -Force .\\dist",
             "Del.exe /S /Q C:\\src",
+            // Windows `format` against a drive letter: git-bash runs format.com,
+            // so the Bash label must not skip the windows.filesystem pack.
+            "format D: /q",
+            "format /q /y E:",
+            "FORMAT.COM d:\\",
+            "/c/Windows/System32/format.com E: /fs:NTFS",
+            "echo ok && format \"D:\" /q",
         ] {
             assert_eq!(
                 refine_shell_dialect(command, ShellDialect::Posix),
@@ -3917,6 +4618,12 @@ mod tests {
             // and PowerShell never spells options with `--`.
             "rm -- -Recurse",
             "rm -- -Force ./weird-file",
+            // `format` without a drive operand, or as part of another word.
+            "format",
+            "format --help",
+            "clang-format -i src/main.c",
+            "git format-patch -1",
+            "cargo fmt; echo format done",
         ] {
             assert_eq!(
                 refine_shell_dialect(command, ShellDialect::Posix),
@@ -3938,6 +4645,258 @@ mod tests {
             refine_shell_dialect("Remove-Item x", ShellDialect::Unknown),
             ShellDialect::Unknown
         );
+    }
+
+    /// Cmd *writers* must widen the dialect the way cmd *deleters* already do.
+    ///
+    /// `core::credential_files::shell::windows_shells::classify_cmd_builtin`
+    /// implements `copy`/`xcopy`/`move`/`ren`/`mklink` and is reached only
+    /// under `ShellDialect::Cmd`, which a `Bash`-labeled payload never became:
+    /// only PowerShell shapes, `del /s /q` and `format D:` widened. So
+    /// `copy nul .git\config` was evaluated as POSIX — where `\c` is an escape
+    /// naming `.gitconfig`, not a separator naming `.git/config` — and allowed,
+    /// while `Copy-Item x .git\config` denied. Measured end-to-end before the
+    /// fix: prepending an unrelated `Get-Item z;` to the identical command
+    /// denied it, which is what isolates this to the dialect rather than to the
+    /// classifier or the rules behind it.
+    #[test]
+    fn cmd_writer_invocations_widen_the_dialect() {
+        // A cmd writer carrying a Windows path is not a POSIX command.
+        for command in [
+            r"copy nul .git\config",
+            r"copy /y nul .git\HEAD",
+            r"copy C:\tmp\x .git\hooks\pre-commit",
+            r"copy nul %USERPROFILE%\.ssh\authorized_keys",
+            r"xcopy C:\tmp\x .git\",
+            r"robocopy C:\tmp .git\objects",
+            r"move /y C:\tmp\x .git\config",
+            r"move C:\tmp\x .git/config",
+            r"ren .git\config config.bak",
+            r"rename .git\HEAD HEAD.bak",
+            r"mklink .git\config C:\tmp\x",
+            r"mklink /h .git\HEAD C:\tmp\x",
+            r"Copy.exe C:\tmp\x .git\config",
+            r"echo ok && copy nul .git\config",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "cmd writer invocation must widen: {command:?}"
+            );
+        }
+
+        // `copy`, `move` and `rename` are ordinary words, so the bare verb is
+        // never enough — the same bar the destructive aliases are held to. A
+        // POSIX script named `copy` must keep the Posix dialect.
+        for command in [
+            "copy src dst",
+            "copy -r src dst",
+            "move old new",
+            "rename 's/a/b/' *.txt",
+            "ren a b",
+            "./copy file.txt backup.txt",
+            "npm run copy-assets",
+            // Backslash as a POSIX escape, not a separator: the byte after `\`
+            // is punctuation in every one of these.
+            r"copy foo\ bar dst",
+            r"copy 'a\*b' dst",
+            r"move a\$b dst",
+            // POSIX end-of-options ends the scan.
+            r"copy -- C:\tmp\x",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "plain POSIX writer usage must not widen: {command:?}"
+            );
+        }
+    }
+
+    /// A cmd-assembled COMMAND WORD widens the dialect.
+    ///
+    /// `repro_294`'s caret test forces `ShellDialect::Unknown` and passes, but
+    /// nothing widened a bare caret, so through the real hook
+    /// `doc^ker system prune -af` was ALLOWED while `docker system prune -af`
+    /// denied. The decoder was never the problem; the route to it was.
+    #[test]
+    fn a_cmd_assembled_command_word_widens_the_dialect() {
+        for command in [
+            "doc^ker system prune -af",
+            "dock^er volume prune -f",
+            "psq^l -c 'DROP TABLE users'",
+            "g^it reset --hard",
+            "r^m -rf /etc",
+            "%COMSPEC% /c git reset --hard",
+            "%SystemRoot%\\System32\\cmd.exe /c del x",
+            "echo ok && doc^ker system prune -af",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "cmd-assembled command word must widen: {command:?}"
+            );
+        }
+
+        // A caret ANYWHERE is not the signal — only in the command word.
+        // These are ordinary Bash and must keep the Posix dialect, or a large
+        // fraction of real commands would be down-trusted into the union.
+        for command in [
+            "grep -rn '^fn main' src/",
+            "grep -E '^(a|b)$' file.txt",
+            "sed -n 's/^use //p' src/lib.rs",
+            "sed -i 's/^//' notes.txt",
+            "awk '/^ERROR/ {print}' app.log",
+            "rg '^\\s*fn ' src/",
+            "echo a^b",
+            "git commit -m 'fix ^ handling'",
+            "python3 -c 'print(2 ^ 3)'",
+            // A quoted first token is data, not an assembled executable name.
+            "'doc^ker' --help",
+            // Ordinary percent usage that is not a %VAR% expansion.
+            "echo 100% done",
+            "df -h | awk '{print $5}'",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "a caret outside the command word must not widen: {command:?}"
+            );
+        }
+    }
+
+    /// Windows single-FILE deletes widen the dialect (#491).
+    ///
+    /// `WINDOWS_DESTRUCTIVE_ALIASES` requires a switch (`-Recurse`, `/s`) to
+    /// corroborate the verb, which a single-file delete never carries — so
+    /// `del .git\config` kept the Posix dialect and the protected-file rule
+    /// written for it never ran, while `rm .git/config` denied.
+    #[test]
+    fn windows_single_file_deletes_widen_the_dialect() {
+        for command in [
+            r"del .git\config",
+            r"erase .git\HEAD",
+            r"del %USERPROFILE%\.ssh\authorized_keys",
+            r"del /f /q %USERPROFILE%\.ssh\id_rsa",
+            r"ri .git\config",
+            r"ri $env:USERPROFILE\.ssh\id_rsa",
+            r"DEL.EXE C:\Windows\System32\config\SAM",
+            r"echo ok && del .git\config",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "windows single-file delete must widen: {command:?}"
+            );
+        }
+
+        // The verb alone is never enough, for the same reason it is not enough
+        // for the aliases and the cmd writers.
+        for command in [
+            // `ri` is Ruby's documentation browser.
+            "ri Array",
+            "ri --no-pager String#split",
+            // Ordinary relative targets.
+            "del notes.txt",
+            "erase build/out.txt",
+            // `rm` is deliberately NOT in the verb list: a POSIX escape must
+            // not widen the most common destructive command there is.
+            r"rm foo\ bar",
+            r"rm a\*b",
+            r"rm -rf ./build",
+            // A mention, not a command word.
+            "echo del is a windows verb",
+            "grep -rn erase notes.md",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "must not widen: {command:?}"
+            );
+        }
+    }
+
+    /// Bare Windows-only executables widen the dialect on the name alone.
+    ///
+    /// Each of these has a rule waiting on a default-on `windows.*` pack
+    /// (`diskpart`, `bcdedit-delete`, `cipher-wipe`, `wbadmin-delete`, and
+    /// `fsutil` zeroing/dismount rules) that was
+    /// unreachable because nothing marked the payload Windows: the name is not
+    /// a cmdlet, not a destructive alias, not a cmd writer, and not
+    /// `format <drive>:`.
+    #[test]
+    fn bare_windows_only_executables_widen_the_dialect() {
+        for command in [
+            "diskpart /s script.txt",
+            "diskpart",
+            "bcdedit /deletevalue safeboot",
+            "cipher /w:C:\\",
+            "wbadmin delete catalog -quiet",
+            "wbadmin delete backup -keepVersions:0",
+            "fsutil file setzerodata offset=0 length=4096 C:\\data.db",
+            "fsutil volume dismount C:",
+            "DISKPART.EXE /s x.txt",
+            "C:\\Windows\\System32\\bcdedit.exe /deletevalue safeboot",
+            "/c/Windows/System32/diskpart /s x.txt",
+            "echo ok && cipher /w:D:\\",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "windows-only executable must widen: {command:?}"
+            );
+        }
+
+        // The name has to be the COMMAND word, not an argument or a substring:
+        // widening on a mention would down-trust ordinary Bash.
+        for command in [
+            "echo diskpart is a windows tool",
+            "grep -rn bcdedit notes.md",
+            "git commit -m 'document cipher usage'",
+            "./diskpart-notes.sh",
+            "cat wbadmin.log",
+            "echo fsutil is a windows tool",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "a mention must not widen: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_path_tokens_are_distinguished_from_posix_words() {
+        for token in [
+            r"C:\tmp\x",
+            r"c:/tmp",
+            r".git\config",
+            r"%USERPROFILE%\.ssh",
+            "%APPDATA%",
+            r#""C:\Program Files""#,
+        ] {
+            assert!(
+                is_windows_path_token(token),
+                "must be a Windows path: {token:?}"
+            );
+        }
+        for token in [
+            "src",
+            "./dst",
+            "/etc/passwd",
+            "~/.ssh/authorized_keys",
+            r"foo\ bar",
+            r"a\*b",
+            r"a\$b",
+            "100%",
+            "%",
+            "%%",
+            "-r",
+        ] {
+            assert!(
+                !is_windows_path_token(token),
+                "must not be a Windows path: {token:?}"
+            );
+        }
     }
 
     #[test]
@@ -4049,14 +5008,14 @@ mod tests {
         // PowerShell or cmd.exe but does not always send `turn_id`. Without
         // the explicit-Windows-shell fallback this payload would be classified as
         // ClaudeCompatible (exit 0 + JSON that Codex's strict parser drops),
-        // letting the destructive command through. These tool names are
-        // Codex-only (Claude Code always uses "Bash"/"launch-process"), so
-        // they must classify as Codex even with no turn_id.
+        // letting the destructive command through. Without an Anthropic
+        // tool-use id (see the next test) these tool names must classify as
+        // Codex even with no turn_id.
         //
         // Ambient `PA_PROJECT_DIR` (the Posit Assistant marker checked ahead
         // of the Windows-shell rule) would legitimately steer these payloads
         // to ClaudeCompatible, so pin it removed for a deterministic result.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
         for tool in [
             "powershell",
@@ -4081,6 +5040,73 @@ mod tests {
                 extract_command(&input),
                 Some("git reset --hard HEAD~1".to_string())
             );
+        }
+    }
+
+    /// Claude Code's Windows `PowerShell` tool carries an Anthropic tool-use id
+    /// (`toolu_…`) and must get the full Claude answer (ruleId, allow-once
+    /// code, remediation) instead of Codex's minimal one. Anything else —
+    /// OpenAI `call_…` ids, no id, a non-string id — keeps the #125 Codex
+    /// treatment, because answering Codex in Claude shape fails open.
+    #[test]
+    fn unattended_permission_mode_detection() {
+        let parse = |mode: &str| -> HookInput {
+            serde_json::from_str(&format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"ls"}},"permission_mode":{mode}}}"#
+            ))
+            .expect("an odd permission_mode must not fail the whole parse")
+        };
+        for mode in [
+            r#""bypassPermissions""#,
+            r#""dontAsk""#,
+            r#""BYPASSPERMISSIONS""#,
+            r#""dontask""#,
+        ] {
+            assert!(parse(mode).declares_unattended_permission_mode(), "{mode}");
+        }
+        for mode in [
+            r#""default""#,
+            r#""acceptEdits""#,
+            r#""plan""#,
+            r#""""#,
+            r#"" bypassPermissions""#,
+            "null",
+            "true",
+            r#"["bypassPermissions"]"#,
+        ] {
+            assert!(!parse(mode).declares_unattended_permission_mode(), "{mode}");
+        }
+        let absent: HookInput =
+            serde_json::from_str(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#).unwrap();
+        assert!(!absent.declares_unattended_permission_mode());
+    }
+
+    #[test]
+    fn test_claude_powershell_tool_is_claude_compatible() {
+        let _lock = test_env::lock();
+        let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+        let payload = |tool: &str, id: &str| {
+            format!(
+                r#"{{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"{tool}","tool_input":{{"command":"git reset --hard"}},"tool_use_id":{id}}}"#
+            )
+        };
+        for tool in ["PowerShell", "pwsh", "cmd"] {
+            let input: HookInput =
+                serde_json::from_str(&payload(tool, r#""toolu_01ABC""#)).unwrap();
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::ClaudeCompatible,
+                "{tool} with an Anthropic tool-use id"
+            );
+            for id in [r#""call_abc123""#, "null", "42", r#"{"x":1}"#, r#""""#] {
+                let input: HookInput = serde_json::from_str(&payload(tool, id))
+                    .expect("an odd tool_use_id must not fail the whole parse");
+                assert_eq!(
+                    detect_protocol(&input),
+                    HookProtocol::Codex,
+                    "{tool} with tool_use_id {id}"
+                );
+            }
         }
     }
 
@@ -4125,7 +5151,7 @@ mod tests {
 
     #[test]
     fn test_posit_assistant_bash_payload_is_claude_compatible_without_env() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _no_env = EnvVarGuard::remove("PA_PROJECT_DIR");
 
         let input: HookInput = serde_json::from_str(POSIT_ASSISTANT_BASH_PAYLOAD).unwrap();
@@ -4158,7 +5184,7 @@ mod tests {
         // Windows-shell → Codex rule. `PA_PROJECT_DIR` — which the hook
         // contract sets in the hook subprocess — must steer the payload back
         // to the Claude-compatible response Posit Assistant actually reads.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let json = r#"{
             "session_id":"pa-session-42",
             "cwd":"C:\\Users\\user\\analysis",
@@ -4172,10 +5198,18 @@ mod tests {
 
         {
             let _no_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+            // Posit Assistant's Anthropic tool-use id alone already selects
+            // the Claude shape it reads.
+            assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+            let bare: HookInput = serde_json::from_str(
+                &json.replace(r#""tool_use_id":"toolu_posit_01""#, r#""unrelated":"x""#),
+            )
+            .unwrap();
+            assert!(bare.tool_use_id.is_none());
             assert_eq!(
-                detect_protocol(&input),
+                detect_protocol(&bare),
                 HookProtocol::Codex,
-                "without the env marker a bare `powershell` tool stays Codex"
+                "without the env marker or an Anthropic id a bare `powershell` tool stays Codex"
             );
         }
 
@@ -4189,7 +5223,7 @@ mod tests {
         // Assistant workspace, so a payload carrying another agent's own wire
         // markers must keep that agent's protocol. Every branch below runs
         // ahead of the Posit Assistant env check.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
 
         // Gemini: BeforeTool event + run_shell_command tool.
@@ -4252,7 +5286,7 @@ mod tests {
         // Claude shape (Gemini's parser reads `decision`/`reason`, not
         // `hookSpecificOutput`, so the deny was dropped). The gate now also
         // requires a Posit-Assistant shell tool name.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
         let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
         let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
@@ -4274,7 +5308,7 @@ mod tests {
         // shell tool is another agent's must keep that agent's protocol. The
         // Posit branch only exists to reroute `bash`/Windows-shell names away
         // from the #125 bare-Windows-shell → Codex rule.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
         let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
         let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
@@ -4381,6 +5415,104 @@ mod tests {
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(extract_command(&input), Some("git status".to_string()));
         assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    /// The native preToolUse input from the Copilot hooks reference:
+    /// `{sessionId, timestamp, cwd, toolName, toolArgs}`, with a *numeric*
+    /// timestamp and no `event` field. Every fixture above carries an `event`
+    /// and no timestamp, so none noticed that a numeric timestamp failed the
+    /// whole parse -- and a failed parse fails open.
+    #[test]
+    fn test_parse_copilot_native_envelope_with_numeric_timestamp() {
+        for tool_args in [
+            r#"{"command":"git reset --hard"}"#,
+            r#""{\"command\":\"git reset --hard\"}""#,
+        ] {
+            let json = format!(
+                r#"{{"sessionId":"a1b2","timestamp":1771286400000,"cwd":"/repo","toolName":"bash","toolArgs":{tool_args}}}"#
+            );
+            let input: HookInput =
+                serde_json::from_str(&json).expect("the documented Copilot payload must parse");
+            assert_eq!(detect_protocol(&input), HookProtocol::Copilot, "{json}");
+            assert_eq!(
+                extract_command(&input),
+                Some("git reset --hard".to_string()),
+                "{json}"
+            );
+        }
+        // Gemini's RFC 3339 string still parses.
+        let gemini: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"BeforeTool","timestamp":"2026-02-24T00:00:00Z","tool_name":"run_shell_command","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&gemini), HookProtocol::Gemini);
+    }
+
+    /// A lone surrogate escape -- what `JSON.stringify` emits for a lone
+    /// surrogate in a JavaScript string -- failed the whole parse, which
+    /// fails open. It is neutralized to U+FFFD so the command is judged.
+    #[test]
+    fn lone_surrogate_escapes_do_not_fail_the_parse() {
+        for escape in [r"\ud800", r"\uDBFF", r"\udc00", r"\uDFFF", r"\ud800\ud800"] {
+            let json = format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"rm -rf ~ # {escape}"}}}}"#
+            );
+            let input = parse_hook_input(&json).unwrap_or_else(|error| {
+                panic!("{escape}: parse failed ({error}), which fails open")
+            });
+            let command = extract_command(&input).expect("command extracted");
+            assert!(command.starts_with("rm -rf ~ # "), "{escape}: {command:?}");
+            assert!(command.contains('\u{FFFD}'), "{escape}: {command:?}");
+        }
+        // A well-formed pair is kept exactly (U+1F600).
+        let pair =
+            parse_hook_input(r#"{"tool_name":"Bash","tool_input":{"command":"echo 😀"}}"#).unwrap();
+        assert_eq!(extract_command(&pair).as_deref(), Some("echo \u{1F600}"));
+        // An escaped backslash before `u` is literal text, not an escape.
+        let literal =
+            parse_hook_input(r#"{"tool_name":"Bash","tool_input":{"command":"printf '\\ud800'"}}"#)
+                .unwrap();
+        assert_eq!(
+            extract_command(&literal).as_deref(),
+            Some(r"printf '\ud800'")
+        );
+        // Nothing to neutralize borrows the input unchanged.
+        assert!(matches!(
+            neutralize_lone_surrogate_escapes(r#"{"a":"A"}"#),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// No envelope field may fail the parse by its type: a failed parse fails
+    /// open. Every string field, and the object-shaped ones, arrive here with
+    /// the wrong JSON type beside a destructive command that must still be
+    /// found.
+    #[test]
+    fn envelope_fields_of_the_wrong_type_never_fail_the_parse() {
+        for bad in ["42", "true", "[1,2]", r#"{"k":"v"}"#, "null"] {
+            let json = format!(
+                r#"{{"event":{bad},"hook_event_name":{bad},"session_id":{bad},"transcript_path":{bad},"cwd":{bad},"timestamp":{bad},"turn_id":{bad},"tool_use_id":{bad},"permission_mode":{bad},"toolCall":{bad},"toolCalls":{bad},"tool_name":"Bash","tool_input":{{"command":"git reset --hard"}}}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json)
+                .unwrap_or_else(|error| panic!("{bad}: parse failed ({error}), which fails open"));
+            assert_eq!(
+                extract_command(&input),
+                Some("git reset --hard".to_string()),
+                "{bad}"
+            );
+        }
+        // A tool name or tool_input of the wrong type degrades to "no
+        // command" rather than an error; a numeric tool name keeps its text.
+        let input: HookInput =
+            serde_json::from_str(r#"{"tool_name":7,"tool_input":"git reset --hard"}"#).unwrap();
+        assert_eq!(input.tool_name.as_deref(), Some("7"));
+        assert!(input.tool_input.is_none());
+        // Formerly a hard parse error (and so a fail-open allow): an object
+        // where the tool name belongs.
+        let input =
+            parse_hook_input(r#"{"tool_name":{"nested":true},"tool_input":{"command":"ls"}}"#)
+                .expect("a wrong-typed tool name degrades, it does not fail the parse");
+        assert!(input.tool_name.is_none());
     }
 
     #[test]
@@ -5480,7 +6612,13 @@ mod tests {
         let input: HookInput =
             serde_json::from_str(json).expect("unfit entries must be skipped, not fatal");
         let calls = input.tool_calls.as_ref().expect("array shape is kept");
-        assert_eq!(calls.len(), 1, "only the fitting entry survives");
+        // `{"name":7}` is an object, so it fits once its name is read
+        // tolerantly; it carries no args and contributes no command.
+        assert_eq!(
+            calls.len(),
+            2,
+            "object entries survive, scalars are skipped"
+        );
         let extracted = extract_command_with_context(&input).expect("kept entry must extract");
         assert_eq!(extracted.command, "echo hi");
         assert!(extracted.additional_commands.is_empty());
@@ -5708,13 +6846,15 @@ mod tests {
     #[test]
     fn malformed_json_without_an_alias_conflict_keeps_its_original_error() {
         // Canonicalization is a targeted retry, not a general tolerance knob:
-        // input that is not an object, or that has no colliding alias group,
-        // must still be reported as the parse failure it is.
+        // input that is not a JSON object must still be reported as the parse
+        // failure it is. (A field of the wrong *type* inside a valid object is
+        // different: each envelope field degrades on its own, because a failed
+        // parse fails open -- see
+        // `envelope_fields_of_the_wrong_type_never_fail_the_parse`.)
         for json in [
             r#"{"session_id":"s1","tool_name":"Bash","tool_input":}"#,
             "not json at all",
             "[1,2,3]",
-            r#"{"tool_name":{"nested":true},"tool_input":{"command":"ls"}}"#,
         ] {
             assert!(parse_hook_input(json).is_err(), "must still reject: {json}");
         }
@@ -5740,7 +6880,7 @@ mod tests {
         // Regression: the toolCalls branch fired on ANY non-empty array, so a
         // single non-shell entry rerouted another agent's payload into Claude
         // wire shape — a deny document those parsers drop (fail-open).
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
         let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
         let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
@@ -5903,9 +7043,10 @@ mod tests {
 
     #[test]
     fn test_env_var_guard_restores_value() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let key = "DCG_TEST_ENV_GUARD";
-        // SAFETY: We hold ENV_LOCK to prevent concurrent env modifications
+        // SAFETY: the test holds `test_env::lock()`, which excludes other env
+        // WRITERS in this crate. Readers are not excluded; see #445.
         unsafe { std::env::remove_var(key) };
 
         {
@@ -6037,7 +7178,7 @@ mod tests {
         // workspace, `CLAUDE_CODE`/`CLAUDE_SESSION_ID` from a Claude Code
         // session) would otherwise make this assertion flaky, so pin them
         // removed under the env lock like the sibling Posit tests do.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
         let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
         let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
@@ -6383,6 +7524,9 @@ mod tests {
                 | HookProtocol::Grok
                 | HookProtocol::Antigravity
                 | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
+                HookProtocol::Reasonix => {
+                    unreachable!("exit-status protocol, covered by the Reasonix test below")
+                }
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -6394,6 +7538,111 @@ mod tests {
                 assert_eq!(json["message"], REASON);
             }
         }
+    }
+
+    /// #358: an unparseable payload's protocol comes from its raw envelope
+    /// markers only for the unambiguous Reasonix shape.
+    #[test]
+    fn reasonix_protocol_is_read_from_truncated_envelope_markers() {
+        let reasonix = r#"{"event":"PreToolUse","sessionId":"s","cwd":"/r","toolName":"bash","toolArgs":{"command":"git reset --hard AAAA"#;
+        assert_eq!(
+            protocol_from_truncated_json(reasonix),
+            Some(HookProtocol::Reasonix)
+        );
+        let spaced = r#"{ "event" : "pretooluse", "toolArgs" : { "command": "x"#;
+        assert_eq!(
+            protocol_from_truncated_json(spaced),
+            Some(HookProtocol::Reasonix)
+        );
+        for other in [
+            // Claude / Codex / Gemini: no top-level event.
+            r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"#,
+            // Crush: PascalCase event, but tool_input.
+            r#"{"event":"PreToolUse","tool_name":"bash","tool_input":{"command":"x"#,
+            // Copilot: hyphenated event, string toolArgs.
+            r#"{"event":"pre-tool-use","toolName":"bash","toolArgs":"{\"command\":\"x"#,
+            r#"{"event":"PreToolUse","toolName":"bash","toolArgs":"{\"command\":\"x"#,
+            // No event at all.
+            r#"{"toolName":"bash","toolArgs":{"command":"x"#,
+        ] {
+            assert_eq!(protocol_from_truncated_json(other), None, "{other}");
+        }
+        // Keys inside a command string are escaped, so a command cannot plant
+        // a `tool_input` key (or an event) to change the answer.
+        let planted = r#"{"event":"PreToolUse","toolName":"bash","toolArgs":{"command":"echo \"tool_input\": 1"#;
+        assert_eq!(
+            protocol_from_truncated_json(planted),
+            Some(HookProtocol::Reasonix)
+        );
+        let planted_event = r#"{"tool_name":"Bash","tool_input":{"command":"echo \"event\":\"PreToolUse\",\"toolArgs\":{"#;
+        assert_eq!(protocol_from_truncated_json(planted_event), None);
+    }
+
+    /// Reasonix reads only the exit status (#358): its payload must be
+    /// recognized as such, and every blocking verdict must put a plain reason
+    /// on stderr and nothing on stdout, since the caller exits 2.
+    #[test]
+    fn reasonix_is_detected_and_answered_through_stderr_issue_358() {
+        let reasonix: HookInput = serde_json::from_str(
+            r#"{"event":"PreToolUse","cwd":"/repo","toolName":"bash","toolArgs":{"command":"git reset --hard"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&reasonix), HookProtocol::Reasonix);
+        // Copilot shares `toolArgs` but sends a hyphenated event and a string.
+        let copilot: HookInput = serde_json::from_str(
+            r#"{"event":"pre-tool-use","toolName":"bash","toolArgs":"{\"command\":\"ls\"}"}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&copilot), HookProtocol::Copilot);
+        // Crush shares the PascalCase event but sends snake_case tool_input.
+        let crush: HookInput = serde_json::from_str(
+            r#"{"event":"PreToolUse","session_id":"s","tool_name":"bash","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&crush), HookProtocol::Crush);
+
+        assert!(HookProtocol::Reasonix.blocks_by_exit_status());
+        assert!(!HookProtocol::Crush.blocks_by_exit_status());
+        assert!(!HookProtocol::ClaudeCompatible.blocks_by_exit_status());
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Reasonix,
+            "git reset --hard",
+            "git reset --hard destroys uncommitted changes.",
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        );
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stdout.is_empty(), "Reasonix never reads stdout");
+        assert!(stderr.starts_with("BLOCKED by dcg"), "{stderr}");
+        assert!(stderr.contains("Rule: core.git:reset-hard"), "{stderr}");
+        assert!(
+            !stderr.contains("+---"),
+            "no decorated box for the model: {stderr}"
+        );
+
+        let mut stdout = FlushProbe::default();
+        let mut stderr = FlushProbe::default();
+        write_indeterminate_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Reasonix,
+            "unverified",
+            false,
+        );
+        assert!(stdout.bytes.is_empty());
+        assert!(String::from_utf8_lossy(&stderr.bytes).contains("unverified"));
     }
 
     /// #338: `general.unverified_decision = "deny"` must convert the
@@ -6443,6 +7692,9 @@ mod tests {
                 | HookProtocol::Grok
                 | HookProtocol::Antigravity
                 | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
+                HookProtocol::Reasonix => {
+                    unreachable!("exit-status protocol, covered by the Reasonix test")
+                }
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -6512,6 +7764,9 @@ mod tests {
                 | HookProtocol::Grok
                 | HookProtocol::Antigravity
                 | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
+                HookProtocol::Reasonix => {
+                    unreachable!("exit-status protocol, covered by the Reasonix test")
+                }
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");

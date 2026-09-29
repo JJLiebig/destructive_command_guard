@@ -32,6 +32,17 @@ pub struct NormalizedCommand<'a> {
     pub normalized: Cow<'a, str>,
     /// List of wrappers that were stripped (for explain/debug output).
     pub stripped_wrappers: Vec<StrippedWrapper>,
+    /// Whether the walk stopped on its own iteration bound rather than because
+    /// no wrapper was left.
+    ///
+    /// When this is set, `normalized` still begins with a wrapper word, so the
+    /// real executable is further right and unknown. A caller that resolves
+    /// argv0 has to treat that as "unresolved" rather than as an answer (#424):
+    /// `command … × 97 … gh repo edit --visibility public` left `command` in
+    /// the executable slot, an `executables = ["gh"]` rule was skipped for not
+    /// being about `command`, and the command was allowed — while 96 wrappers
+    /// denied, and the same rule without the scope denied at any depth.
+    pub wrapper_limit_reached: bool,
 }
 
 /// A wrapper that was stripped from the command.
@@ -52,6 +63,7 @@ impl<'a> NormalizedCommand<'a> {
             original: command,
             normalized: Cow::Borrowed(command),
             stripped_wrappers: Vec::new(),
+            wrapper_limit_reached: false,
         }
     }
 
@@ -88,10 +100,14 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
     // Limit iterations to prevent DoS from maliciously crafted commands
     const MAX_WRAPPER_ITERATIONS: usize = 32;
     let mut iteration_count = 0;
+    let mut limit_reached = false;
     loop {
         iteration_count += 1;
         if iteration_count > MAX_WRAPPER_ITERATIONS {
-            // Too many wrapper layers - treat as suspicious and stop stripping
+            // Too many wrapper layers - treat as suspicious and stop stripping.
+            // The caller is told, because what is left in the executable slot
+            // is a wrapper word rather than the executable (#424).
+            limit_reached = true;
             break;
         }
         let before_len = current.len();
@@ -146,6 +162,7 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
             original: command,
             normalized: Cow::Owned(current),
             stripped_wrappers,
+            wrapper_limit_reached: limit_reached,
         }
     }
 }
@@ -1557,7 +1574,7 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
     i
 }
 
-fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usize) -> usize {
+pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usize) -> usize {
     let mut depth = 1usize;
 
     while i < len {
@@ -1796,7 +1813,7 @@ enum PosixQuote {
     Double,
 }
 
-fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
+pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
     if !token
         .as_bytes()
         .iter()
@@ -1908,9 +1925,11 @@ fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InvalidAnsiCQuote;
+pub(crate) struct InvalidAnsiCQuote;
 
-fn decode_ansi_c_quoted(
+/// Decode the body of a Bash `$'…'` string, the opening `$'` already
+/// consumed, through its closing quote.
+pub(crate) fn decode_ansi_c_quoted(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     output: &mut String,
 ) -> Result<(), InvalidAnsiCQuote> {
@@ -1993,11 +2012,12 @@ fn decode_ansi_c_quoted(
                         .and_then(|n| n.checked_add(digit))
                         .ok_or(InvalidAnsiCQuote)?;
                 }
+                // bash and zsh keep the low byte of an overlong octal
+                // escape: `$'\562'` is `r` (0o562 & 0xff), not an error. An
+                // error here left `rm $'-\562f' /` undecoded, i.e. unread.
+                let value = value & 0xff;
                 if value == 0 {
                     return discard_ansi_c_quote_tail(chars);
-                }
-                if value > u32::from(u8::MAX) {
-                    return Err(InvalidAnsiCQuote);
                 }
                 output.push(char::from_u32(value).ok_or(InvalidAnsiCQuote)?);
             }
@@ -4182,6 +4202,11 @@ mod tests {
             (r"$'\x72\x6d\c@ignored'", "rm"),
             (r#"$"-d""#, "-d"),
             (r#"$"--delete""#, "--delete"),
+            // An overlong octal escape keeps its low byte, as bash and zsh
+            // do: 0o562 & 0xff is `r`, and 0o400 is NUL (ends the string).
+            (r"$'\562m'", "rm"),
+            (r"$'-\562f'", "-rf"),
+            (r"$'rm\400ignored'", "rm"),
         ];
 
         for (raw, expected) in cases {

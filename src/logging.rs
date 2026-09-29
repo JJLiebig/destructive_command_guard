@@ -31,6 +31,11 @@ pub struct LoggingConfig {
     pub redaction: RedactionConfig,
     /// Events to log.
     pub events: LogEventFilter,
+    /// Name of an environment variable whose value identifies the caller,
+    /// recorded as `caller` on each entry (#378), e.g. `FLYWHEEL_AGENT_ID`.
+    /// Opt-in. The value is a label only: it is sanitized, bounded, and never
+    /// consulted by any decision.
+    pub caller_env: Option<String>,
 }
 
 impl Default for LoggingConfig {
@@ -41,8 +46,34 @@ impl Default for LoggingConfig {
             format: LogFormat::Text,
             redaction: RedactionConfig::default(),
             events: LogEventFilter::default(),
+            caller_env: None,
         }
     }
+}
+
+/// Longest caller label recorded, in characters.
+const MAX_CALLER_CHARS: usize = 64;
+
+/// The caller label from the configured environment variable, if set (#378).
+///
+/// Anyone who can set the variable controls it, so it is reduced to a short,
+/// single-line label (printable ASCII only), fit for an audit record and
+/// unable to forge log structure.
+#[must_use]
+pub fn caller_label(config: &LoggingConfig) -> Option<String> {
+    let name = config.caller_env.as_deref()?;
+    sanitize_caller_label(&std::env::var(name).ok()?)
+}
+
+/// Reduce a raw caller value to the label [`caller_label`] records.
+fn sanitize_caller_label(raw: &str) -> Option<String> {
+    let label: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(MAX_CALLER_CHARS)
+        .collect();
+    let label = label.trim().to_string();
+    (!label.is_empty()).then_some(label)
 }
 
 /// Log output format.
@@ -133,6 +164,9 @@ pub struct LogEntry {
     pub budget_skip: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowlist_layer: Option<String>,
+    /// Caller label from `[logging] caller_env` (#378).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
 }
 
 impl LogEntry {
@@ -164,11 +198,14 @@ impl LogEntry {
             EvaluationDecision::Indeterminate => "indeterminate",
         };
 
-        let mode_str = match mode {
-            DecisionMode::Deny => "deny",
-            DecisionMode::Ask => "ask",
-            DecisionMode::Warn => "warn",
-            DecisionMode::Log => "log",
+        // No policy mode applies to an allowed command; report the outcome
+        // itself rather than whichever placeholder the caller passed.
+        let mode_str = match (result.decision, mode) {
+            (EvaluationDecision::Allow, _) => "allow",
+            (_, DecisionMode::Deny) => "deny",
+            (_, DecisionMode::Ask) => "ask",
+            (_, DecisionMode::Warn) => "warn",
+            (_, DecisionMode::Log) => "log",
         };
 
         let (pack_id, pattern_name, rule_id, reason) =
@@ -212,6 +249,7 @@ impl LogEntry {
                 None
             },
             allowlist_layer,
+            caller: None,
         }
     }
 
@@ -236,6 +274,9 @@ impl LogEntry {
         }
         if let Some(ref layer) = self.allowlist_layer {
             parts.push(format!("[allowlist:{layer}]"));
+        }
+        if let Some(ref caller) = self.caller {
+            parts.push(format!("[caller:{caller}]"));
         }
         parts.join(" ")
     }
@@ -296,6 +337,10 @@ impl DecisionLogger {
             &self.config.redaction,
             elapsed_us,
         );
+        let entry = LogEntry {
+            caller: caller_label(&self.config),
+            ..entry
+        };
         let line = match self.config.format {
             LogFormat::Text => entry.format_text(),
             LogFormat::Json => entry.format_json(),
@@ -339,7 +384,7 @@ impl DecisionLogger {
 fn expand_tilde(path: &str) -> String {
     // Expand a leading `~/` or `~\` using $HOME first (honored for test
     // isolation), then the platform home dir (USERPROFILE on Windows). On native
-    // Windows `HOME` is normally unset, so the `dirs::home_dir()` fallback is what
+    // Windows `HOME` is normally unset, so the `config::home_dir()` fallback is what
     // keeps `~`-prefixed log paths from collapsing into a junk relative path.
     if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
         if let Some(home) = home_dir_string() {
@@ -355,7 +400,7 @@ fn expand_tilde(path: &str) -> String {
 
 /// Resolve the user's home directory as a `String`, preferring `$HOME` (so tests
 /// can override it for isolation) and falling back to the platform home
-/// (`USERPROFILE` on Windows) via the `dirs` crate.
+/// (`USERPROFILE` on Windows) via [`crate::config::home_dir`].
 fn home_dir_string() -> Option<String> {
     if let Some(home) = std::env::var_os("HOME") {
         let s = home.to_string_lossy();
@@ -363,7 +408,7 @@ fn home_dir_string() -> Option<String> {
             return Some(s.into_owned());
         }
     }
-    dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
+    crate::config::home_dir().map(|p| p.to_string_lossy().into_owned())
 }
 
 fn open_log_file(path: &str) -> std::io::Result<File> {
@@ -1034,6 +1079,41 @@ pub fn log_allow_once_event(
 mod tests {
     use super::*;
 
+    /// The caller label is attacker-settable text in an audit record (#378):
+    /// single-line, printable, bounded, and absent when empty.
+    #[test]
+    fn caller_label_is_a_bounded_single_line_label_issue_378() {
+        assert_eq!(
+            sanitize_caller_label("agent-7 (swarm)").as_deref(),
+            Some("agent-7 (swarm)")
+        );
+        assert_eq!(
+            sanitize_caller_label("ok\n[DENY] forged\x1b[31m").as_deref(),
+            Some("ok[DENY] forged[31m"),
+            "newlines and control bytes cannot forge log structure"
+        );
+        assert_eq!(
+            sanitize_caller_label(&"x".repeat(500)).map(|l| l.len()),
+            Some(64)
+        );
+        assert_eq!(sanitize_caller_label("  \t\n "), None);
+
+        let entry = LogEntry {
+            caller: Some("agent-7".to_string()),
+            ..LogEntry::from_result(
+                &EvaluationResult::allowed(),
+                "ls",
+                None,
+                DecisionMode::Deny,
+                &RedactionConfig::default(),
+                None,
+            )
+        };
+        assert!(entry.format_text().ends_with("[caller:agent-7]"));
+        assert!(entry.format_json().contains("\"caller\":\"agent-7\""));
+        assert!(LoggingConfig::default().caller_env.is_none(), "opt-in");
+    }
+
     #[test]
     fn logging_config_defaults() {
         let config = LoggingConfig::default();
@@ -1131,7 +1211,7 @@ mod tests {
     fn expand_tilde_backslash_form_and_bare_tilde() {
         // `~\` (Windows-style) must expand just like `~/`, and bare `~` resolves
         // to the home dir. Uses home_dir_string(), which falls back to
-        // dirs::home_dir() (USERPROFILE on Windows) when $HOME is unset, so this
+        // config::home_dir() (USERPROFILE on Windows) when $HOME is unset, so this
         // runs on any host.
         if home_dir_string().is_some() {
             let result = expand_tilde(r"~\test\path");

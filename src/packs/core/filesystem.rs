@@ -325,6 +325,40 @@ const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory redirect (allowed without confirmation)",
     ),
 ];
+
+/// Suggestions for the `.git`-internals write rules.
+///
+/// Deliberately not [`REDIRECT_TRUNCATE_SUGGESTIONS`]. That list offers
+/// `echo data >> {path}` as the gentler spelling, which is sound advice for an
+/// ordinary file and wrong for a git internal: appending a `[url] insteadOf`
+/// section or a `[core] pager` command to `.git/config` runs on the next git
+/// invocation without destroying a byte, so the truncate/append axis the
+/// redirect rules are drawn on does not separate safe from unsafe here (#457).
+/// `cp` from a staged file stays on the list on purpose — it is the one
+/// spelling that puts a human-reviewable artifact between the agent and the
+/// repository, and the rules below leave it allowed.
+const GIT_INTERNALS_WRITE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "git config <key> <value>",
+        "Change repository configuration through git, which writes atomically and validates the key",
+    ),
+    PatternSuggestion::new(
+        "git update-ref <ref> <sha>",
+        "Move a ref through git rather than by writing .git/refs or .git/HEAD",
+    ),
+    PatternSuggestion::new(
+        "producer | dcg create-new {path}",
+        "After resolving a literal destination, create it only if no file, directory, or symlink already exists",
+    ),
+    PatternSuggestion::new(
+        "cat .git/config",
+        "Reading anything under .git is never blocked",
+    ),
+    PatternSuggestion::new(
+        "echo data > /tmp/{subdir}/config && cp /tmp/{subdir}/config .git/config",
+        "Stage the proposed file outside the repository and copy it in after review",
+    ),
+];
 use crate::normalize::{
     NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole,
     tokenize_for_normalization, tokenize_for_shell_dialect,
@@ -359,6 +393,8 @@ const RM_RECURSIVE_UNVERIFIED_NAME: &str = "rm-recursive-unverified";
 const RM_RECURSIVE_UNVERIFIED_REASON: &str = "a dynamically resolved executable may be rm and is followed by recursive deletion syntax that cannot be verified safe before shell expansion.";
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME: &str = "powershell-remove-item-recursive";
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON: &str = "PowerShell Remove-Item (or an alias) with -Recurse permanently deletes an entire item tree without using the Recycle Bin.";
+const RM_PROTECTED_FILE_NAME: &str = "rm-protected-file";
+const RM_PROTECTED_FILE_REASON: &str = "rm on a protected credential or login-startup file is one-shot data destruction with no recovery. EXTREMELY DANGEROUS.";
 
 // ============================================================================
 // Guidance for classifier-only rules (#348)
@@ -472,6 +508,48 @@ const RM_BARE_GLOB_EXPLANATION: &str = "A bare * (or ./*) handed to rm is expand
      rm -i *                          # interactive; needs a terminal - with stdin closed it deletes nothing and exits 0\n  \
      mv ./file /tmp/delete-me-<literal-timestamp>   # move aside instead of deleting";
 
+const RM_PROTECTED_FILE_EXPLANATION: &str = "This deletes a protected credential or login-startup file: an SSH or GPG key, a \
+     cloud or container credential, a shell startup file, or a system account \
+     file such as /etc/shadow or /etc/sudoers. Losing one of these is not a file \
+     you can rebuild from the repository - it is a locked-out account, a revoked \
+     deploy key, or a machine that no longer authenticates.\n\n\
+     There is NO recovery without backups.\n\n\
+     dcg already blocks every other single-file spelling of this - unlink, \
+     shred -u, truncate -s 0 - and every embedded-language spelling. Plain rm was \
+     the one that got through, because the rm rules all require a recursive flag \
+     and -r is exactly the flag you do not need to delete one file.\n\n\
+     This rule is narrow on purpose: it decides on the protected-file table, not \
+     on a directory prefix, so ordinary deletes under a home directory \
+     (rm ~/notes.txt, rm ~/project/src/main.rs) are untouched.\n\n\
+     Safer alternatives (dcg allows all of these):\n  \
+     ls -la {path}                                  # confirm what this actually names\n  \
+     mv {path} /tmp/delete-me-<literal-timestamp>   # move aside; reversible while you verify\n  \
+     cp {path} {path}.bak                           # keep an explicit copy before anything else\n\n\
+     For an SSH key specifically, remove the authorized entry rather than the \
+     key file, so an existing session is not the last one you have.";
+
+/// Deliberately no `cp {path} {path}.bak && rm {path}`.
+///
+/// That is the shape `UNLINK_SUGGESTIONS` offers, and it is right there because
+/// `unlink` keeps working once a backup exists. It cannot be offered here: the
+/// `rm {path}` half is the command this very rule denies, so suggesting it
+/// would send the caller back into the same wall. The backup and the deletion
+/// are split instead, and the move-aside form carries the actual remedy.
+const RM_PROTECTED_FILE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "Confirm which file this actually names before deleting it",
+    ),
+    PatternSuggestion::new(
+        "mv {path} /tmp/delete-me-{timestamp}",
+        "Move it aside instead: reversible, and proves nothing depended on it",
+    ),
+    PatternSuggestion::new(
+        "cp {path} {path}.bak",
+        "Keep an explicit copy before doing anything irreversible",
+    ),
+];
+
 const RM_BARE_GLOB_ROOT_EXPLANATION: &str = "rm /* expands to every top-level entry of the filesystem root. Without -r the \
      directories survive, but on systems where /bin, /lib, and /sbin are symlinks \
      into /usr, deleting those symlinks bricks the machine - no shell, no rescue \
@@ -561,6 +639,9 @@ pub(crate) fn classifier_rule_guidance(
         n if n == RM_BARE_GLOB_ROOT_NAME => {
             Some((RM_BARE_GLOB_ROOT_EXPLANATION, RM_BARE_GLOB_SUGGESTIONS))
         }
+        n if n == RM_PROTECTED_FILE_NAME => {
+            Some((RM_PROTECTED_FILE_EXPLANATION, RM_PROTECTED_FILE_SUGGESTIONS))
+        }
         _ => None,
     }
 }
@@ -584,6 +665,7 @@ pub(crate) const CLASSIFIER_RULE_NAMES: &[&str] = &[
     POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
     RM_BARE_GLOB_NAME,
     RM_BARE_GLOB_ROOT_NAME,
+    RM_PROTECTED_FILE_NAME,
 ];
 
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
@@ -598,6 +680,8 @@ pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
                 // of the rm Allow fast path as well.
                 | "redirect-truncate-root-home"
                 | "redirect-truncate-dynamic-path"
+                | "redirect-truncate-git-internals-relative"
+                | "redirect-append-git-internals-relative"
         )
     )
 }
@@ -634,6 +718,13 @@ pub(crate) enum RmExecutableCertainty {
 #[derive(Debug)]
 struct PathToken<'a> {
     unquoted: &'a str,
+    /// The operand exactly as spelled, quotes and all.
+    ///
+    /// `unquoted` has already had the outer quotes removed, which loses the
+    /// one distinction the protected-file classifier depends on: `rm ~/x`
+    /// expands to the home directory and `rm "~/x"` does not. That classifier
+    /// does its own quote and escape decoding, so it wants the raw word (#469).
+    raw: &'a str,
     quote: QuoteKind,
     range: Range<usize>,
     /// The byte right after the operand is an unquoted `(`.
@@ -664,8 +755,31 @@ enum RmInteractiveMode {
 }
 
 impl RmInteractiveMode {
-    const fn prompts(self) -> bool {
-        matches!(self, Self::Once | Self::Always)
+    /// Whether this mode makes GNU `rm` actually prompt for the command
+    /// described by `recursive` and `operands`.
+    ///
+    /// `-i` (`Always`) prompts before every file, so it needs no context. `-I`
+    /// (`Once`) does not, and the condition is the whole point of the flag:
+    ///
+    /// > `-I`, `--interactive=once` — prompt once before removing more than
+    /// > three files, or when removing recursively
+    ///
+    /// Treating `Once` as unconditional made `rm -I <private key>` read as
+    /// bounded by a prompt that GNU never issues, so the rules that stand down
+    /// for an interactive command stood down for a silent deletion (#481). One,
+    /// two and three named files all deleted without a prompt and were allowed.
+    ///
+    /// A glob is ONE operand here even though the shell may expand it to many,
+    /// because whether `-I` prompts is then not knowable from the command text.
+    /// Counting it as one keeps the answer "no proven prompt", which leaves the
+    /// rule standing — the conservative direction, and the one that leaves the
+    /// glob rules to make their own case.
+    const fn prompts_for(self, recursive: bool, operands: usize) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Once => recursive || operands > 3,
+            Self::Default | Self::Never => false,
+        }
     }
 }
 
@@ -674,7 +788,6 @@ struct RmFlagState {
     force_style: Option<RmFlagStyle>,
     recursive_span: Option<Range<usize>>,
     span: Option<Range<usize>>,
-    saw_terminator: bool,
     interactive_mode: RmInteractiveMode,
 }
 
@@ -690,7 +803,6 @@ struct RmFlagTracker {
     long_recursive_span: Option<Range<usize>>,
     seen_long_force: bool,
     long_force_span: Option<Range<usize>>,
-    saw_terminator: bool,
     interactive_mode: RmInteractiveMode,
 }
 
@@ -725,7 +837,6 @@ impl RmFlagTracker {
             force_style,
             recursive_span,
             span,
-            saw_terminator: self.saw_terminator,
             interactive_mode: self.interactive_mode,
         })
     }
@@ -1245,16 +1356,10 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
     if dialect == ShellDialect::PowerShell && powershell_variable_assignment(command) {
         return RmParseDecision::NoMatch;
     }
-    if dialect == ShellDialect::PowerShell {
-        let powershell = parse_powershell_remove_item_segment(command, pipeline_stdin);
-        if !matches!(powershell, RmParseDecision::NoMatch) {
-            return powershell;
-        }
-    }
-    if dialect == ShellDialect::Cmd {
-        let cmd = parse_cmd_decoded_rm_segment(command, pipeline_stdin);
-        if !matches!(cmd, RmParseDecision::NoMatch) {
-            return cmd;
+    if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Cmd) {
+        let windows = parse_windows_rm_segment(command, pipeline_stdin, dialect);
+        if !matches!(windows, RmParseDecision::NoMatch) {
+            return windows;
         }
     }
 
@@ -1263,7 +1368,169 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
         return exact;
     }
 
+    // Under `Unknown` the honest answer is the fail-closed union. Every arm
+    // above keys on an EXACT dialect, and `hook::refine_shell_dialect`
+    // down-trusts a mislabeled `Bash` payload to `Unknown` -- which matched no
+    // arm, so a Windows payload fell through to the POSIX parse and
+    // `Remove-Item .git\config`, `del %USERPROFILE%\.ssh\authorized_keys` and
+    // their siblings were allowed while `rm .git/config` and
+    // `rm ~/.ssh/authorized_keys` denied (#491).
+    //
+    // The code those commands needed already existed and was already wired:
+    // `parse_cmd_protected_file_segment` was written for exactly them (#486).
+    // Only the dialect gate stood in front of it. Two controls said so: forcing
+    // `Unknown` changed nothing (it is the value neither arm accepts), and
+    // `dcg explain` reported no `dialect_divergence` at all, so it was not a
+    // case of one dialect denying and the hook reading the wrong one.
+    //
+    // POSIX IS TRIED FIRST, ABOVE. That ordering is the whole safety argument:
+    // an ordinary `rm` keeps its own reading, and only a command the POSIX
+    // parser declines is offered to the Windows front ends. It is also the
+    // convention `credential_files::shell::classify` already established for
+    // this same situation (`posix().or_else(PowerShell).or_else(Cmd)`), so this
+    // follows it rather than inventing a second one.
+    if dialect == ShellDialect::Unknown {
+        for windows in [ShellDialect::PowerShell, ShellDialect::Cmd] {
+            let hit = parse_windows_rm_segment(command, pipeline_stdin, windows);
+            if !matches!(hit, RmParseDecision::NoMatch) {
+                return hit;
+            }
+        }
+    }
+
     parse_unverified_rm_command_segment(command, pipeline_stdin, dialect)
+}
+
+/// The Windows delete front ends for one CONCRETE dialect.
+///
+/// Split out of [`parse_rm_command_segment_in_dialect`] so the `Unknown` union
+/// runs exactly the same code the concrete dialects do, rather than a second
+/// copy that could drift from it.
+fn parse_windows_rm_segment(
+    command: &str,
+    pipeline_stdin: bool,
+    dialect: ShellDialect,
+) -> RmParseDecision {
+    match dialect {
+        ShellDialect::PowerShell => {
+            // A PowerShell assignment is an expression statement, not an
+            // invocation; see the caller's note. The guard travels with the
+            // front end so the union cannot bypass it.
+            if powershell_variable_assignment(command) {
+                return RmParseDecision::NoMatch;
+            }
+            parse_powershell_remove_item_segment(command, pipeline_stdin)
+        }
+        ShellDialect::Cmd => {
+            let decoded = parse_cmd_decoded_rm_segment(command, pipeline_stdin);
+            if !matches!(decoded, RmParseDecision::NoMatch) {
+                return decoded;
+            }
+            // The decoder above only runs for commands carrying `^`, so the
+            // plain spelling of a protected-file delete reached nothing (#451).
+            parse_cmd_protected_file_segment(command)
+        }
+        ShellDialect::Posix | ShellDialect::Unknown => RmParseDecision::NoMatch,
+    }
+}
+
+/// Whether a Windows-dialect delete target names a protected file (#451).
+///
+/// The classifier that owns the protected-path table reads POSIX spelling, so
+/// the Windows one is translated rather than duplicated — a second table is
+/// exactly the drift that #441/#452/#465/#468 were:
+///
+/// - `\` becomes `/`. Both shells accept either, and `$HOME\.ssh\id_rsa` and
+///   `$HOME/.ssh/id_rsa` name the same file.
+/// - Every Windows spelling of the home directory becomes `$HOME`, the anchor
+///   the table already recognises: PowerShell's `$env:USERPROFILE` and cmd's
+///   `%USERPROFILE%` / `%HOMEPATH%`. This is a rename of the same concept, not
+///   a new root — on Windows `%USERPROFILE%` IS the home directory, and dcg's
+///   own `config::home_dir()` resolves it that way (bd-b2b1).
+///
+/// Everything else is left alone, so a target the classifier cannot prove
+/// literal still declines there rather than here.
+fn windows_target_is_protected(target: &str) -> bool {
+    /// Windows home anchors, longest first so `%HOMEDRIVE%%HOMEPATH%` is not
+    /// half-consumed by the `%HOMEPATH%` entry.
+    const HOME_ALIASES: &[&str] = &[
+        "%HOMEDRIVE%%HOMEPATH%",
+        "${env:USERPROFILE}",
+        "$env:USERPROFILE",
+        "%USERPROFILE%",
+        "${env:HOME}",
+        "$env:HOME",
+        "%HOMEPATH%",
+        "%HOME%",
+    ];
+
+    let mut candidate = target.replace('\\', "/");
+    for alias in HOME_ALIASES {
+        if let Some(rest) = strip_prefix_ascii_case_insensitive(&candidate, alias) {
+            candidate = format!("$HOME{rest}");
+            break;
+        }
+    }
+    crate::packs::core::credential_files::may_name_protected_path(&candidate)
+        && crate::packs::core::credential_files::names_protected_file(&candidate)
+}
+
+/// A plain `del`/`erase` of a protected file, in the cmd dialect (#451).
+///
+/// `parse_cmd_decoded_rm_segment` only runs for commands carrying `^`, because
+/// it exists to undo cmd's escape obfuscation. The ordinary spelling therefore
+/// reached no protected-file judgment at all: measured, `del
+/// %USERPROFILE%\.ssh\id_rsa` was allowed while `rm ~/.ssh/id_rsa` denied, for
+/// five target files and every `del`/`erase` switch combination.
+///
+/// Only the two file-deleting verbs are read here. `rd`/`rmdir` remove a
+/// directory and are the recursive rules' business, not this one's.
+fn parse_cmd_protected_file_segment(command: &str) -> RmParseDecision {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Cmd);
+    let mut words = tokens
+        .iter()
+        .take_while(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(command));
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let Some(executable) = words
+        .next()
+        .and_then(|word| decoder.decode(word, ShellTokenRole::Syntax))
+    else {
+        return RmParseDecision::NoMatch;
+    };
+    if !cmd_file_delete_verb(executable.as_ref()) {
+        return RmParseDecision::NoMatch;
+    }
+
+    for word in words {
+        // cmd switches are `/f`, `/q`, `/s`, … — a leading slash is an option
+        // here, never a POSIX root.
+        if word.starts_with('/') {
+            continue;
+        }
+        let Some(decoded) = decoder.decode(word, ShellTokenRole::Data) else {
+            continue;
+        };
+        let target = strip_outer_quotes(decoded.as_ref()).1;
+        if target.is_empty() || !windows_target_is_protected(target) {
+            continue;
+        }
+        return RmParseDecision::Deny(RmParseMatch {
+            pattern_name: RM_PROTECTED_FILE_NAME,
+            reason: RM_PROTECTED_FILE_REASON,
+            severity: Severity::Critical,
+            span: None,
+        });
+    }
+    RmParseDecision::NoMatch
+}
+
+/// `str::strip_prefix` with an ASCII case-insensitive comparison, because
+/// PowerShell variable names are case-insensitive (`$env:userprofile`).
+fn strip_prefix_ascii_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
 }
 
 fn powershell_variable_assignment(command: &str) -> bool {
@@ -1300,22 +1567,47 @@ fn powershell_variable_assignment(command: &str) -> bool {
 pub(crate) fn rm_semantic_scan_required(command: &str, dialect: ShellDialect) -> bool {
     match dialect {
         ShellDialect::PowerShell => {
-            if !command.contains(['`', '@', '&', '$', '(']) {
-                return false;
-            }
             if command.contains('&') {
                 // The call operator can execute a variable, subexpression, or
                 // concatenation whose bytes contain no literal pack keyword.
                 return true;
             }
+            // There used to be a `!command.contains(['`', '@', '&', '$', '('])`
+            // short-circuit here, on the theory that a command with no
+            // obfuscation character would already have been selected by the
+            // bytewise pack keywords. That holds for `rm`, which is a keyword.
+            // It does not hold for the cmdlet spellings — `Remove-Item`, `ri`,
+            // `del`, `rd`, `erase` are not core.filesystem keywords — so the
+            // plain, unobfuscated `Remove-Item -Recurse ./tree` fell between the
+            // two mechanisms: too plain for this scan's prefilter, and invisible
+            // to the keyword index. `Remove-Item -Recurse -Force $HOME` blocked
+            // only because the `$` happened to satisfy the prefilter, so the
+            // spelling with a variable in it was caught while the plain literal
+            // was not (#451).
+            //
+            // The segment check below is the authoritative test and already
+            // decodes the command word against `powershell_remove_item_alias`,
+            // so it answers this correctly on its own. Only PowerShell and
+            // Unknown dialects reach this arm, so the tokenizing cost does not
+            // land on the POSIX hot path.
             crate::packs::split_command_segments_in_dialect(command, dialect)
                 .into_iter()
                 .any(powershell_segment_requires_rm_semantic_scan)
         }
         ShellDialect::Cmd => {
-            if !command.contains(['^', '%', '!']) {
-                return false;
-            }
+            // There used to be a `!command.contains(['^', '%', '!'])`
+            // short-circuit here, on the same theory the PowerShell arm above
+            // used to hold: a command with no obfuscation character would
+            // already have been selected by the bytewise pack keywords. That
+            // holds for `rm`, which is a keyword. It does not hold for cmd's
+            // OWN delete verbs — `del` and `erase` are not core.filesystem
+            // keywords — so `del %USERPROFILE%\.ssh\id_rsa` fell between the
+            // two mechanisms exactly as the plain cmdlets did, and the
+            // protected-file rule never ran for it (#451).
+            //
+            // The segment check below is the authoritative test. Only Cmd and
+            // Unknown dialects reach this arm, so the tokenizing cost does not
+            // land on the POSIX hot path.
             crate::packs::split_command_segments_in_dialect(command, dialect)
                 .into_iter()
                 .any(cmd_segment_requires_rm_semantic_scan)
@@ -1335,6 +1627,43 @@ fn posix_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     if !segment.contains(['$', '`', '\'', '"', '\\', '*', '?', '[', '{']) {
         return false;
     }
+    // Ask about the segment as written AND about the segment with wrapper
+    // prefixes removed, and admit the pack if EITHER view names a writer.
+    //
+    // Both views are needed, and taking only one is a real defect in each
+    // direction:
+    //
+    // - As-written only: the first token of `sudo python3 -c "…"` is `sudo`,
+    //   which is neither a credential writer nor an interpreter, so the pack
+    //   was never made a candidate and `credential-file-write` never ran, while
+    //   the identical command without the prefix denied. Measured: all twelve
+    //   combinations of {sudo, env, /usr/bin/env, FOO=1} x three interpreters
+    //   writing a login-shell startup file were allowed (#464).
+    //
+    // - Unwrapped only: `strip_wrapper_prefixes` also unwraps an *interpreter*
+    //   down to the code it runs, so the first token of `python3 -c "open(…)"`
+    //   becomes the payload rather than `python3`, and the gate answers false
+    //   for a command it used to admit. That is a false NEGATIVE, and it is why
+    //   this ORs rather than replaces.
+    //
+    // OR-ing is strictly more permissive than the original, so it can only add
+    // candidates. It cannot manufacture a false positive: nothing here decides
+    // anything, it only lets the classifier see a command it would otherwise
+    // never judge, and the classifier is what decides.
+    // The unwrap is deliberately on the right of the `||`: this runs on every
+    // command, and a segment whose first word is already a writer never pays
+    // for the rewrite.
+    segment_names_semantic_writer(segment)
+        || segment_names_semantic_writer(
+            crate::normalize::strip_wrapper_prefixes(segment)
+                .normalized
+                .as_ref(),
+        )
+}
+
+/// Whether the first word of `segment`, as spelled, is a writer the semantic
+/// rules in this pack own.
+fn segment_names_semantic_writer(segment: &str) -> bool {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     let Some(raw) = tokens
         .iter()
@@ -1366,6 +1695,19 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         || (dialect == ShellDialect::Cmd
             && command.contains('>')
             && command.contains(['%', '!', '^']))
+        // PowerShell/Cmd writers of a protected file (#477). `Add-Content`
+        // and `Copy-Item` are in no keyword row, so without this the
+        // credential classifier could not run on the idiomatic spellings.
+        || (dialect != ShellDialect::Posix
+            && super::credential_files::names_windows_shell_writer(command))
+        // `cd ~/.ssh && echo k > authorized_keys` (#480): the redirect target
+        // is relative, so no keyword spells the protected path; the `cd` does.
+        // The evaluator anchors the target to that directory.
+        || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+            && command.contains('>')
+            && (contains_ascii_command_word(command, "cd")
+                || contains_ascii_command_word(command, "pushd"))
+            && super::credential_files::may_name_protected_path(command))
         // Fork-bomb reachability (issue #302): the `fork-bomb` rule matches a
         // shell function-definition shape (`name() { … }`). The paren pair is
         // pure syntax that keyword-based quick-reject cannot see, and POSIX
@@ -1405,8 +1747,40 @@ fn command_contains_empty_paren_pair(command: &str) -> bool {
 /// Mirroring that necessary lexical condition here preserves a superset of the
 /// pack's matches without cold-initializing the pack for unrelated commands.
 pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
+    // The trailing four are the Windows disk-destruction verbs (cross-platform
+    // baseline, #451), matched case-insensitively so the base spelling covers
+    // every case. `wmic` alone selects the pack; the `wmic-shadowcopy-delete`
+    // regex then requires `shadowcopy delete`, so ordinary `wmic` queries still
+    // fall through to Allow.
     const COMMAND_WORDS: &[&str] = &[
-        "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
+        "rm",
+        "find",
+        "unlink",
+        "truncate",
+        "shred",
+        "tar",
+        // Archive extraction writes the archive's members into the destination
+        // directory, and is judged exactly where a `cp`/`rsync` destination
+        // already is. `tar` is listed above for the source-deleting rule; these
+        // carry no other rule, so without them the extraction classifier is
+        // never reached.
+        "bsdtar",
+        "unzip",
+        "7z",
+        "7za",
+        "7zr",
+        "dd",
+        "mv",
+        "cp",
+        "ln",
+        "rsync",
+        "vssadmin",
+        "wmic",
+        "format-volume",
+        "clear-disk",
+        // `wmi-shadowcopy-delete`: the class name is the one word every
+        // spelling carries (`Get-WmiObject Win32_ShadowCopy | Remove-WmiObject`).
+        "win32_shadowcopy",
     ];
     // `credential-file-write` writers (plus the GNU-prefixed spellings macOS
     // users install from Homebrew coreutils). These are common words —
@@ -1457,6 +1831,14 @@ fn powershell_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     if segment.starts_with('&') {
         return true;
     }
+    // `… | ForEach-Object { Remove-Item $_ }`: the Remove-Item is inside the
+    // block, so the segment's first word is ForEach-Object and the pack was
+    // never selected for the evaluator's per-item check to run.
+    if let Some(statements) = powershell_foreach_block_statements(segment) {
+        return statements
+            .iter()
+            .any(|statement| powershell_segment_requires_rm_semantic_scan(statement));
+    }
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::PowerShell);
     let Some(raw) = tokens
         .iter()
@@ -1484,10 +1866,25 @@ fn cmd_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
         return false;
     };
-    matches!(
+    if matches!(
         rm_executable_certainty(decoded.as_ref(), ShellDialect::Cmd),
         RmExecutableCertainty::Exact | RmExecutableCertainty::MayBeRm
-    )
+    ) {
+        return true;
+    }
+    // `rm_executable_certainty` answers `Exact` only for a literal `rm`, so
+    // cmd's own file-deleting verbs are invisible to it. They are what a cmd
+    // caller actually writes, and neither is a pack keyword (#451).
+    cmd_file_delete_verb(decoded.as_ref())
+}
+
+/// cmd's file-deleting verbs. `rd`/`rmdir` are deliberately absent: they remove
+/// a directory, which is the recursive rules' business rather than the
+/// protected-file rule's.
+fn cmd_file_delete_verb(executable: &str) -> bool {
+    let executable = strip_outer_quotes(executable).1;
+    let basename = rm_frontend_basename(executable).to_ascii_lowercase();
+    matches!(basename.trim_end_matches(".exe"), "del" | "erase")
 }
 
 fn parse_cmd_decoded_rm_segment(command: &str, automated_stdin: bool) -> RmParseDecision {
@@ -1692,6 +2089,10 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
     // Pipeline-fed targets are invisible here, so they can never all be
     // proven literal temp subpaths (#285).
     let mut targets_are_literal_temp = !automated_stdin;
+    // The literal targets, kept so a NON-recursive delete can still be judged
+    // against the protected-file table (#451). Pipeline-fed targets never land
+    // here, which is the same literal-only stance the POSIX rule takes.
+    let mut literal_targets: Vec<String> = Vec::new();
     let mut index = command_index + 1;
     while let Some(token) = tokens.get(index) {
         if token.kind == NormalizeTokenKind::Separator {
@@ -1762,14 +2163,43 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
             }) {
                 has_target = true;
                 targets_are_literal_temp &= windows_literal_user_temp_subpath(value);
+                literal_targets.push(value.to_string());
             }
             continue;
         }
         has_target = true;
         targets_are_literal_temp &= windows_literal_user_temp_subpath(word);
+        literal_targets.push(word.to_string());
     }
 
-    if !recurse || !has_target {
+    if !recurse {
+        // A non-recursive `Remove-Item` still deletes the file it names, and
+        // `rm ~/.ssh/id_rsa` — the POSIX spelling of the very same deletion —
+        // denies under `rm-protected-file` in this same always-on pack. Measured
+        // before this, all six protected targets and all five delete verbs
+        // (`Remove-Item`, `ri`, `del`, `erase`, `rm`) were allowed with and
+        // without `-Force`, on every host and pack set, because this parser
+        // returned NoMatch for anything that did not recurse (#451).
+        //
+        // `-WhatIf` still allows: it reports the removal without performing it,
+        // the same carve-out the recursive arm makes just below.
+        if !what_if
+            && let Some(target) = literal_targets
+                .iter()
+                .find(|target| windows_target_is_protected(target))
+        {
+            return RmParseDecision::Deny(RmParseMatch {
+                pattern_name: RM_PROTECTED_FILE_NAME,
+                reason: RM_PROTECTED_FILE_REASON,
+                severity: Severity::Critical,
+                span: command
+                    .find(target.as_str())
+                    .map(|at| at..at + target.len()),
+            });
+        }
+        return RmParseDecision::NoMatch;
+    }
+    if !has_target {
         return RmParseDecision::NoMatch;
     }
     if what_if {
@@ -1788,6 +2218,119 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
         severity: Severity::Critical,
         span: None,
     })
+}
+
+/// Whether the pipeline stage feeding the segment at `segment_start` is a
+/// recursive PowerShell listing — `Get-ChildItem -Recurse` (or `gci`, `ls`,
+/// `dir`, `-Depth N`).
+///
+/// `Get-ChildItem -Recurse C:\src | Remove-Item -Force` is the idiomatic
+/// PowerShell tree delete, and it was allowed in every dialect: the recursion
+/// is on the producer, so the `-Recurse` the Remove-Item classifier looks for
+/// never appears on the consumer (#451 comment). Every item of the tree
+/// reaches `Remove-Item`, the same deletion `find … -delete` performs.
+pub(crate) fn powershell_recursive_listing_feeds(command: &str, segment_start: usize) -> bool {
+    let Some(prefix) = command.get(..segment_start) else {
+        return false;
+    };
+    let prefix = prefix.trim_end();
+    let Some(producer_end) = prefix.strip_suffix('|').filter(|rest| !rest.ends_with('|')) else {
+        return false;
+    };
+    let producer_start = producer_end
+        .rfind([';', '|', '&', '\n', '{', '('])
+        .map_or(0, |at| at + 1);
+    let producer = producer_end[producer_start..].trim();
+    let tokens = tokenize_for_shell_dialect(producer, ShellDialect::PowerShell);
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let mut words = tokens
+        .iter()
+        .filter(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(producer));
+    let Some(executable) = words
+        .next()
+        .and_then(|word| decoder.decode(word, ShellTokenRole::Syntax))
+    else {
+        return false;
+    };
+    let lister = ["get-childitem", "gci", "ls", "dir"]
+        .iter()
+        .any(|alias| executable.eq_ignore_ascii_case(alias));
+    lister
+        && words.any(|word| {
+            decoder
+                .decode(word, ShellTokenRole::Syntax)
+                .is_some_and(|word| {
+                    powershell_switch_value(word.as_ref(), "recurse", 1, true) == Some(true)
+                        || powershell_switch_value(word.as_ref(), "depth", 2, false).is_some()
+                })
+        })
+}
+
+/// Whether the segment at `segment_start` is a statement inside a
+/// `ForEach-Object { … }` block that a recursive listing feeds.
+///
+/// PowerShell segments split at `;` even inside braces, so in
+/// `gci -Recurse | % { Write-Host $_; Remove-Item $_ }` the Remove-Item is its
+/// own segment whose prefix ends in `;`, not `|`. Walk back to the enclosing
+/// unmatched `{`, require the ForEach word before it, and ask the ordinary
+/// pipeline question about the stage feeding that word.
+pub(crate) fn powershell_foreach_block_fed_by_recursive_listing(
+    command: &str,
+    segment_start: usize,
+) -> bool {
+    let Some(prefix) = command.get(..segment_start) else {
+        return false;
+    };
+    let mut depth = 0usize;
+    let mut open = None;
+    for (index, byte) in prefix.bytes().enumerate().rev() {
+        match byte {
+            b'}' => depth += 1,
+            b'{' if depth == 0 => {
+                open = Some(index);
+                break;
+            }
+            b'{' => depth -= 1,
+            _ => {}
+        }
+    }
+    let Some(open) = open else {
+        return false;
+    };
+    let head = prefix[..open].trim_end();
+    let word_start = head
+        .rfind(|ch: char| ch.is_whitespace() || ch == '|')
+        .map_or(0, |at| at + 1);
+    let word = &head[word_start..];
+    ["foreach-object", "%", "foreach"]
+        .iter()
+        .any(|alias| word.eq_ignore_ascii_case(alias))
+        && powershell_recursive_listing_feeds(command, word_start)
+}
+
+/// The statements inside a `ForEach-Object { … }` (or `%`, `foreach`) script
+/// block, when `segment` is one. `gci -Recurse | % { Remove-Item $_ -Force }`
+/// is the other common tree delete: the block runs once per item of the tree,
+/// so each statement in it is judged like a directly piped Remove-Item.
+pub(crate) fn powershell_foreach_block_statements(segment: &str) -> Option<Vec<&str>> {
+    let segment = segment.trim();
+    let first = segment.split_whitespace().next()?;
+    if !["foreach-object", "%", "foreach"]
+        .iter()
+        .any(|alias| first.eq_ignore_ascii_case(alias))
+    {
+        return None;
+    }
+    let open = segment.find('{')?;
+    let close = segment.rfind('}').filter(|close| *close > open)?;
+    Some(
+        segment[open + 1..close]
+            .split([';', '\n'])
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .collect(),
+    )
 }
 
 fn powershell_remove_item_alias(executable: &str) -> bool {
@@ -2651,8 +3194,13 @@ fn parse_rm_segment_with_option_scanning(
 
         if !options_ended {
             if flag_text == "--" {
+                // `options_ended` is the whole effect: everything after the
+                // POSIX end-of-options marker is an operand. The marker itself
+                // deliberately does NOT feed the verdict — it makes a command
+                // strictly safer to parse and never changes what an operand
+                // names, so the temp exemption is decided by operand content
+                // alone (#395).
                 options_ended = true;
-                flags.saw_terminator = true;
                 continue;
             }
 
@@ -2682,6 +3230,7 @@ fn parse_rm_segment_with_option_scanning(
         let glued_to_paren = command.as_bytes().get(token.byte_range.end) == Some(&b'(');
         paths.push(PathToken {
             unquoted,
+            raw: text,
             quote,
             range: token.byte_range.clone(),
             glued_to_paren,
@@ -2699,12 +3248,27 @@ fn parse_rm_segment_with_option_scanning(
         .take_while(|token| token.kind != NormalizeTokenKind::Separator)
         .filter_map(|token| token.text(command))
         .any(starts_with_shell_stdin_redirection);
-    let interactive_prompts = flags.interactive_mode.prompts();
+    // Non-recursive here: `flags.resolve()` below returns `None` without a
+    // recursive span, and that is the branch these two rules serve.
+    let interactive_prompts = flags.interactive_mode.prompts_for(false, paths.len());
 
     let Some(flag_state) = flags.resolve() else {
         // Non-recursive rm has no dangerous flag shape of its own, but a bare
         // `*` operand still hands the shell an unbounded deletion set (#334).
-        return parse_bare_glob_rm(
+        let bare_glob = parse_bare_glob_rm(
+            &paths,
+            interactive_prompts,
+            automated_stdin,
+            redirected_stdin,
+        );
+        if !matches!(bare_glob, RmParseDecision::NoMatch) {
+            return bare_glob;
+        }
+        // …and a named operand can still be a protected credential or
+        // login-startup file, which `rm` alone was letting through (#469).
+        // Ordered after the glob rules so the broader attribution wins when a
+        // command somehow satisfies both.
+        return parse_protected_file_rm(
             &paths,
             interactive_prompts,
             automated_stdin,
@@ -2719,7 +3283,12 @@ fn parse_rm_segment_with_option_scanning(
         return RmParseDecision::NoMatch;
     }
 
-    if flag_state.interactive_mode.prompts() && !automated_stdin && !redirected_stdin {
+    // Recursive by construction: `resolve()` requires a recursive span, and
+    // `-I` does prompt when recursing.
+    if flag_state.interactive_mode.prompts_for(true, paths.len())
+        && !automated_stdin
+        && !redirected_stdin
+    {
         return RmParseDecision::Allow;
     }
 
@@ -2820,6 +3389,141 @@ fn parse_rm_segment_with_option_scanning(
 /// `build/*`) stay untouched — they name a reviewable shape — as do quoted
 /// operands (`rm '*'` is one literal file) and genuinely interactive
 /// invocations, which prompt per file exactly like the recursive forms.
+/// A non-recursive `rm` whose operand names a protected credential or
+/// login-startup file (#469).
+///
+/// `rm /etc/shadow` and `rm ~/.ssh/authorized_keys` were allowed while
+/// `unlink`, `shred -u` and `truncate -s 0` denied the same nine targets, and so
+/// did all six embedded languages. The cause is structural rather than a gap in
+/// the path matching: every `rm` rule requires a recursive flag, and `-r` is
+/// exactly the flag you do not need in order to delete one file. `rm -rf` on the
+/// same paths has always denied.
+///
+/// The predicate is `core::credential_files`' protected-file table, not
+/// `path_is_root_home`. That distinction is the whole design. `path_is_root_home`
+/// matches anything under `/home`, `/etc` or `/var`, which is affordable for
+/// `rm -rf` — recursive deletion under a home directory is rare — and is not
+/// affordable here, where it would deny `rm ~/notes.txt` and
+/// `rm ~/project/src/main.rs`. The credential table separates `~/.ssh/id_rsa`
+/// from `~/notes.txt`, which is the separation this rule needs and the reason it
+/// can be Critical without being noisy.
+///
+/// Severity matches the three sibling rules, which are all Critical on these
+/// paths. The usual argument for softening it — that `rm` carries far more
+/// traffic than `unlink` — is answered by the narrower predicate rather than by
+/// a lower severity: the commands this fires on are the ones where the file is
+/// irrecoverable.
+///
+/// The interactive carve-out is the same one `parse_bare_glob_rm` applies, for
+/// the same reason, so `rm -i` keeps behaving identically across both.
+fn parse_protected_file_rm(
+    paths: &[PathToken<'_>],
+    interactive_prompts: bool,
+    automated_stdin: bool,
+    redirected_stdin: bool,
+) -> RmParseDecision {
+    if paths.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+    if interactive_prompts && !automated_stdin && !redirected_stdin {
+        // The per-file prompt bounds the deletion; with stdin closed, as
+        // under a hook, rm deletes nothing and exits 0.
+        return RmParseDecision::NoMatch;
+    }
+
+    // The raw operand, not `unquoted`: the classifier does its own quote and
+    // escape decoding, and it needs an unquoted `~` or `$HOME` to survive in
+    // order to recognise the root. Handing it the stripped spelling would lose
+    // the difference between `rm ~/.ssh/id_rsa`, which expands to the key, and
+    // `rm "~/.ssh/id_rsa"`, which names a directory literally called `~`.
+    // `may_name_protected_path` first: `rm` runs constantly, and this is the
+    // cheap lexical superset the classifier publishes for exactly this
+    // purpose. `rm ./build/stamp` and `rm target/debug/app` fail it on a
+    // substring test and never pay for word decoding.
+    //
+    // A literal brace alternation is enumerable, not unknown: the shell turns
+    // `~/.ssh/{id_rsa,id_ed25519}` into two named files, so each is judged
+    // (#482). Anything the expansion cannot prove declines, as before.
+    let names_protected = |raw: &str| {
+        crate::packs::core::credential_files::may_name_protected_path(raw)
+            && crate::packs::core::credential_files::names_protected_file(raw)
+    };
+    let Some(path) = paths.iter().find(|path| {
+        names_protected(path.raw)
+            || literal_brace_expansions(path.raw)
+                .is_some_and(|expansions| expansions.iter().any(|word| names_protected(word)))
+    }) else {
+        return RmParseDecision::NoMatch;
+    };
+
+    if rm_targets_exempted_for_rule(RM_PROTECTED_FILE_NAME, paths) {
+        // Only this rule stands down (#284); other rules still see the
+        // command, so report no-match rather than a shielding allow.
+        return RmParseDecision::NoMatch;
+    }
+
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: RM_PROTECTED_FILE_NAME,
+        reason: RM_PROTECTED_FILE_REASON,
+        severity: Severity::Critical,
+        span: Some(path.range.clone()),
+    })
+}
+
+/// The words bash brace-expands an unquoted `a{b,c}d` operand into, when every
+/// alternative is literal (#482).
+///
+/// `None` when there is nothing to expand or the expansion is not provable
+/// from the text: quoting or escapes anywhere in the word, an expansion
+/// (`$`, `` ` ``) inside a group, a nested or unbalanced brace, a range
+/// (`{1..3}`), or more than [`MAX_BRACE_EXPANSIONS`] results. A group with no
+/// comma (`{id_rsa}`) is not an expansion at all — bash keeps it literally —
+/// so it stays in the word unchanged.
+pub(crate) fn literal_brace_expansions(raw: &str) -> Option<Vec<String>> {
+    const MAX_BRACE_EXPANSIONS: usize = 64;
+    if !raw.contains('{') || raw.contains(['\'', '"', '\\']) {
+        return None;
+    }
+    let mut expansions = vec![String::new()];
+    let mut expanded = false;
+    let mut rest = raw;
+    while let Some(open) = rest.find('{') {
+        let (prefix, after) = rest.split_at(open);
+        let close = after.find('}')?;
+        let body = &after[1..close];
+        if body.contains('{') {
+            return None;
+        }
+        for word in &mut expansions {
+            word.push_str(prefix);
+        }
+        if body.contains(',') {
+            if body.contains(['$', '`']) || body.contains("..") {
+                return None;
+            }
+            let alternatives: Vec<&str> = body.split(',').collect();
+            if expansions.len() * alternatives.len() > MAX_BRACE_EXPANSIONS {
+                return None;
+            }
+            expansions = expansions
+                .iter()
+                .flat_map(|word| alternatives.iter().map(move |alt| format!("{word}{alt}")))
+                .collect();
+            expanded = true;
+        } else {
+            // No comma: bash leaves the braces as literal characters.
+            for word in &mut expansions {
+                word.push_str(&after[..=close]);
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    for word in &mut expansions {
+        word.push_str(rest);
+    }
+    expanded.then_some(expansions)
+}
+
 fn parse_bare_glob_rm(
     paths: &[PathToken<'_>],
     interactive_prompts: bool,
@@ -2996,14 +3700,27 @@ fn apply_rm_long_option(
 /// when a quote is *unbalanced* — an unterminated quote is a shell syntax error
 /// that never runs `rm`, so it must stay opaque and match no flag rather than
 /// be silently "repaired" into a destructive one.
+///
+/// Bash ANSI-C (`$'…'`) and locale (`$"…"`) quoting are quoting too: without
+/// them `rm $'-rf' /` read as the operand `$-rf` (the `$-` parameter) and was
+/// allowed while `rm '-rf' /` denied.
 fn dequote_rm_flag_token(token: &str) -> std::borrow::Cow<'_, str> {
     if !token.bytes().any(|b| matches!(b, b'\'' | b'"' | b'\\')) {
         return std::borrow::Cow::Borrowed(token);
     }
     let mut out = String::with_capacity(token.len());
-    let mut chars = token.chars();
+    let mut chars = token.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            '$' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                if crate::normalize::decode_ansi_c_quoted(&mut chars, &mut out).is_err() {
+                    return std::borrow::Cow::Borrowed(token);
+                }
+            }
+            // `$"…"` is a double-quoted string after (no-op) translation;
+            // dropping the `$` hands it to the arm below.
+            '$' if chars.peek() == Some(&'"') => {}
             // Single quotes: everything until the next `'` is literal.
             '\'' => {
                 let mut closed = false;
@@ -3289,21 +4006,129 @@ fn path_is_root_home(path: &PathToken<'_>) -> bool {
     false
 }
 
+/// Top-level directories whose subtrees are the operating system, another
+/// user's data, or a whole mounted volume. A recursive delete anywhere under
+/// one of these keeps the Critical root/home severity at any depth.
+const CRITICAL_TOP_LEVEL_DIRS: &[&str] = &[
+    "Applications",
+    "Library",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+    "System",
+    "Volumes",
+    "Windows",
+    "bin",
+    "boot",
+    "cores",
+    "dev",
+    "etc",
+    "lib",
+    "lib32",
+    "lib64",
+    "libx32",
+    "media",
+    "mnt",
+    "nix",
+    "opt",
+    "private",
+    "proc",
+    "root",
+    "sbin",
+    "snap",
+    "srv",
+    "sys",
+    "usr",
+    "var",
+];
+
+/// Directories whose direct children are user home directories.
+const HOME_PARENT_DIRS: &[&str] = &["home", "Users"];
+
+/// Whether a recursive delete of `text` earns the Critical root/home rule.
+///
+/// Critical means "this can take out the OS or a whole home directory", so it
+/// covers root, a home root (`~`, `~user`, `$HOME`, `/home/<u>`, `/Users/<u>`,
+/// `/root`), a home's top-level entries and dotfile trees (`~/Documents`,
+/// `~/.ssh/...`), any direct child of `/`, and anything under a system or
+/// mount directory. A path two or more real components into a home directory
+/// (`/home/u/proj/dist`) or outside the system dirs (`/data/proj/dist`) is
+/// still denied, under the general rule at High: calling it "destroy your
+/// entire operating system" was inaccurate (#196).
+///
+/// Every doubt resolves to Critical. A component that can expand at runtime
+/// (`$`, backtick, glob, brace, tilde) or a `..` anywhere could make the
+/// operand name a shallower directory than it reads as, so either keeps the
+/// Critical rule.
 fn path_text_is_root_home(text: &str) -> bool {
-    // Absolute paths starting with / are dangerous regardless of quotes
-    // e.g. rm -rf "/" is just as deadly as rm -rf /
-    if text.starts_with('/') {
-        return true;
+    if let Some(rest) = text.strip_prefix('~') {
+        // `~` and `~user` both name a home root; only the part after the
+        // first `/` can take the operand below it.
+        return match rest.find('/') {
+            Some(slash) => !path_is_deep_below_home(&rest[slash..]),
+            None => true,
+        };
     }
 
-    if text.starts_with('~') {
-        return true;
+    for home in ["$HOME", "${HOME}"] {
+        if let Some(rest) = text.strip_prefix(home) {
+            if rest.is_empty() {
+                return true;
+            }
+            if rest.starts_with('/') {
+                return !path_is_deep_below_home(rest);
+            }
+        }
     }
 
-    text == "$HOME"
-        || text.starts_with("$HOME/")
-        || text == "${HOME}"
-        || text.starts_with("${HOME}/")
+    // Absolute paths are judged regardless of quotes: rm -rf "/" is just as
+    // deadly as rm -rf /.
+    text.starts_with('/') && absolute_path_is_critical(text)
+}
+
+/// Split a path into components, or `None` when any component could change
+/// what the path names at runtime (expansion, globbing, `..`).
+fn static_path_components(path: &str) -> Option<Vec<&str>> {
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let dynamic = components.iter().any(|component| {
+        *component == ".."
+            || component
+                .bytes()
+                .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'[' | b'{' | b'~' | b'\\'))
+    });
+    (!dynamic).then_some(components)
+}
+
+/// `rest` is what follows a home root. Deep means two or more static
+/// components whose first is not a dotfile tree like `.ssh` or `.config`.
+fn path_is_deep_below_home(rest: &str) -> bool {
+    static_path_components(rest)
+        .is_some_and(|components| components.len() >= 2 && !components[0].starts_with('.'))
+}
+
+fn absolute_path_is_critical(path: &str) -> bool {
+    let Some(mut components) = static_path_components(path) else {
+        return true;
+    };
+    // Git-bash / MSYS spell a Windows drive root as `/c/...`; judge the rest
+    // exactly as if it started at `/`.
+    if components
+        .first()
+        .is_some_and(|first| first.len() == 1 && first.as_bytes()[0].is_ascii_alphabetic())
+    {
+        components.remove(0);
+    }
+    match components.as_slice() {
+        [] | [_] => true,
+        [first, ..] if CRITICAL_TOP_LEVEL_DIRS.contains(first) => true,
+        [parent, _user, rest @ ..] if HOME_PARENT_DIRS.contains(parent) => {
+            rest.len() < 2 || rest[0].starts_with('.')
+        }
+        _ => false,
+    }
 }
 
 /// Create the core filesystem pack.
@@ -3334,11 +4159,122 @@ pub fn create_pack() -> Pack {
         // `tee`, `sponge`, `install`, `sed`, and `perl` are the non-redirect
         // writers `credential-file-write` classifies (`cp`, `mv`, `ln`, and
         // `dd` are already here).
+        // These gate whether the pack is consulted at all, so a shape missing
+        // from here is invisible to every pattern below it. `.git/` is listed
+        // for `redirect-truncate-git-internals-relative`: a relative target
+        // carries none of the other redirect keywords, because it starts with
+        // a dot or a directory name rather than `/`, `~`, `$` or a quote, so
+        // `cat > .git/config` and `cat > sub/.git/config` reached no pattern at
+        // all and the rule never ran (GitHub #407).
+        //
+        // The credential-directory anchors that follow it are there for the
+        // same reason and the same issue: `credential-file-write` now judges a
+        // relative path through one of them, but a bare redirect carries no
+        // other keyword, so `echo k > .ssh/authorized_keys` would be dropped
+        // before the classifier ran. The non-redirect writers (`tee`, `cp`, …)
+        // are already keywords under their own names and do not need these.
         keywords: &[
-            "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
-            "tee", "sponge", "install", "sed", "perl", ">/", "> /", ">~", "> ~", ">$", "> $",
-            ">\"", "> \"", ">'", "> '", "&>", ">&", ">|", "1>", "2>", ">%", "> %", ">!", "> !",
-            ">^", "> ^",
+            "rm",
+            "find",
+            "unlink",
+            "truncate",
+            "shred",
+            "tar",
+            "dd",
+            "mv",
+            "cp",
+            "ln",
+            "rsync",
+            "tee",
+            "sponge",
+            "install",
+            "sed",
+            "perl",
+            // Windows disk-destruction verbs (cross-platform baseline, #451).
+            // Case variants are listed because the boundary-aware quick-reject
+            // matcher is case-sensitive, exactly as `windows.system` does.
+            "Format-Volume",
+            "format-volume",
+            "FORMAT-VOLUME",
+            "Clear-Disk",
+            "clear-disk",
+            "CLEAR-DISK",
+            "vssadmin",
+            "VSSADMIN",
+            "wmic",
+            "WMIC",
+            "Win32_ShadowCopy",
+            "win32_shadowcopy",
+            "WIN32_SHADOWCOPY",
+            ".git/",
+            ".ssh/",
+            ".gnupg/",
+            ".aws/",
+            ".kube/",
+            ".docker/",
+            ".bashrc.d/",
+            ".zshrc.d/",
+            // The same anchors spelled the Windows way. A PowerShell or cmd
+            // caller writes `.ssh\authorized_keys`, which carries none of the
+            // forward-slash entries above, so a bare redirect to it selected
+            // no pack and the rule never ran. Path resolution already handles
+            // `\` — the identical targets deny as soon as any writer word is
+            // present (`copy`, `Set-Content`) — so this is purely the
+            // candidate gate, which is the mechanism #407 added these anchors
+            // for in the first place.
+            ".git\\",
+            ".ssh\\",
+            ".gnupg\\",
+            ".aws\\",
+            ".kube\\",
+            ".docker\\",
+            ".bashrc.d\\",
+            ".zshrc.d\\",
+            // The login-shell startup files, for the same reason: a bare
+            // `echo x > .bashrc` carries no other keyword in this row.
+            ".bashrc",
+            ".bash_profile",
+            ".bash_login",
+            ".profile",
+            ".zshrc",
+            ".zshenv",
+            ".zprofile",
+            ".zlogin",
+            ">/",
+            "> /",
+            ">~",
+            "> ~",
+            ">$",
+            "> $",
+            ">\"",
+            "> \"",
+            ">'",
+            "> '",
+            // An escaped first character (`> \/etc/passwd`) is the same
+            // path to the shell, and carried none of the entries above, so
+            // the pack was never a candidate and the write was allowed.
+            ">\\",
+            "> \\",
+            // A target that climbs out of the working directory
+            // (`> ../../../etc/sudoers`) or is spelled by a backquote
+            // substitution carried none of the entries above either.
+            ">..",
+            "> ..",
+            ">./..",
+            "> ./..",
+            ">`",
+            "> `",
+            "&>",
+            ">&",
+            ">|",
+            "1>",
+            "2>",
+            ">%",
+            "> %",
+            ">!",
+            "> !",
+            ">^",
+            "> ^",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -3351,7 +4287,10 @@ pub fn create_pack() -> Pack {
 #[allow(clippy::too_many_lines)]
 fn create_safe_patterns() -> Vec<SafePattern> {
     // Every temp exemption below carries an optional `(?:--\s+)?` immediately
-    // before its operand list (issue #395). `--` is the POSIX end-of-options
+    // before its operand list (issue #395) — `rm`, `find`, `unlink` and
+    // `truncate` alike. Six of them were missed on the first pass, so
+    // `unlink -- /tmp/scratch` and `truncate -s 0 -- /tmp/scratch` denied while
+    // their bare spellings were exempt. `--` is the POSIX end-of-options
     // marker a careful script writes so an operand beginning with `-` cannot be
     // read as a flag; it makes the command strictly safer and must not cost the
     // exemption. The trailing `\s+` means only a bare `--` matches, so
@@ -3359,6 +4298,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     // destructive rules, and a second `--` would have to satisfy the
     // temp-operand group (it cannot), so `rm -rf -- -- /tmp/x` keeps denying.
     vec![
+        // The baseline Format-Volume / Clear-Disk rules (#451) mirror
+        // windows.system's regexes, so they take its preview carve-out too:
+        // a bare `-WhatIf` is a preview, `-WhatIf:$false` is not.
+        crate::packs::windows::system::storage_whatif_safe_pattern(),
         // rm -rf in /tmp (combined flags)
         safe_pattern!(
             "rm-rf-tmp",
@@ -3451,11 +4394,23 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "find-delete-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         safe_pattern!(
             "find-delete-var-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        // The `-exec rm … {}` spelling of the same temp-only delete. Since
+        // `find-delete-*` learned that action it denied here while `-delete`
+        // was allowed. Same literal temp roots; the only backslash admitted is
+        // the terminating `\;`.
+        safe_pattern!(
+            "find-exec-rm-tmp",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:(?:/private)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+        ),
+        safe_pattern!(
+            "find-exec-rm-var-tmp",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:(?:/private)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         // -----------------------------------------------------------------
         // `unlink <file>` safe whitelist for temp directories.
@@ -3469,11 +4424,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "unlink-tmp",
-            r"^(?![^|;&]*[\\$`])unlink\s+(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])unlink\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         safe_pattern!(
             "unlink-var-tmp",
-            r"^(?![^|;&]*[\\$`])unlink\s+(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])unlink\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         // unlink invoked with --help / --version is read-only.
         safe_pattern!("unlink-help", r"^unlink\s+(?:--help|--version)\s*$"),
@@ -3494,21 +4449,22 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("truncate-help", r"^truncate\s+(?:--help|--version)\s*$"),
         // Growing operations: -s +<N>, --size=+<N> (pure growth — no
         // data destroyed). We only whitelist the explicit `+` form because
-        // absolute sizes can shrink existing files. The `-s` short form
-        // takes its value as a separate token (`-s +1G`); `--size=` packs
-        // value into the same token (`--size=+1G`).
+        // absolute sizes can shrink existing files. getopt accepts the size
+        // in every spelling -- `-s +1G`, `-s+1G`, `-cs +1G` (bundled with
+        // `-c`/`-o`), `--size=+1G`, `--size +1G` -- and the safe and
+        // destructive rules below must agree on all of them.
         safe_pattern!(
             "truncate-grow",
-            r"^truncate\s+(?:-s\s+\+\S+|--size=\+\S+)\s+\S+\s*$"
+            r"^truncate\s+(?:-[co]*s\s*\+\S+|--size(?:=|\s+)\+\S+)\s+\S+\s*$"
         ),
         // Temp-directory truncate (any size).
         safe_pattern!(
             "truncate-tmp",
-            r"^(?![^|;&]*[\\$`])truncate\s+(?:-s\s+\S+|--size=\S+)\s+(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+|--size(?:=|\s+)\S+)\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         safe_pattern!(
             "truncate-var-tmp",
-            r"^(?![^|;&]*[\\$`])truncate\s+(?:-s\s+\S+|--size=\S+)\s+(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+|--size(?:=|\s+)\S+)\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         // -r/--reference <ref-file> <file> uses the size of ref-file.
         // This is a copy-size, not a destruction primitive — allowed when
@@ -3715,9 +4671,78 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "mv-within-home",
             r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
         ),
+        // -----------------------------------------------------------------
+        // The same ordinary rename, written with a relative source.
+        //
+        // `mv-sensitive-source-root-home` fires on any mv whose command line
+        // *mentions* a home path, and `mv-within-home` above only rescues the
+        // command when BOTH operands are home-rooted. So moving a file into a
+        // home directory from the directory it already sits in was denied
+        // while the identical move with an absolute source was allowed
+        // (GitHub #422):
+        //
+        //     mv a.md /home/u/project/x/docs/a.md            denied
+        //     mv /home/u/project/x/a.md /home/u/project/x/docs/a.md   allowed
+        //     mv a.md docs/a.md                              allowed
+        //
+        // The rule keys on a spelling, not on a risk. The boundary it states
+        // — that a top-level home directory can never be the thing being
+        // moved — does not hold today either: `mv Documents backup/` run from
+        // `$HOME` does exactly that and is allowed, because no absolute home
+        // path appears in it. Accepting a relative source here therefore adds
+        // no exposure that spelling both operands relatively does not already
+        // have.
+        //
+        // The source side is constrained to what cannot reach out of the
+        // working directory or name a hidden tree:
+        // - `(?![-~.])` on the first component refuses a flag (`-t`), a
+        //   home-rooted path (`~/...`), and every dotfile tree (`.ssh`,
+        //   `.aws`), while `(?:\./)?` still permits the ordinary `./x`.
+        // - A leading `/` cannot match at all: the component class excludes
+        //   it, so absolute sources keep going through `mv-within-home`.
+        // - `..` is refused in every later component, so no source can climb
+        //   out of the tree it names.
+        // - Dynamic expansion is excluded globally and inside every token,
+        //   and the whole command is anchored, so a compound that appends a
+        //   destructive second segment is not rescued.
+        // The destination alternation is lifted verbatim from
+        // `mv-within-home` so the two cannot disagree about what a
+        // home-rooted target is.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "mv-relative-into-home",
+            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:\./)?(?![-~.])[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:\./)?(?![-~.])[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
+        ),
     ]
 }
 
+/// The destructive patterns for `core.filesystem`.
+///
+/// # A pattern here cannot match an argv operand
+///
+/// This pack and `core.git` are the two the evaluator treats as argv-inert.
+/// `command_pattern_match_is_inert_quoted_data` rejects any match from them
+/// whose first alphanumeric byte lands in a span `offset_is_quoted_data`
+/// classifies as `SpanKind::Data` **or** `SpanKind::Argument` — that is, any
+/// operand, quoted or not. Only the two rules named by
+/// `is_core_filesystem_redirect_rule` are exempt.
+///
+/// This is deliberate and load-bearing: it is what keeps
+/// `git commit -m "rm -rf /"` from being read as the command it quotes. Do not
+/// weaken it to rescue a single rule.
+///
+/// The consequence for authors is concrete. A rule whose match begins at the
+/// command word (`rm …`, a redirect operator) works. A rule that keys on a
+/// *path in argv* — `tee .git/config`, `cp x .git/config` — will match the
+/// regex, pass `Pack::check`, pass `Pack::might_match`, pass the registry gate,
+/// pass every pack-level test, and then be discarded by the evaluator, so it
+/// decides nothing for a user. `tee-git-internals` shipped that way (#460).
+///
+/// A path-keyed writer therefore belongs in the `credential_files.rs`
+/// classifier, which inspects resolved operands, not in a pattern here. And a
+/// new rule of that shape is only proven by an assertion through
+/// `evaluate_command` — see
+/// `the_evaluator_actually_decides_every_command_its_rules_must_reach`.
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // Severity levels:
     // - Critical: Most dangerous, irreversible, high-confidence detections
@@ -3785,6 +4810,30 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use `rm -ri` for manual cleanup of derived temp trees.",
             SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS
         ),
+        // `rsync --delete` into a system directory or a home root MIRRORS the
+        // source over the destination, DELETING every destination file the
+        // source does not have. `rsync --delete /empty/ /etc/` wipes /etc as
+        // surely as `rm -rf /etc`, yet it carried no rule. Keyed on the
+        // DESTINATION only: `--delete` into an ordinary backup dir, or into a
+        // subdirectory of a home (`~/backup/`, `/home/u/proj/`), is a routine
+        // operation and stays allowed, as does any `--dry-run`. A sensitive
+        // path as the SOURCE (`rsync --delete /etc/ /backup/`) is unaffected.
+        destructive_pattern!(
+            "rsync-delete-sensitive-dest",
+            r#"\brsync\b(?![^|;&\r\n]*(?:--dry-run\b|\s-[A-Za-z]*n[A-Za-z]*(?:\s|$)))(?=[^|;&\r\n]*\s--del(?:ete(?:-(?:after|before|during|delay|excluded))?)?\b)[^|;&\r\n]*[\s=](?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|sys|proc|dev|opt)(?:/[^\s;&|<>()'"]*)?|/(?:home|Users)(?:/[^/\s;&|<>()'"]+)?/?|/|~/?|\$\{?HOME\}?/?)\s*(?:$|[;&|<>)])"#,
+            "rsync --delete into a system directory or home root mirror-deletes its contents. EXTREMELY DANGEROUS.",
+            Critical,
+            "rsync --delete makes the destination match the source, so it DELETES every \
+             file in the destination that is not present in the source. Aimed at /, /etc, \
+             /usr, a home root, or another system path, an empty or wrong source empties \
+             that directory — the same catastrophe as `rm -rf` on it, with no undo.\n\n\
+             Safer alternatives:\n\
+             - Preview first: add `--dry-run` (or `-n`) and read the deletion list.\n\
+             - Drop `--delete` to copy without removing extra destination files.\n\
+             - Mirror into a dedicated, non-system directory you own.\n\
+             - Back the destination up before a real mirror into it.",
+            SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS
+        ),
         // rm -rf on root or home paths (CRITICAL - catastrophic, never allow)
         // Target set covers:
         //   - literal `/` or `~` (optionally quoted/backslash-escaped)
@@ -3792,7 +4841,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //     expands to the user's home directory before rm sees it
         destructive_pattern!(
             "rm-rf-root-home",
-            r#"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            r#"(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
             "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.",
             Critical,
             "This command would recursively delete files starting from the root filesystem (/) \
@@ -3823,7 +4872,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Critical root deletion.
         destructive_pattern!(
             "rm-r-f-separate-root-home",
-            r#"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+['"\\]?(?:[/~]|\$\{?HOME\b)|rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            r#"(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
             "rm with separate -r -f flags targeting root or home is EXTREMELY DANGEROUS.",
             Critical,
             "Separate `-r -f` flags on `/` or `~` have identical effect to `rm -rf /`: \
@@ -3840,7 +4889,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // (`rm --recursive --force /`, `rm --force --recursive /`).
         destructive_pattern!(
             "rm-recursive-force-root-home",
-            r#"rm\s+.*--recursive.*--force\s+['"\\]?(?:[/~]|\$\{?HOME\b)|rm\s+.*--force.*--recursive\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            r#"(?:^|[^A-Za-z0-9_.-])rm\s+.*--recursive.*--force\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+.*--force.*--recursive\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
             "rm --recursive --force targeting root or home is EXTREMELY DANGEROUS.",
             Critical,
             "The long-flag form has identical effect to `rm -rf /`: recursive, forced, \
@@ -3855,7 +4904,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // General rm -rf (caught after safe patterns) - High because temp paths are allowed
         destructive_pattern!(
             "rm-rf-general",
-            r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR]",
+            r"(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f|(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR]",
             "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.",
             High,
             "rm -rf recursively removes files and directories without confirmation prompts. \
@@ -3905,7 +4954,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -r -f (separate flags)
         destructive_pattern!(
             "rm-r-f-separate",
-            r"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f|rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]",
+            r"(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f|(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]",
             "rm with separate -r -f flags is destructive and requires human approval.",
             High,
             "rm with separate -r and -f flags has the same effect as rm -rf: recursive \
@@ -3931,7 +4980,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm --recursive --force (long flags)
         destructive_pattern!(
             "rm-recursive-force-long",
-            r"rm\s+.*--recursive.*--force|rm\s+.*--force.*--recursive",
+            r"(?:^|[^A-Za-z0-9_.-])rm\s+.*--recursive.*--force|(?:^|[^A-Za-z0-9_.-])rm\s+.*--force.*--recursive",
             "rm --recursive --force is destructive and requires human approval.",
             High,
             "rm --recursive --force is the long-form equivalent of rm -rf. While more \
@@ -3954,13 +5003,31 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         // ----- `find ... -delete` (Critical: root/home target) -----
         //
-        // `find <sensitive-path> -delete` recursively removes everything
-        // under the path — bytewise-equivalent to `rm -rf <sensitive-path>`.
+        // `find <sensitive-path> -delete` removes everything its predicate
+        // matches under the path; unfiltered, that is `rm -rf <sensitive-path>`.
         // This rule exists to close the most common dcg-bypass pattern in
         // the wild: agents that learn `rm -rf` is blocked simply swap it
         // for `find -delete`. Without this rule, dcg's protection against
         // catastrophic root/home deletion is one Google search away from
         // useless.
+        //
+        // What the rule actually keys on is a sensitive path token appearing
+        // anywhere between `find` and `-delete`. That is deliberately coarse in
+        // two directions, and the user-facing text must not overstate either:
+        //
+        //   - It does not evaluate `-name`/`-maxdepth`/`-type`, so a narrowly
+        //     scoped delete under home is gated like an unfiltered one (#418).
+        //   - It does not require the sensitive path to be the search ROOT, so
+        //     `find /tmp/x -newer /etc/passwd -delete` denies even though only
+        //     `/tmp/x` is searched.
+        //
+        // Claiming the scoped form is "bytewise-equivalent to rm -rf on
+        // root/home" was false, and the old text additionally advised
+        // re-rooting "under a more specific subdir", which does not lift the
+        // rule while that subdir is still under home. Both cost the reporter of
+        // #418 real diagnosis time, so say what is true: dcg gates on the paths
+        // the command names, and a denial is not a measurement of its blast
+        // radius.
         //
         // The regex matches `find` at any word boundary (so it fires
         // inside compound commands like `echo foo; find /etc -delete`,
@@ -3980,21 +5047,38 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // `(find /etc -delete)` and `find /etc -delete | tee log`
             // both fire. Without `)` in the set, subshell forms
             // silently bypass.
-            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
-            "find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed.",
+            // The action is `-delete` or `-exec`/`-execdir rm … {}`: the second
+            // is the same deletion of the found files spelled the older way,
+            // and was allowed. `{}` may be quoted or escaped.
+            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s(?:-delete(?:\s|$|[;&|)\n])|-exec(?:dir)?\s+(?:[^\s;&|]*/)?rm(?:\s+-\S+)*\s+(?:['"]?\{\}['"]?|\\\{\\\})(?:\s|$))"#,
+            "find ... -delete naming root, home, or a system directory requires explicit approval. dcg gates on the paths the command names, not on the -name/-maxdepth filters that may narrow what it deletes. This command will NOT be executed.",
             Critical,
-            "`find <path> -delete` is the bytewise-equivalent of `rm -rf <path>`: \
-             it recursively removes every file and (when -depth is implied) every \
-             directory matched by the predicate. Targeting `/`, `~`, `$HOME`, or any \
-             top-level system directory (`/etc`, `/usr`, `/var`, `/home`, `/boot`, \
-             `/dev`, `/proc`, `/sys`, `/lib`, `/lib64`, `/opt`, `/root`) destroys \
-             the operating system or user data the same way `rm -rf` would.\n\n\
-             There is NO recovery without backups.\n\n\
-             If you only need to delete files matching a pattern, use a much more \
-             specific path:\n  \
-             find /path/to/specific/subdir -name '*.tmp' -delete\n\n\
+            "`find <path> -delete` removes every file the predicate matches beneath \
+             `<path>`, and with `-depth` implied it removes matched directories too. \
+             Rooted at `/`, `~`, `$HOME`, or a top-level system directory (`/etc`, \
+             `/usr`, `/var`, `/home`, `/boot`, `/dev`, `/proc`, `/sys`, `/lib`, \
+             `/lib64`, `/opt`, `/root`), the unfiltered form destroys the operating \
+             system or the user's data exactly as `rm -rf` would, and there is NO \
+             recovery without backups. It is also the most common way an agent \
+             works around a blocked `rm -rf`.\n\n\
+             This rule fires on a sensitive path appearing anywhere between `find` \
+             and `-delete`, and it is deliberately coarse in two ways. It does not \
+             evaluate `-name`, `-maxdepth`, `-type`, or any other predicate, so a \
+             narrowly filtered delete under home is gated like an unfiltered one — \
+             a predicate is easy to get wrong, and the blast radius of a wrong one \
+             is the whole subtree. It also does not require the sensitive path to be \
+             the search root, so `find /tmp/x -newer /etc/passwd -delete` is gated \
+             even though only `/tmp/x` is searched.\n\n\
+             So a denial here is NOT a measurement of what this particular command \
+             would have removed. It reports which paths the command names.\n\n\
+             To delete inside root or home, pick one:\n  \
+             find /tmp/<subdir> -delete                       # literal temp roots are allowed\n  \
+             dcg allow-once <code>                            # one-shot, from the code in this denial\n  \
+             dcg allowlist add-command '<exact command>' -r \"reviewed\" --user\n\n\
+             Re-rooting under a more specific subdirectory does NOT lift this rule \
+             while that subdirectory is still under root or home.\n\n\
              Always preview first:\n  \
-             find /path -type f | head -20",
+             find <path> -type f | head -20",
             FIND_DELETE_SUGGESTIONS
         ),
         // ----- `find ... -delete` (High: any other target) -----
@@ -4012,7 +5096,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // `\b`) so `-delete-this-not-a-flag` — where `\b` happily
             // allows the following `-` — does NOT false-positive, while
             // shell separators and subshell-close are still accepted.
-            r"\bfind\b[^|;&]*\s-delete(?:\s|$|[;&|)\n])",
+            // `-exec rm {} \;` / `-execdir rm -f {} +` deletes the found files,
+            // the same deletion as `-delete`; only `-delete` was recognised,
+            // so the older, more common spelling walked straight through. An
+            // `-exec rm` of a fixed operand (not `{}`) is left to the rm rules.
+            r#"\bfind\b[^|;&]*\s(?:-delete(?:\s|$|[;&|)\n])|-exec(?:dir)?\s+(?:[^\s;&|]*/)?rm(?:\s+-\S+)*\s+(?:['"]?\{\}['"]?|\\\{\\\})(?:\s|$))"#,
             "find ... -delete is destructive (bytewise-equivalent to rm -rf on the matched tree) and requires human approval.",
             High,
             "`find ... -delete` recursively deletes every path matched by the find \
@@ -4092,7 +5180,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `truncate-grow` safe pattern above.
         destructive_pattern!(
             "truncate-zero-root-home",
-            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\btruncate\b[^|;&]*?(?:\s-[co]*s\s*(?!\+)\S+|\s--size(?:=|\s+)(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "truncate with a potentially shrinking size on a sensitive system or home path destroys data. EXTREMELY DANGEROUS.",
             Critical,
             "`truncate -s 0 <file>` zeros a file in place. `truncate -s -<N> <file>` \
@@ -4109,7 +5197,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // ----- destructive `truncate -s/--size` (High: any other target) -----
         destructive_pattern!(
             "truncate-zero-general",
-            r"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)",
+            r"\btruncate\b[^|;&]*?(?:\s-[co]*s\s*(?!\+)\S+|\s--size(?:=|\s+)(?!\+)\S+)",
             "truncate with an absolute or shrinking size can destroy file content and requires human approval.",
             High,
             "`truncate -s 0 <file>` zeros a file in place; `truncate -s -<N> <file>` \
@@ -4400,7 +5488,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "credential-file-write",
             r"(?!)",
-            "writing a credential, private-key, login-shell startup, or system authentication file (`~/.ssh/*`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the shell rc files and `~/.bashrc.d`/`~/.zshrc.d`, `/etc/sudoers*`, `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/ssh/*`) with `>`, `>>`, `tee`, `cp`/`mv`/`install`/`ln`, `dd of=`, or `sed -i` installs persistent access or replaces the trust this machine runs on, whether or not the file exists yet. Reads and `chmod`/`chown` are unaffected; appending to `~/.ssh/known_hosts` stays allowed.",
+            "writing a credential, private-key, login-shell startup, or system authentication file (`~/.ssh/*`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the token stores of cargo, gem, Vault, Terraform, gcloud, Azure, s3cmd/boto, pass and hub, `~/.pgpass`, `~/.my.cnf`, the shell rc files and `~/.bashrc.d`/`~/.zshrc.d`, `/etc/sudoers*`, `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/ssh/*`) with `>`, `>>`, `tee`, `cp`/`mv`/`install`/`ln`, `dd of=`, or `sed -i` — or, from PowerShell or Cmd, `Add-Content`, `Set-Content`, `Clear-Content`, `Out-File`, `Tee-Object`, `New-Item`, `Copy-Item`, `Move-Item`, `copy`, or `move` — installs persistent access or replaces the trust this machine runs on, whether or not the file exists yet. Reads and `chmod`/`chown` are unaffected; appending to `~/.ssh/known_hosts` stays allowed.",
             Critical,
             "These files decide who can log in, which keys and tokens act as this user, and what \
              code every new shell runs. Writing one of them — even creating it where it did not \
@@ -4410,7 +5498,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              The write is judged by the path the shell will open, so quoted, escaped, `$HOME`, \
              `~user`, `/home/<user>`, and `$ZDOTDIR`-style spellings are all recognised, and a \
              brace, glob, or alternation that could still expand into one of these paths is \
-             treated as if it did.\n\n\
+             treated as if it did. A PowerShell or Cmd payload is read with that shell's own \
+             quoting and variables (`$env:USERPROFILE`, `%USERPROFILE%`, `C:\\Users\\<user>`), \
+             whichever host dcg runs on.\n\n\
              What stays allowed:\n\
              - Reading them (`cat`, `grep`, `diff`, `ssh -F`, `source`).\n\
              - `chmod 600` / `chown` on them.\n\
@@ -4425,6 +5515,48 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - For a project that must manage one of these files, allowlist \
                `core.filesystem:credential-file-write` in that project's dcg config with a reason.",
             super::credential_files::CREDENTIAL_FILE_WRITE_SUGGESTIONS
+        ),
+        // ----- `.git/` writes (Critical, semantic) -----
+        //
+        // Same classifier, same unsatisfiable-regex arrangement, separate id.
+        // A project that must rewrite `.git/config` allowlists this without
+        // also granting itself `~/.ssh/authorized_keys`, which is the whole
+        // reason it is not folded into `credential-file-write` (#457).
+        //
+        // Redirects are NOT decided here: `> .git/x` and `>> .git/x` keep
+        // `redirect-truncate-git-internals-relative` and
+        // `redirect-append-git-internals-relative`, so no existing allowlist
+        // entry changes meaning. This id covers the writers those two rules
+        // cannot see.
+        destructive_pattern!(
+            "git-internals-write",
+            r"(?!)",
+            "writing inside a `.git` directory with `tee`, `sponge`, `cp`/`mv`/`install`, `sed -i`, `perl -i`, `dd of=`, or an embedded-code sink rewrites repository state: `.git/config` carries remotes, `insteadOf` rewrites and credential helpers, `.git/hooks/*` run on ordinary git commands, and refs and objects are the history itself. Reads are unaffected, and `.gitignore`, `.gitattributes`, `.gitmodules` and `.github/` are not this rule.",
+            Critical,
+            "`.git` is not a secret, it is the repository. Three of its contents \
+             change what later commands do rather than what they see: `config` \
+             names the remotes a push reaches and can install a credential \
+             helper or an `insteadOf` rewrite that silently redirects a fetch; \
+             `hooks/*` execute on commit, push and checkout, so writing one is \
+             arbitrary code execution at the next ordinary git command; refs \
+             and objects are the history, and rewriting them by hand loses work \
+             in a way `git reflog` cannot always recover.\n\n\
+             The write is judged by the path the shell will open, so a \
+             checkout-relative `.git/config`, a nested `repo/.git/config`, and \
+             a quoted or escaped spelling are all recognised.\n\n\
+             What stays allowed:\n\
+             - Reading anything under `.git/` (`cat`, `grep`, `git config --list`).\n\
+             - Every git porcelain command; this rule never sees them.\n\
+             - `.gitignore`, `.gitattributes`, `.gitmodules`, `.github/` — none \
+               of these are inside `.git/`.\n\n\
+             Safer alternatives:\n\
+             - `git config <key> <value>` edits config with git's own validation.\n\
+             - `git remote set-url` changes a remote without touching the file.\n\
+             - Show the user the exact change and let them apply it, or use \
+               `dcg allow-once` for a one-off.\n\
+             - For a project that genuinely manages `.git` files, allowlist \
+               `core.filesystem:git-internals-write` with a reason.",
+            super::credential_files::GIT_INTERNALS_WRITE_SUGGESTIONS
         ),
         // ----- `> <sensitive>` (Critical: shell redirect truncate) -----
         //
@@ -4533,6 +5665,115 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Read redirects (`< <file>`) are not affected — they don't truncate.",
             REDIRECT_TRUNCATE_SUGGESTIONS
         ),
+        // A truncating redirect into a `.git` directory, named relatively.
+        //
+        // `redirect-truncate-root-home` matches the literal text of the
+        // target, so it only ever saw the absolute spelling. The same write to
+        // the same file was allowed the moment it was written relatively, which
+        // included the `.git` internals that rule's own reason promises to
+        // protect (GitHub #407):
+        //
+        //     cat > /home/u/proj/.git/config     denied
+        //     cat > .git/config                  ALLOWED, same file
+        //     echo x > .git/hooks/pre-commit     ALLOWED, and that one executes
+        //
+        // A relative target cannot be resolved in general — dcg does not know
+        // the working directory, and denying every relative redirect would
+        // deny `> out.txt`. But a `.git/` path *component* names a git
+        // internal wherever the shell happens to be standing, so this one case
+        // is decidable without the cwd and is worth deciding.
+        //
+        // `.gitignore`, `.gitattributes` and `.github/` are untouched: the
+        // component must be exactly `.git` followed by a separator. Append
+        // (`>>`) does not truncate, so it is matched by the sibling rule
+        // below rather than by this one.
+        destructive_pattern!(
+            "redirect-truncate-git-internals-relative",
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?:\./)?(?:[^\s;&|'"]*/)?\.git/"#,
+            "shell truncating redirect into a .git directory rewrites repository internals; a relative spelling names the same file an absolute one does.",
+            Critical,
+            "`> .git/<path>` opens the file with O_WRONLY|O_CREAT|O_TRUNC, so the \
+             previous contents are gone before anything is written. Inside `.git` that \
+             means repository state, not a working file:\n\
+             - `.git/config` carries remotes, hooks configuration and credentials helpers.\n\
+             - `.git/HEAD` and `.git/refs/**` decide which commits are reachable; \
+               truncating them can orphan history that only the reflog still names.\n\
+             - `.git/hooks/**` is executed by git, so a write there is code execution \
+               on the next commit, merge or checkout.\n\n\
+             The absolute spelling of this same path is already denied; naming it \
+             relatively does not make it a different file.\n\n\
+             Safer alternatives:\n\
+             - Change configuration through git, which writes atomically and validates: \
+               `git config <key> <value>`, `git remote set-url <name> <url>`.\n\
+             - Move a ref with `git update-ref <ref> <sha>` rather than by writing the file.\n\
+             - To inspect rather than replace, read it: `cat .git/config`.\n\
+             - If a file genuinely must be rewritten, write it beside the repository and \
+               copy it in after review: `… > /tmp/<subdir>/config && cp /tmp/<subdir>/config .git/config`.",
+            GIT_INTERNALS_WRITE_SUGGESTIONS
+        ),
+        // An appending redirect into a `.git` directory, named relatively or
+        // otherwise.
+        //
+        // The truncating sibling above leaves `>>` out on purpose, and every
+        // other redirect rule in this pack is drawn on the same axis: `>`
+        // destroys the previous contents, `>>` does not. Inside `.git` that is
+        // the wrong axis. Git reads these files whole, so adding to one is how
+        // it is subverted rather than a milder way of replacing it (#457):
+        //
+        //     echo '[url "…"]'      >> .git/config     rewrites where fetches go
+        //     echo 'pager = sh -c …' >> .git/config    runs on the next git command
+        //     echo 'curl … | sh'     >> .git/hooks/pre-commit
+        //
+        // None of those truncate anything, and the third executes on the next
+        // commit exactly as an overwritten hook would. `.gitignore` and
+        // `.github/` stay untouched for the same reason as above: the
+        // component must be exactly `.git` followed by a separator.
+        destructive_pattern!(
+            "redirect-append-git-internals-relative",
+            r#"(?<![<>])(?:&>>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>>)\s*(?:['"\\]|\$['"])?(?:\./)?(?:[^\s;&|'"]*/)?\.git/"#,
+            "shell appending redirect into a .git directory adds repository configuration or hook code that git runs on its next invocation.",
+            Critical,
+            "`>> .git/<path>` leaves the existing contents in place and adds to them, \
+             which is what makes it useful against a repository rather than what makes \
+             it safe:\n\
+             - A `[url \"…\"] insteadOf` or `[credential] helper` section appended to \
+               `.git/config` redirects the next fetch or hands over a token; the \
+               sections already there keep working, so nothing looks broken.\n\
+             - `[core] pager`, `[core] editor` and `[alias]` entries name commands git \
+               runs, so appending one is code execution on the next git invocation.\n\
+             - A line appended to `.git/hooks/**` runs on the next commit, merge or \
+               checkout just as a rewritten hook would.\n\n\
+             Truncating the same file is already denied. Appending to it reaches the \
+             same end state by a route that preserves the evidence.\n\n\
+             Safer alternatives:\n\
+             - Add configuration through git, which validates the key and writes \
+               atomically: `git config <key> <value>`, `git remote add <name> <url>`.\n\
+             - Install a hook from a reviewed file rather than by appending lines.\n\
+             - To inspect rather than extend, read it: `cat .git/config`.",
+            GIT_INTERNALS_WRITE_SUGGESTIONS
+        ),
+        // There is deliberately no `tee`/`sponge` rule here, and the reason is
+        // a property of this pack rather than of the writer (#457, #460).
+        //
+        // A `core.filesystem` destructive regex whose match lies wholly inside
+        // argv does not reach the evaluator. Measured three ways against a
+        // built binary: the rule spelled with the command word, the same rule
+        // executable-scoped with `executables = ["tee", "sponge"]`, and the
+        // rule reduced to the bare literal `\.git/` all allow
+        // `tee .git/config`, while `cat > .git/config` denies throughout and
+        // `truncate -s 0 .git/config` — a regex whose match BEGINS at the
+        // command word — denies too. `tee .ssh/id_rsa` denies as well, through
+        // `credential-file-write`, which is a classifier and does not go
+        // through the regex pass at all.
+        //
+        // So the supported way to guard a non-redirect writer of a literal
+        // path in this pack is the credential classifier, not a pattern. That
+        // is a larger change than #457 (it needs a per-entry rule name so a
+        // `.git` denial does not report as `credential-file-write`, and it
+        // decides the `cp`/`install` posture at the same time), so the writer
+        // gap stays open rather than being closed by a rule that passes its
+        // pack-level test and never fires in production.
+        //
         // The shell expands redirect targets at runtime. A variable, command
         // substitution, or backslash-obfuscated suffix can therefore resolve
         // outside an apparent temp path before O_TRUNC opens the file.
@@ -4570,6 +5811,80 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              There is no legitimate reason to run this shape. If you are testing \
              process limits, use `ulimit -u` in a disposable VM or container."
         ),
+        // ----- Windows disk-destruction verbs (cross-platform baseline, #451/#252) -----
+        //
+        // The full Windows coverage lives in the `windows.system` pack, which is
+        // compiled everywhere but only DEFAULT-ENABLED on `cfg(windows)`
+        // (`packs/windows/mod.rs`). So on a macOS/Linux dcg driving a Windows box
+        // — over SSH, or a cross-platform agent — these verbs pass. These core
+        // rows give the highest-severity, zero-false-positive ones a baseline
+        // that is enabled everywhere, exactly as `powershell-remove-item-recursive`
+        // does for recursive `Remove-Item`. They are meaningless outside Windows,
+        // so matching them in any dialect (including the `powershell -Command
+        // '...'` / `cmd /c '...'` wrapper that re-evaluates its payload) is safe.
+        // Regexes are kept byte-identical to `windows.system`'s so the two cannot
+        // diverge silently; `windows.system` owns the fuller set (diskpart,
+        // Remove-Partition, cipher, bcdedit, …) for a real Windows build.
+        destructive_pattern!(
+            "format-volume",
+            r"(?i)\bformat-volume\b",
+            "PowerShell Format-Volume erases a volume and everything on it.",
+            Critical,
+            "`Format-Volume` reformats a volume, destroying every file on it with no undo. \
+             Under an agent hook this must be run by a human who has confirmed the target \
+             drive.\n\n\
+             Safer alternatives:\n\
+             - Confirm the volume first: `Get-Volume`.\n\
+             - Add `-WhatIf` to report what would happen without doing it."
+        ),
+        destructive_pattern!(
+            "clear-disk",
+            r"(?i)\bclear-disk\b",
+            "PowerShell Clear-Disk removes a disk's partitions and data.",
+            Critical,
+            "`Clear-Disk -RemoveData` deletes all partitions and data from a disk. There is \
+             no undo.\n\n\
+             Safer alternatives:\n\
+             - Inspect the disk first: `Get-Disk`.\n\
+             - Add `-WhatIf` to preview without changing anything."
+        ),
+        destructive_pattern!(
+            "vssadmin-delete-shadows",
+            r"(?i)\bvssadmin(?:\.exe)?\s+(?:[^|&\r\n]*\s+)?delete\s+shadows\b",
+            "vssadmin delete shadows destroys Volume Shadow Copies (System Restore and backups).",
+            Critical,
+            "`vssadmin delete shadows /all` removes the Volume Shadow Copies that System \
+             Restore and many backup tools depend on — a hallmark of ransomware, because it \
+             destroys the local means of recovery.\n\n\
+             Safer alternatives:\n\
+             - List them first: `vssadmin list shadows`.\n\
+             - Manage restore points through System Protection instead."
+        ),
+        destructive_pattern!(
+            "wmic-shadowcopy-delete",
+            r"(?i)\bwmic(?:\.exe)?\s+shadowcopy\s+delete\b",
+            "wmic shadowcopy delete destroys Volume Shadow Copies.",
+            Critical,
+            "`wmic shadowcopy delete` removes Volume Shadow Copies — the same \
+             recovery-destroying operation as `vssadmin delete shadows`, through a different \
+             tool.\n\n\
+             Safer alternatives:\n\
+             - List them first: `vssadmin list shadows`."
+        ),
+        // The PowerShell spelling of the same deletion (see the twin in
+        // `windows.system`): `Win32_ShadowCopy` instances piped into
+        // Remove-WmiObject/Remove-CimInstance or deleted with `.Delete()`.
+        destructive_pattern!(
+            "wmi-shadowcopy-delete",
+            r"(?i)\bwin32_shadowcopy\b[^\r\n;]*?(?:\|\s*(?:remove-wmiobject|rwmi|remove-ciminstance|rcim)\b|\.delete\s*\()",
+            "Deleting Win32_ShadowCopy instances destroys Volume Shadow Copies.",
+            Critical,
+            "Piping `Win32_ShadowCopy` into `Remove-WmiObject` / `Remove-CimInstance`, or \
+             calling `.Delete()` on its instances, removes Volume Shadow Copies: the same \
+             recovery-destroying operation as `vssadmin delete shadows`, through PowerShell.\n\n\
+             Safer alternatives:\n\
+             - List them first: `Get-CimInstance Win32_ShadowCopy` or `vssadmin list shadows`."
+        ),
     ]
 }
 
@@ -4591,6 +5906,12 @@ mod tests {
             ("-rf''", "-rf"),
             ("'-'r'f'", "-rf"),
             ("-r\\f", "-rf"),
+            // Bash ANSI-C and locale quoting.
+            ("$'-rf'", "-rf"),
+            ("-$'\\x72'f", "-rf"),
+            ("-$'\\162'f", "-rf"),
+            ("-$'\\562'f", "-rf"),
+            ("$\"-rf\"", "-rf"),
             ("--recursive", "--recursive"),
             ("-rf", "-rf"),
         ] {
@@ -4602,7 +5923,7 @@ mod tests {
         }
         // An unbalanced quote is a syntax error: leave it opaque so it matches
         // no flag (never "repair" it into a destructive one).
-        for opaque in ["-r'f", "-r\"f", "-rf\\"] {
+        for opaque in ["-r'f", "-r\"f", "-rf\\", "$'-rf", "$\"-rf"] {
             assert_eq!(
                 dequote_rm_flag_token(opaque).as_ref(),
                 opaque,
@@ -4614,6 +5935,53 @@ mod tests {
             dequote_rm_flag_token("-rf"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// A bare redirect to a Windows-spelled relative anchor must select the
+    /// pack (#451).
+    ///
+    /// `.ssh/authorized_keys` and `.git/config` are keywords because a bare
+    /// redirect to them carries no other one (#407). A PowerShell or cmd
+    /// caller writes `.ssh\authorized_keys`, which matched none of them, so
+    /// the quick-reject dropped the command before core.filesystem was a
+    /// candidate and the relative half of `credential-file-write` never ran.
+    ///
+    /// Resolution was never the problem: the same targets deny as soon as any
+    /// writer word is present. This asserts the gate itself.
+    #[test]
+    fn windows_spelled_relative_anchors_select_the_pack_issue_451() {
+        let pack = create_pack();
+        let bs = char::from(92);
+        for target in [
+            format!(".ssh{bs}authorized_keys"),
+            format!(".git{bs}config"),
+            format!(".aws{bs}credentials"),
+            format!(".gnupg{bs}secring.gpg"),
+            format!(".kube{bs}config"),
+            format!(".docker{bs}config.json"),
+        ] {
+            let command = format!("echo x > {target}");
+            assert!(
+                pack.might_match(&command),
+                "a bare redirect to a Windows-spelled anchor must select the pack: {command}"
+            );
+        }
+
+        // Negative control: an ordinary relative Windows path carries none of
+        // these anchors, so the quick-reject must still drop it. Without this
+        // the assertions above would pass on a keyword row so broad that the
+        // gate stopped meaning anything.
+        for target in [
+            format!("build{bs}out.txt"),
+            format!("docs{bs}readme.md"),
+            format!("src{bs}main.rs"),
+        ] {
+            let command = format!("echo x > {target}");
+            assert!(
+                !pack.might_match(&command),
+                "an ordinary relative Windows path must not select the pack: {command}"
+            );
+        }
     }
 
     /// Issue #302: the canonical fork bomb and word-named variants are
@@ -5186,6 +6554,37 @@ mod tests {
             "truncate --reference=ref.bin out.bin",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    /// getopt accepts the size attached (`-s0`), separated from a long option
+    /// (`--size 0`), and bundled (`-cs0`). Only `-s 0` and `--size=0` were
+    /// recognised, so the other spellings zeroed a key or /etc/passwd
+    /// unexamined -- and the safe rules had the same blind spot, so both
+    /// sides move together.
+    #[test]
+    fn truncate_every_size_spelling_is_judged_alike() {
+        let pack = create_pack();
+        for cmd in [
+            "truncate -s0 ~/.ssh/id_ed25519",
+            "truncate --size 0 ~/.ssh/id_ed25519",
+            "truncate -cs0 /etc/passwd",
+            "truncate -c -s0 /etc/shadow",
+            "truncate -s-100 ~/.bashrc",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+        }
+        for cmd in ["truncate -s0 ./data.bin", "truncate --size 0 build/out.log"] {
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+        }
+        for cmd in [
+            "truncate -s+1G ./disk.img",
+            "truncate --size +1G ./disk.img",
+            "truncate -cs+4K ./sparse.bin",
+            "truncate -s0 /tmp/scratch/out.log",
+            "truncate --size 0 /var/tmp/job.log",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
         }
     }
 
@@ -5929,6 +7328,8 @@ mod tests {
         for rule_name in [
             "redirect-truncate-root-home",
             "redirect-truncate-dynamic-path",
+            "redirect-truncate-git-internals-relative",
+            "redirect-append-git-internals-relative",
         ] {
             let rule = pack
                 .destructive_patterns
@@ -5950,6 +7351,12 @@ mod tests {
         // `>>` is append (non-destructive); the destructive regex's
         // negative lookbehind `(?<![<>])` excludes it. Even on
         // sensitive paths, append must NOT block.
+        //
+        // `.git/` is the one exception, and it is not a hole in this rule but
+        // a different judgement about a different target: git reads its
+        // internals whole, so adding to one runs on the next git command
+        // without destroying anything (#457). See
+        // `append_into_git_internals_is_denied_issue_457`.
         let pack = create_pack();
         for cmd in [
             "echo line >> /etc/syslog",
@@ -5964,6 +7371,104 @@ mod tests {
             "echo x 17>> /etc/passwd",
             "echo x {audit}>> /etc/passwd",
             "Write-Output x *>> /etc/passwd",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn append_into_git_internals_is_denied_issue_457() {
+        // The truncating spelling of each of these was already denied; the
+        // appending one reaches the same end state and was allowed. Appending
+        // is the more useful primitive against a repository, not the milder
+        // one: a section added to `.git/config` runs on the next fetch and
+        // leaves everything already there working.
+        let pack = create_pack();
+        for cmd in [
+            "cat >> .git/config",
+            "echo x >>.git/config",
+            "echo x >> ./.git/config",
+            "echo x >> sub/.git/config",
+            "echo x >> /home/u/proj/.git/hooks/pre-commit",
+            "echo x >> \"$HOME/proj/.git/config\"",
+            "echo x 1>> .git/config",
+            "echo x &>> .git/config",
+            "echo x {audit}>> .git/config",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-append-git-internals-relative");
+        }
+    }
+
+    #[test]
+    fn a_pack_regex_cannot_reach_a_tee_operand_issue_460() {
+        // Why there is no `tee-git-internals` rule. A pack-level `check` DOES
+        // match a rule spelled for `tee <path>` — this test proves the regex
+        // is fine — and the same rule then never fires in the evaluator, which
+        // is the exact shape #407/#441/#444 were about, one layer deeper: the
+        // keyword admits the pack, the pack agrees, and production still
+        // allows the command.
+        //
+        // Keeping the rule with this test passing would have shipped a green
+        // assertion of coverage that does not exist, so the rule is out and
+        // #460 carries the evaluator gap. This test stays as the guard: if the
+        // regex ever stops matching here, the reasoning above is stale.
+        let pack = create_pack();
+        let candidate = DestructivePattern {
+            regex: crate::packs::regex_engine::LazyCompiledRegex::new(
+                r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+['"]?(?:\./)?(?:[^\s'";&|<>]*/)?\.git/"#,
+            ),
+            reason: "candidate rule retained only as this test's fixture",
+            name: Some("tee-git-internals-candidate"),
+            severity: Severity::Critical,
+            explanation: None,
+            suggestions: &[],
+            executables: None,
+        };
+        for cmd in [
+            "tee .git/config",
+            "tee -a .git/config",
+            "echo x | tee .git/hooks/pre-commit",
+            "sponge .git/config",
+            "tee sub/.git/config",
+        ] {
+            assert!(
+                candidate.matches_command(cmd),
+                "the candidate regex must still match {cmd}; if it does not, the \
+                 #460 reasoning needs re-measuring rather than trusting"
+            );
+        }
+        assert!(
+            !pack
+                .destructive_patterns
+                .iter()
+                .any(|pattern| pattern.name == Some("tee-git-internals")),
+            "the rule must stay out of the pack until the evaluator can reach it (#460)"
+        );
+    }
+
+    #[test]
+    fn ordinary_git_adjacent_writes_stay_allowed_issue_457() {
+        // The component must be exactly `.git` followed by a separator, and
+        // reading a git internal into a writer is not writing one. `cp` and
+        // `install` stay allowed on purpose: staging a file and copying it in
+        // is the reviewed path the `.git` denial text itself recommends.
+        let pack = create_pack();
+        for cmd in [
+            "echo x >> .gitignore",
+            "echo x >> .gitattributes",
+            "echo x >> .github/workflows/ci.yml",
+            "echo x >> notes/git.md",
+            "cat .git/config | tee /tmp/backup",
+            "git ls-files | tee .gitignore",
+            // A commit message that discusses these rules is covered by the
+            // EVALUATOR's string-data sanitization, not by the pack, so its
+            // pin lives in `tests/repro_407_relative_git_internals_redirect`
+            // where the hook actually runs. Asserting it here fails, correctly:
+            // `pack.check` sees the raw text and the append rule matches it.
+            "tee /tmp/scratch/config",
+            "cp /tmp/x .git/config",
+            "install -m 644 /tmp/x .git/config",
         ] {
             assert_no_match(&pack, cmd);
         }
@@ -6244,6 +7749,18 @@ mod tests {
         ] {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
+        // A relative target is a redirection too; the split used to require
+        // a rooted or quoted one, so these were masked as echo data.
+        assert_blocks_with_pattern(
+            &pack,
+            "echo x >.git/config",
+            "redirect-truncate-git-internals-relative",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "printf x >.git/HEAD",
+            "redirect-truncate-git-internals-relative",
+        );
     }
 
     #[test]
@@ -6313,6 +7830,26 @@ mod tests {
         ] {
             assert_no_match(&pack, cmd);
         }
+    }
+
+    /// The rm regexes are anchored on the executable (bd-migo): `rm` inside a
+    /// longer word is not an invocation, even for a caller that uses
+    /// `Pack::check` without the evaluator's argv0 gating. Path-qualified and
+    /// subcommand spellings still match.
+    #[test]
+    fn rm_regexes_do_not_match_inside_a_longer_word() {
+        let pack = create_pack();
+        for command in [
+            "charm -r -f build",
+            "swarm -r -f nodes",
+            "charm -rf /",
+            "swarm --recursive --force nodes",
+            "farm -fr ~/",
+        ] {
+            assert_allows(&pack, command);
+        }
+        assert_blocks_with_pattern(&pack, "/bin/rm -rf build", "rm-rf-general");
+        assert_blocks_with_pattern(&pack, "echo ok; rm -rf build", "rm-rf-general");
     }
 
     #[test]
@@ -6754,6 +8291,296 @@ mod tests {
         }
     }
 
+    /// A non-recursive `rm` of a protected credential file denies (#469).
+    ///
+    /// `rm /etc/shadow` and `rm ~/.ssh/authorized_keys` were allowed while
+    /// `unlink`, `shred -u` and `truncate -s 0` denied the same nine targets,
+    /// and so did all six embedded languages. Every `rm` rule required a
+    /// recursive flag, and `-r` is exactly the flag you do not need to delete
+    /// one file.
+    #[test]
+    fn rm_of_a_protected_credential_file_denies_issue_469() {
+        for target in [
+            "/home/user/.ssh/id_rsa",
+            "/home/user/.ssh/authorized_keys",
+            "/home/user/.bashrc",
+            "/home/user/.gnupg/secring.gpg",
+            "/home/user/.aws/credentials",
+            "/etc/shadow",
+            "/etc/passwd",
+            "/etc/sudoers",
+            "/root/.ssh/id_rsa",
+        ] {
+            assert_rm_parser_denies(
+                &format!("rm {target}"),
+                RM_PROTECTED_FILE_NAME,
+                Severity::Critical,
+            );
+        }
+
+        // The flag and spelling surface measured as allowed before the fix.
+        for command in [
+            "rm -f /home/user/.ssh/id_rsa",
+            "rm -v /home/user/.ssh/id_rsa",
+            "rm -- /home/user/.ssh/id_rsa",
+            r#"rm "/home/user/.ssh/id_rsa""#,
+            "/bin/rm /home/user/.ssh/id_rsa",
+            "rm ~/.ssh/id_rsa",
+            "rm $HOME/.aws/credentials",
+            // One protected operand among benign ones is still a deletion of
+            // the protected one.
+            "rm /home/user/notes.txt /home/user/.ssh/id_rsa",
+        ] {
+            assert_rm_parser_denies(command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+        }
+    }
+
+    /// The boundaries #469 must not cross, and the reason it is a new predicate
+    /// rather than a reuse of `path_is_root_home`.
+    ///
+    /// `path_is_root_home` matches anything under `/home`, `/etc` or `/var`.
+    /// Reusing it here would deny `rm /home/user/notes.txt` and
+    /// `rm /home/user/project/src/main.rs` — the single most common operation
+    /// an agent performs in its own tree. Those two rows are the countermetric
+    /// for this rule: if either ever starts denying, the predicate has been
+    /// widened into the one that was measured unusable.
+    #[test]
+    fn rm_of_an_ordinary_file_still_allows_issue_469() {
+        for command in [
+            // Relative paths carry no anchor at all.
+            "rm ./build/stamp",
+            "rm target/debug/app",
+            "rm node_modules/.cache/x",
+            // Temp, which the sibling rules already carve out.
+            "rm /tmp/scratch.txt",
+            "rm /var/tmp/x.log",
+            // The rows the obvious fix breaks.
+            "rm /home/user/notes.txt",
+            "rm /home/user/project/src/main.rs",
+            "rm ~/notes.txt",
+            // Under a protected prefix but not protected files: `unlink`
+            // denies both of these, and that breadth deliberately does not
+            // transfer to `rm`.
+            "rm /etc/hosts",
+            "rm /var/log/app.log",
+            // Public key material is not credential loss (`ssh_entry`).
+            "rm ~/.ssh/id_rsa.pub",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+    }
+
+    /// `-I` prompts only for more than three files, or when recursing (#481).
+    ///
+    /// `prompts()` treated `-I` exactly like `-i`, so every rule that stands
+    /// down for an interactive command stood down for a deletion GNU performs
+    /// silently. `rm -I <private key>` deleted the key with no prompt at all
+    /// and was allowed on the strength of one that never happens.
+    ///
+    /// From `man rm`: "-I, --interactive=once — prompt once before removing
+    /// more than three files, or when removing recursively".
+    ///
+    /// The boundary is asserted on both sides at three-versus-four operands,
+    /// because a fix that simply dropped the carve-out would pass a
+    /// deny-only test and break the case the flag exists for.
+    #[test]
+    fn interactive_once_prompts_only_past_three_files_issue_481() {
+        const KEY: &str = "/home/user/.ssh/id_rsa";
+
+        // One, two and three named files: GNU does not prompt, so the rule
+        // that guards the protected file must still decide.
+        for operands in [
+            "",
+            " /home/user/.ssh/a",
+            " /home/user/.ssh/a /home/user/.ssh/b",
+        ] {
+            for flag in ["-I", "--interactive=once"] {
+                let command = format!("rm {flag} {KEY}{operands}");
+                assert_rm_parser_denies(&command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+            }
+        }
+
+        // Four operands: GNU prompts once, and with stdin closed under a hook
+        // that prompt deletes nothing, so the carve-out is right here.
+        assert_rm_parser_no_match(&format!(
+            "rm -I {KEY} /home/user/.ssh/a /home/user/.ssh/b /home/user/.ssh/c"
+        ));
+
+        // `-i` prompts before every file whatever the count, so it keeps the
+        // carve-out at one operand. This is the row that proves the fix reads
+        // the two modes differently rather than deleting the carve-out.
+        assert_rm_parser_no_match(&format!("rm -i {KEY}"));
+        assert_rm_parser_no_match(&format!("rm -i {KEY} /home/user/.ssh/a"));
+
+        // A later `-f` still wins over either, so the command is not
+        // interactive at all.
+        assert_rm_parser_denies(
+            &format!("rm -I -f {KEY}"),
+            RM_PROTECTED_FILE_NAME,
+            Severity::Critical,
+        );
+    }
+
+    /// A literal brace alternation is two named files, not an unknown one
+    /// (#482).
+    #[test]
+    fn rm_of_a_braced_protected_file_denies_issue_482() {
+        for command in [
+            "rm /home/user/.ssh/{id_rsa,id_ed25519}",
+            "rm /home/user/{.ssh,.aws}/credentials",
+            "rm ~/.ssh/{notes.txt,id_rsa}",
+            "rm -f $HOME/.ssh/{a,b,authorized_keys}",
+            "rm /home/user/{.ssh/id_rsa,notes.txt}",
+        ] {
+            assert_rm_parser_denies(command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+        }
+        for command in [
+            // No comma: bash keeps `{id_rsa}` literally, a file of that name.
+            "rm /home/user/.ssh/{id_rsa}",
+            // Every alternative ordinary.
+            "rm /home/user/{notes,todo}.txt",
+            "rm ~/.ssh/{id_rsa,id_ed25519}.pub",
+            // Quoted braces do not expand (and a quoted name under `.ssh/` is
+            // judged as that literal file); dynamic ones are not provable.
+            "rm \"/home/user/{notes,id_rsa}\"",
+            "rm /home/user/.ssh/{$a,$b}",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+
+        assert_eq!(
+            literal_brace_expansions("a{b,c}d{1,2}"),
+            Some(vec![
+                "abd1".to_string(),
+                "abd2".to_string(),
+                "acd1".to_string(),
+                "acd2".to_string()
+            ])
+        );
+        assert_eq!(literal_brace_expansions("a{b}c"), None);
+        assert_eq!(literal_brace_expansions("a{b,{c,d}}"), None);
+        assert_eq!(literal_brace_expansions("{1..3}"), None);
+    }
+
+    /// The prompt predicate itself, at the boundary (#481).
+    ///
+    /// Asserted directly as well as through the parser because the parser can
+    /// only reach it with operands a rule cares about, and the recursive arm is
+    /// the one whose answer must NOT change.
+    #[test]
+    fn interactive_once_prompt_predicate_issue_481() {
+        use RmInteractiveMode::{Always, Default as Dflt, Never, Once};
+
+        // Non-recursive: the count decides, and the boundary is "more than".
+        for operands in 0..=3 {
+            assert!(
+                !Once.prompts_for(false, operands),
+                "-I does not prompt for {operands} files"
+            );
+        }
+        assert!(Once.prompts_for(false, 4), "-I prompts past three files");
+
+        // Recursive: `-I` prompts regardless of count, which is why the
+        // recursive rules are unaffected by this fix.
+        for operands in 0..=4 {
+            assert!(
+                Once.prompts_for(true, operands),
+                "-I prompts when recursing, at {operands} operands"
+            );
+        }
+
+        // The other three modes do not depend on either fact.
+        for recursive in [false, true] {
+            for operands in [0usize, 1, 4] {
+                assert!(Always.prompts_for(recursive, operands));
+                assert!(!Never.prompts_for(recursive, operands));
+                assert!(!Dflt.prompts_for(recursive, operands));
+            }
+        }
+    }
+
+    /// The shapes a one-group `.ssh` alternation does not reach (#482).
+    ///
+    /// `rm_of_a_braced_protected_file_denies_issue_482` covers the canonical
+    /// key-pair spelling. These are the rows around it: the product of two
+    /// groups reaching the parser (not just the expander), a braced operand
+    /// that is not the only operand, and the Etc-rooted and home-dotfile
+    /// entries, whose classifier arms are separate from the `.ssh` one.
+    #[test]
+    fn a_brace_alternation_names_each_path_it_expands_to_issue_482() {
+        for command in [
+            "rm /home/user/{.ssh,.aws}/{credentials,id_rsa}",
+            "rm /tmp/x /home/user/.ssh/{id_rsa,b}",
+            "rm /etc/{shadow,passwd}",
+            "rm /home/user/{.bashrc,.profile}",
+        ] {
+            assert_rm_parser_denies(command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+        }
+
+        // Each row here is a shape where expanding would be WRONG, so a fix
+        // that expanded eagerly would pass the rows above and start denying
+        // commands that touch nothing protected.
+        for command in [
+            // A nested brace is legal shell this pass deliberately does not
+            // read; declining leaves the operand judged as written.
+            "rm /home/user/x/{a,{b,c}}",
+            // An unmatched brace is not an alternation at all.
+            "rm /home/user/x/{a,b",
+            // Ordinary braces stay ordinary.
+            "rm /tmp/{a,b}",
+            "rm ./build/{a.o,b.o}",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+    }
+
+    /// The expander's own bound, and the spellings it refuses outright (#482).
+    ///
+    /// The cap matters because the product of N two-way groups is 2^N and this
+    /// runs on the path of every `rm`; nothing else asserts where it falls.
+    #[test]
+    fn brace_expansion_is_bounded_issue_482() {
+        // Six two-way groups is exactly 64 and still expands; seven is 128 and
+        // is refused, so the bound is inclusive and is reached, not exceeded.
+        let at_bound = literal_brace_expansions(&"{a,b}".repeat(6))
+            .expect("six two-way groups sit on the bound");
+        assert_eq!(at_bound.len(), 64);
+        assert_eq!(literal_brace_expansions(&"{a,b}".repeat(7)), None);
+
+        // An escape means the brace may not be a brace, so the word is not one
+        // this pass can prove; same for a group that is never closed.
+        assert_eq!(literal_brace_expansions(r"a\{b,c}"), None);
+        assert_eq!(literal_brace_expansions("a{b,c"), None);
+    }
+
+    /// The recursive rules keep their own attribution (#467's invariant).
+    ///
+    /// `rm -rf ~/.ssh/id_rsa` must still report `rm-rf-root-home` and not also
+    /// the new rule: two blocking ids for one command would mean an allowlist
+    /// entry for the reported one leaves it denied under the other. The new
+    /// rule is reachable only when `flags.resolve()` yields `None`, which is
+    /// exactly the non-recursive case, so this is structural — the test pins it.
+    #[test]
+    fn recursive_rm_keeps_its_own_rule_issue_469() {
+        assert_rm_parser_denies(
+            "rm -rf /home/user/.ssh/id_rsa",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm -r /etc/shadow",
+            RM_RECURSIVE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm -r -f /etc/shadow",
+            RM_R_F_SEPARATE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        // And the temp exemption for recursive rm is untouched.
+        assert_rm_parser_allows("rm -rf /tmp/build");
+    }
+
     #[test]
     fn test_rm_parser_rejects_variable_tmpdir_roots() {
         assert_rm_parser_denies(
@@ -6906,6 +8733,66 @@ mod tests {
             RM_RF_ROOT_HOME_NAME,
             Severity::Critical,
         );
+    }
+
+    /// #196 case 2: any absolute path used to get the "destroy your entire
+    /// operating system" rule, including a build directory inside a project.
+    /// Deep project paths now deny under the general rule; everything that can
+    /// reach the OS or a whole home directory stays Critical.
+    #[test]
+    fn root_home_severity_is_reserved_for_root_home_issue_196() {
+        for command in [
+            "rm -rf /home/ubuntu/proj/dist",
+            "rm -rf ~/proj/dist",
+            "rm -rf $HOME/proj/dist",
+            r#"rm -rf "${HOME}/proj/node_modules""#,
+            "rm -rf ~alice/proj/dist",
+            "rm -rf /Users/alice/code/app/build",
+            "rm -rf /data/projects/app/target",
+            "rm -rf /c/Users/bob/src/app/out",
+        ] {
+            assert_rm_parser_denies(command, RM_RF_GENERAL_NAME, Severity::High);
+        }
+        assert_rm_parser_denies(
+            "rm -r /home/ubuntu/proj/dist",
+            RM_RECURSIVE_GENERAL_NAME,
+            Severity::High,
+        );
+
+        for command in [
+            // Root, top-level dirs, and home roots.
+            "rm -rf /",
+            "rm -rf /data",
+            "rm -rf /home",
+            "rm -rf /home/ubuntu",
+            "rm -rf /root/proj/dist",
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -rf ~alice",
+            "rm -rf $HOME",
+            // A home's top-level entries and dotfile trees.
+            "rm -rf ~/Documents",
+            "rm -rf /home/ubuntu/proj",
+            "rm -rf ~/.config/app",
+            "rm -rf /home/ubuntu/.ssh/keys",
+            // System and mount directories at any depth.
+            "rm -rf /usr/local/lib",
+            "rm -rf /var/lib/docker",
+            "rm -rf /etc/nginx/sites",
+            "rm -rf /mnt/backup/2026",
+            "rm -rf /Volumes/Backup/photos",
+            "rm -rf /c/Windows/System32",
+            "rm -rf /c/Users/bob/Desktop",
+            // Anything that can expand or climb to a shallower directory.
+            "rm -rf ~/proj/../..",
+            "rm -rf /home/ubuntu/proj/../../..",
+            "rm -rf ~/$DIR/dist",
+            "rm -rf /home/ubuntu/*/dist",
+            "rm -rf ~/{a,b}/dist",
+            "rm -rf /data/`pwd`/dist",
+        ] {
+            assert_rm_parser_denies(command, RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        }
     }
 
     #[test]
@@ -7488,6 +9375,89 @@ mod tests {
         }
     }
 
+    /// A relative redirect after a `cd` spells no pack keyword, so without the
+    /// override the quick-reject drops it before the evaluator can anchor the
+    /// target to the directory (#480).
+    #[test]
+    fn a_cd_then_relative_redirect_forces_the_scan_issue_480() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for command in [
+                "cd ~/.ssh && echo k > authorized_keys",
+                "cd /etc; printf x >sudoers",
+                "pushd $HOME/.aws && echo x >> credentials",
+            ] {
+                assert!(
+                    filesystem_semantic_scan_required(command, dialect),
+                    "{command:?} ({dialect:?}) must reach core.filesystem"
+                );
+            }
+        }
+        // No `cd`, no redirect, or a directory that cannot be protected.
+        // (Unknown also reads each line as PowerShell, whose own triggers
+        // are not this rule's to pin.)
+        for command in [
+            "echo k > out.log",
+            "cd ~/.ssh && ls",
+            "cd src && echo x > out.log",
+        ] {
+            assert!(
+                !filesystem_semantic_scan_required(command, ShellDialect::Posix),
+                "{command:?} must stay quick-rejectable"
+            );
+        }
+    }
+
+    /// #451: the PLAIN cmdlet spellings must force candidate selection too.
+    ///
+    /// These carry no obfuscation character, which is exactly why they were
+    /// missed: the removed prefilter assumed the bytewise keyword index would
+    /// have caught anything unobfuscated, but `Remove-Item`/`ri`/`del`/`rd` are
+    /// not core.filesystem keywords. The consequence was inverted coverage —
+    /// `Remove-Item -Recurse -Force $HOME` blocked because of the `$`, while the
+    /// plain literal target did not.
+    #[test]
+    fn plain_powershell_removal_cmdlets_force_candidate_selection_issue_451() {
+        for command in [
+            "Remove-Item -Recurse ./tree",
+            "Remove-Item -Recurse -Force /etc",
+            "Remove-Item -Path /etc -Recurse -Force",
+            "ri -Recurse -Force /etc",
+            "del -Recurse ./tree",
+            "rd -Recurse ./tree",
+            "erase -Recurse ./tree",
+            "Get-Process; Remove-Item -Recurse ./tree",
+        ] {
+            assert!(
+                filesystem_semantic_scan_required(command, ShellDialect::PowerShell),
+                "a plain PowerShell removal cmdlet must force core.filesystem \
+                 candidate selection even with no obfuscation character: {command}"
+            );
+        }
+    }
+
+    /// Negative control for the test above: dropping the prefilter must not make
+    /// the signal fire for every PowerShell command, or core.filesystem would be
+    /// force-selected on every payload and the quick-reject would stop meaning
+    /// anything.
+    #[test]
+    fn ordinary_powershell_commands_still_skip_the_semantic_scan_issue_451() {
+        for command in [
+            "Get-ChildItem -Path C:\\Users",
+            "Write-Output 'hello'",
+            "Set-Location C:\\src",
+            "Copy-Item a.txt b.txt",
+            "New-Item -ItemType Directory ./build",
+            "Get-Content log.txt | Select-String error",
+            // Mentions a cmdlet name as DATA, not as the command word.
+            "Write-Output 'Remove-Item -Recurse ./tree'",
+        ] {
+            assert!(
+                !filesystem_semantic_scan_required(command, ShellDialect::PowerShell),
+                "an ordinary PowerShell command must not force a semantic scan: {command}"
+            );
+        }
+    }
+
     #[test]
     fn test_filesystem_keyword_candidate_requires_command_word_boundaries() {
         for command in [
@@ -7741,5 +9711,381 @@ mod classifier_guidance_tests {
             pack.check("rm -rf *").and_then(|matched| matched.name),
             Some(RM_RF_GENERAL_NAME)
         );
+    }
+
+    /// Windows disk-destruction verbs are caught on a non-Windows build too, so
+    /// a macOS/Linux dcg driving a Windows box does not miss them (#451). The
+    /// fuller set lives in the `cfg(windows)`-default-enabled `windows.system`
+    /// pack; these are its highest-severity, zero-false-positive baseline.
+    #[test]
+    fn windows_disk_destruction_verbs_block_cross_platform() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("Format-Volume -DriveLetter C", "format-volume"),
+            ("format-volume -driveletter c", "format-volume"),
+            ("FORMAT-VOLUME -DriveLetter D", "format-volume"),
+            ("Clear-Disk -Number 0 -RemoveData", "clear-disk"),
+            (
+                "vssadmin delete shadows /all /quiet",
+                "vssadmin-delete-shadows",
+            ),
+            (
+                "vssadmin.exe Delete Shadows /All",
+                "vssadmin-delete-shadows",
+            ),
+            ("wmic shadowcopy delete", "wmic-shadowcopy-delete"),
+            (
+                "Get-WmiObject Win32_ShadowCopy | Remove-WmiObject",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "GET-CIMINSTANCE WIN32_SHADOWCOPY | REMOVE-CIMINSTANCE",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "(Get-WmiObject Win32_ShadowCopy).Delete()",
+                "wmi-shadowcopy-delete",
+            ),
+        ] {
+            assert!(
+                filesystem_keyword_candidate(command),
+                "{command} must reach the pack"
+            );
+            let matched = pack
+                .check(command)
+                .unwrap_or_else(|| panic!("{command} must be denied"));
+            assert_eq!(matched.name, Some(rule), "{command}");
+            assert_eq!(matched.severity, Severity::Critical, "{command}");
+        }
+
+        // The read-only / unrelated spellings of the same tools stay allowed —
+        // only the destructive subcommand blocks.
+        for command in [
+            "vssadmin list shadows",
+            "wmic process list",
+            "Get-Volume",
+            "Get-Disk",
+            "git format-patch -1",
+            // A bare -WhatIf is a preview (windows.system's carve-out).
+            "Format-Volume -DriveLetter D -WhatIf",
+            "Clear-Disk -Number 1 -RemoveData -WhatIf",
+            "Get-CimInstance Win32_ShadowCopy",
+            "Get-WmiObject Win32_ShadowCopy | Select-Object ID, InstallDate",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+        // `-WhatIf:$false` turns the preview off: the volume is formatted.
+        for command in [
+            "Format-Volume -DriveLetter D -WhatIf:$false",
+            "Clear-Disk -Number 1 -RemoveData -WhatIf:$false",
+        ] {
+            assert!(pack.check(command).is_some(), "{command} must be denied");
+        }
+    }
+
+    /// `rsync --delete` into a system directory or home root mirror-deletes it,
+    /// the same catastrophe as `rm -rf` on that path, and was previously
+    /// fail-open. Keyed on the DESTINATION, so backups and `--dry-run` stay
+    /// allowed and a sensitive SOURCE is unaffected.
+    #[test]
+    fn rsync_delete_into_sensitive_destination_blocks() {
+        let pack = create_pack();
+        for command in [
+            "rsync -a --delete /src/ /etc/",
+            "rsync -a --delete src/ /",
+            "rsync -avz --delete /tmp/x/ /usr/",
+            "rsync -a --delete /empty/ /var/",
+            "rsync -a --delete /e/ /boot/",
+            "rsync -a --delete-after /s/ /etc/",
+            "rsync -a --delete-excluded /s/ /etc/",
+            "rsync -a --del /s/ /etc/",
+            "rsync -a --delete /s/ ~/",
+            "rsync -a --delete /s/ $HOME/",
+            "rsync -a --delete /s/ /home/",
+            "rsync -a --delete /s/ /home/user/",
+            "rsync -a --delete /s/ /root/",
+            "rsync --delete /s/ /etc/",
+        ] {
+            assert_eq!(
+                pack.check(command).and_then(|matched| matched.name),
+                Some("rsync-delete-sensitive-dest"),
+                "{command}"
+            );
+        }
+
+        // Backups, home subdirectories, dry runs, a sensitive SOURCE, and
+        // plain (no --delete) rsync all stay allowed.
+        for command in [
+            "rsync -a --delete src/ dest/",
+            "rsync -a --delete /tmp/a/ /tmp/b/",
+            "rsync -a --delete /project/ /home/user/backup/",
+            "rsync -a --delete /project/ ~/backup/",
+            "rsync -a --dry-run --delete /src/ /etc/",
+            "rsync -avn --delete /src/ /etc/",
+            "rsync -a --delete /etc/ /backup/",
+            "rsync -a /src/ /etc/",
+            "rsync -avz /src/ backup:/dst/",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+    }
+
+    /// `find … -exec rm {}` deletes every found file — the same deletion as
+    /// the already-denied `find … -delete` — and was allowed, because each
+    /// `-exec` child was judged as a lone non-recursive `rm`.
+    #[test]
+    fn find_exec_rm_of_the_found_files_is_a_find_delete() {
+        let pack = create_pack();
+        for (command, rule) in [
+            (r"find . -type f -exec rm {} \;", "find-delete-general"),
+            ("find . -type f -exec rm -f {} +", "find-delete-general"),
+            (
+                r"find src -name '*.rs' -execdir rm '{}' \;",
+                "find-delete-general",
+            ),
+            (r"find . -exec /bin/rm -f \{\} \;", "find-delete-general"),
+            (
+                r"find ~ -name '*.log' -exec rm {} \;",
+                "find-delete-root-home",
+            ),
+            (
+                "find /etc -type f -exec rm -f {} +",
+                "find-delete-root-home",
+            ),
+        ] {
+            assert_eq!(
+                pack.check(command).and_then(|matched| matched.name),
+                Some(rule),
+                "{command}"
+            );
+        }
+        // A fixed operand is the rm rules' business, and non-deleting actions
+        // over the found files stay allowed.
+        for command in [
+            r"find . -name '*.txt' -exec cat {} \;",
+            r"find . -type f -exec grep -l rm {} +",
+            r"find ./root -exec rm /tmp/scratch/marker \;",
+            "find . -name '*.rs' -print",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+        // Inside literal temp roots `-exec rm {}` is allowed exactly as
+        // `-delete` is; a climb, a variable, or a backslash anywhere but the
+        // terminating `\;` keeps the deny.
+        for command in [
+            r"find /tmp/build -name '*.o' -exec rm {} \;",
+            "find /tmp/build -type f -exec rm -f {} +",
+            r"find /var/tmp/cache -exec /bin/rm {} \;",
+        ] {
+            crate::packs::test_helpers::assert_allows(&pack, command);
+        }
+        for command in [
+            r"find /tmp/../etc -exec rm {} \;",
+            r"find /tmp/$D -exec rm {} \;",
+            r"find /tmp/x\ /etc -exec rm {} \;",
+        ] {
+            assert!(pack.check(command).is_some(), "{command} must stay denied");
+        }
+    }
+}
+
+#[cfg(test)]
+mod powershell_protected_file_tests {
+    use super::*;
+
+    /// A non-recursive PowerShell delete of a protected file (#451).
+    ///
+    /// `rm ~/.ssh/id_rsa` denies under `rm-protected-file`; the PowerShell
+    /// spelling of the very same deletion was allowed on every host and every
+    /// pack set, because this parser returned `NoMatch` for anything that did
+    /// not recurse. Measured before the fix: all six protected targets below,
+    /// and all five delete verbs, allowed with and without `-Force`.
+    #[test]
+    fn powershell_delete_of_a_protected_file_denies_issue_451() {
+        for target in [
+            "$HOME\\.ssh\\id_rsa",
+            "$HOME/.ssh/id_rsa",
+            "$HOME\\.ssh\\authorized_keys",
+            "$HOME\\.aws\\credentials",
+            "$HOME\\.bashrc",
+            "/etc/shadow",
+            "~/.ssh/id_rsa",
+            // Windows spells home `%USERPROFILE%`, and dcg's own path
+            // resolution treats it as the home directory (bd-b2b1).
+            "$env:USERPROFILE\\.ssh\\id_rsa",
+            "$env:userprofile\\.ssh\\id_rsa",
+        ] {
+            for verb in ["Remove-Item", "ri", "del", "erase", "rm"] {
+                for command in [
+                    format!("{verb} {target}"),
+                    format!("{verb} -Force {target}"),
+                ] {
+                    match parse_rm_command_segment_in_dialect(
+                        &command,
+                        false,
+                        ShellDialect::PowerShell,
+                    ) {
+                        RmParseDecision::Deny(hit) => {
+                            assert_eq!(
+                                hit.pattern_name, RM_PROTECTED_FILE_NAME,
+                                "{command} must deny under the same rule the POSIX twin uses"
+                            );
+                            assert_eq!(hit.severity, Severity::Critical);
+                        }
+                        other => unreachable!(
+                            "PowerShell delete of a protected file must deny: {command}: {other:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The rule turns on the TARGET, not on the verb (#451).
+    ///
+    /// Without these the test above would pass on a blanket deny of
+    /// `Remove-Item`, which is the failure mode a new rule arm invites.
+    #[test]
+    fn powershell_protected_delete_still_turns_on_the_target_issue_451() {
+        for command in [
+            // Ordinary files are nobody's business.
+            "Remove-Item ./notes.txt",
+            "Remove-Item -Force ./build/app.exe",
+            "Remove-Item C:\\temp\\scratch.log",
+            "Remove-Item $HOME\\Documents\\report.docx",
+            // `*.pub` is the public half of a key pair: protected directory,
+            // exempt file. The shared classifier owns that carve-out.
+            "Remove-Item $HOME\\.ssh\\id_rsa.pub",
+            // `-WhatIf` reports the removal without performing it, the same
+            // carve-out the recursive arm makes.
+            "Remove-Item $HOME\\.ssh\\id_rsa -WhatIf",
+            "Remove-Item -WhatIf $HOME\\.ssh\\id_rsa",
+            // A non-delete cmdlet that merely names the path.
+            "Get-Content $HOME\\.ssh\\id_rsa",
+            "Get-ChildItem $HOME\\.ssh",
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::PowerShell),
+                    RmParseDecision::NoMatch | RmParseDecision::Allow
+                ),
+                "{command} must stay allowed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cmd_protected_file_tests {
+    use super::*;
+
+    /// A plain cmd `del` of a protected file (#451).
+    ///
+    /// The cmd decoder only runs for commands carrying `^`, so the ordinary
+    /// spelling reached no protected-file judgment at all. Measured before the
+    /// fix: five protected targets and every `del`/`erase` switch combination
+    /// allowed, while `rm ~/.ssh/id_rsa` denied.
+    #[test]
+    fn cmd_delete_of_a_protected_file_denies_issue_451() {
+        for target in [
+            "%USERPROFILE%\\.ssh\\id_rsa",
+            "%USERPROFILE%\\.ssh\\authorized_keys",
+            "%USERPROFILE%\\.aws\\credentials",
+            "%USERPROFILE%\\.bashrc",
+            "%HOMEPATH%\\.ssh\\id_rsa",
+            "%userprofile%\\.ssh\\id_rsa",
+            // POSIX spellings reach cmd too: a caller can pass either.
+            "~/.ssh/id_rsa",
+            "$HOME/.ssh/id_rsa",
+        ] {
+            for verb in ["del", "erase", "del /f", "del /q", "del /f /q"] {
+                let command = format!("{verb} {target}");
+                match parse_rm_command_segment_in_dialect(&command, false, ShellDialect::Cmd) {
+                    RmParseDecision::Deny(hit) => {
+                        assert_eq!(
+                            hit.pattern_name, RM_PROTECTED_FILE_NAME,
+                            "{command} must deny under the same rule the POSIX twin uses"
+                        );
+                        assert_eq!(hit.severity, Severity::Critical);
+                    }
+                    other => unreachable!(
+                        "cmd delete of a protected file must deny: {command}: {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The removed `['^', '%', '!']` prefilter must not make the signal fire
+    /// for every cmd command (#451).
+    ///
+    /// Negative control for dropping it: if this were always true,
+    /// core.filesystem would be force-selected on every cmd payload and the
+    /// quick-reject would stop meaning anything.
+    #[test]
+    fn ordinary_cmd_commands_still_skip_the_semantic_scan_issue_451() {
+        for command in [
+            "dir C:\\src",
+            "type C:\\app\\x.conf",
+            "echo hello",
+            "copy a.txt b.txt",
+            "move a.txt b.txt",
+            "cd %USERPROFILE%",
+            "set PATH=%PATH%;C:\\bin",
+        ] {
+            assert!(
+                !crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    command,
+                    ShellDialect::Cmd
+                ),
+                "an ordinary cmd command must not force core.filesystem selection: {command}"
+            );
+        }
+        for command in ["del %USERPROFILE%\\.ssh\\id_rsa", "erase ~/.ssh/id_rsa"] {
+            assert!(
+                crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    command,
+                    ShellDialect::Cmd
+                ),
+                "a cmd delete verb must force core.filesystem selection: {command}"
+            );
+        }
+    }
+
+    /// The cmd rule turns on the TARGET, not on the verb (#451).
+    #[test]
+    fn cmd_protected_delete_still_turns_on_the_target_issue_451() {
+        for command in [
+            "del C:\\temp\\scratch.log",
+            "del /q .\\build\\app.exe",
+            "del %USERPROFILE%\\Documents\\report.docx",
+            // The public half of a key pair stays exempt.
+            "del %USERPROFILE%\\.ssh\\id_rsa.pub",
+            // Reading is not deleting.
+            "type %USERPROFILE%\\.ssh\\id_rsa",
+            "dir %USERPROFILE%\\.ssh",
+            // `rd`/`rmdir` remove a directory; the recursive rules own those.
+            "rd /s /q %USERPROFILE%\\.ssh",
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::Cmd),
+                    RmParseDecision::NoMatch | RmParseDecision::Allow
+                ),
+                "{command} must not deny under {RM_PROTECTED_FILE_NAME}"
+            );
+        }
     }
 }

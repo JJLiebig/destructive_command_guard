@@ -112,7 +112,9 @@ impl OutputFormat {
 /// destructive commands by AI coding agents. It blocks dangerous git commands,
 /// filesystem operations, database queries, and more.
 #[derive(Parser, Debug)]
-#[command(name = "dcg")]
+// `bin_name` pins usage lines to `dcg`; otherwise clap takes argv[0] and
+// Windows help reads `Usage: dcg.exe ...`, unlike every documented example.
+#[command(name = "dcg", bin_name = "dcg")]
 #[command(version, about, long_about = None)]
 #[command(after_help = "Run 'dcg doctor' to verify your installation.")]
 pub struct Cli {
@@ -216,11 +218,14 @@ pub enum Command {
 
     /// Run in hook mode with batch processing support
     ///
-    /// Explicit hook mode for processing commands from stdin. When `--batch` is
-    /// specified, reads JSONL (one JSON hook input per line) and outputs JSONL
-    /// with decisions.
+    /// Explicit hook mode for processing commands from stdin. Any batch option
+    /// — `--batch`, `--parallel`, `--workers`, `--continue-on-error` or
+    /// `--with-packs` — reads JSONL (one JSON hook input per line), outputs
+    /// JSONL with decisions, and exits non-zero if any line was denied.
     ///
-    /// Without `--batch`, behaves identically to running `dcg` with no subcommand.
+    /// With no batch option, `dcg hook` behaves identically to running `dcg`
+    /// with no subcommand: one hook payload in, one agent-protocol response out,
+    /// carrying a denial on stdout with exit 0.
     #[command(name = "hook")]
     Hook(HookCommand),
 
@@ -307,7 +312,7 @@ pub enum Command {
     },
 
     /// Install the hook into Claude Code settings (or another agent with
-    /// `--grok`, `--agy`, `--opencode`, `--omp`, or `--crush`)
+    /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, or `--reasonix`)
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -324,7 +329,7 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush", "reasonix"])]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -332,7 +337,7 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush", "reasonix"])]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -342,7 +347,7 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush", "reasonix"])]
         opencode: bool,
 
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
@@ -351,7 +356,7 @@ pub enum Command {
         /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
         /// extension discovery is cwd-only and does not walk Git ancestors.
         /// Every OMP bash tool call is routed through dcg before execution.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush", "reasonix"])]
         omp: bool,
 
         /// Install the dcg PreToolUse hook for Charm Crush by merging a
@@ -360,8 +365,18 @@ pub enum Command {
         /// and `CRUSH_GLOBAL_CONFIG`) or the repo's `crush.json` (with
         /// `--project`). Crush pipes every bash tool call to dcg's stdin and
         /// blocks the call when dcg answers `{"decision":"deny"}`.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "reasonix"])]
         crush: bool,
+
+        /// Install the dcg PreToolUse hook for Reasonix by merging a
+        /// `hooks.PreToolUse` entry (match `bash|pwsh`) into
+        /// `<Reasonix home>/settings.json` (`~/.reasonix`, `%APPDATA%\reasonix`
+        /// on Windows, or `REASONIX_HOME`) or the repo's
+        /// `.reasonix/settings.json` (with `--project`). Reasonix pipes every
+        /// shell tool call to dcg's stdin and blocks it when dcg exits 2.
+        /// Restart Reasonix afterwards: hooks load when a session is built.
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush"])]
+        reasonix: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -384,7 +399,8 @@ pub enum Command {
         no_shell_check: bool,
     },
 
-    /// Remove the hook from Claude Code settings (or from Crush with `--crush`)
+    /// Remove the hook from Claude Code settings (or from Crush with `--crush`,
+    /// Reasonix with `--reasonix`)
     #[command(name = "uninstall")]
     Uninstall {
         /// Also remove configuration files
@@ -393,8 +409,13 @@ pub enum Command {
 
         /// Remove the dcg hook entry from `~/.config/crush/crush.json` instead
         /// of Claude Code settings
-        #[arg(long, conflicts_with = "purge")]
+        #[arg(long, conflicts_with_all = ["purge", "reasonix"])]
         crush: bool,
+
+        /// Remove the dcg hook entry from `<Reasonix home>/settings.json`
+        /// instead of Claude Code settings
+        #[arg(long, conflicts_with = "purge")]
+        reasonix: bool,
     },
 
     /// Update dcg to the latest release (re-runs the installer)
@@ -453,9 +474,16 @@ pub enum Command {
     /// `dcg test` evaluates the command line you give it.
     ///
     /// The hook is told which tool it is gating, so a `Bash` payload is
-    /// evaluated as POSIX. `dcg test` has no such context and evaluates the
-    /// conservative union of the POSIX, PowerShell and Cmd views, which can
-    /// deny where the hook allows.
+    /// evaluated as POSIX. `dcg test` has no such context and defaults to
+    /// `--dialect unknown`, which can deny where the hook allows.
+    ///
+    /// That union is not proven complete in both directions, so do not read an
+    /// `allow` here as "no hook would block this". The example this warning
+    /// used to carry is fixed — `Remove-Item -Recurse -Force /etc` denied under
+    /// `--dialect ps` and was ALLOWED by the default, and now denies under both
+    /// (#491) — but only that one command was measured, not every pack. Pass
+    /// the dialect you actually care about when the answer matters;
+    /// `--dialect posix` reproduces the `Bash` hook path exactly (#451).
     #[command(name = "test")]
     TestCommand {
         /// Command to test
@@ -1904,7 +1932,18 @@ pub enum SimulateFormat {
 /// pin the same dialect the hook resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DialectArg {
-    /// Evaluate every dialect (CLI default; matches no single hook path)
+    /// Union over dialects (CLI default; matches no single hook path).
+    ///
+    /// The semantic delete front ends are covered here as of #491:
+    /// `Remove-Item -Recurse -Force /etc`, which used to deny under `ps` and
+    /// allow here, now denies at this dialect too.
+    ///
+    /// Completeness across every pack is NOT claimed, because it has not been
+    /// measured. An `allow` at this dialect is evidence, not proof, that no hook
+    /// would block the command. This is also the dialect the hook itself
+    /// resolves for any tool name that is not `bash`/`powershell`/`pwsh`/`cmd`,
+    /// so any remaining gap is reachable from a real payload rather than
+    /// CLI-only (#451).
     #[default]
     Unknown,
     /// POSIX shell — the dialect the `Bash` PreToolUse hook resolves
@@ -2156,9 +2195,15 @@ pub struct AllowOnceCommand {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Allow a single use only (consumed after first allow) (apply-only)
-    #[arg(long)]
+    /// Allow a single use only (consumed after first allow). This is the
+    /// default; the flag is kept so existing scripts keep working (apply-only)
+    #[arg(long, conflicts_with = "reusable")]
     pub single_use: bool,
+
+    /// Keep the grant reusable until it expires instead of consuming it on
+    /// first use (the pre-#378 default) (apply-only)
+    #[arg(long)]
+    pub reusable: bool,
 
     /// Override explicit config blocklist (extra confirmation required) (apply-only)
     #[arg(long)]
@@ -2376,6 +2421,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (Config::load(), None)
     };
+    crate::output::install_theme_config(&config);
     let verbosity = Verbosity::from_cli(&cli);
     let explicit_omp_agent = is_explicit_omp_agent(cli.agent.as_deref());
     maybe_show_update_notice(&cli, &config, verbosity);
@@ -2418,6 +2464,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             opencode,
             omp,
             crush,
+            reasonix,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
@@ -2429,6 +2476,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 install_omp_extension(force, project, true)?;
             } else if crush {
                 install_crush_hook(force, project)?;
+            } else if reasonix {
+                install_reasonix_hook(force, project)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -2440,9 +2489,15 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             run_setup(force, shell_check, no_shell_check)?;
         }
-        Some(Command::Uninstall { purge, crush }) => {
+        Some(Command::Uninstall {
+            purge,
+            crush,
+            reasonix,
+        }) => {
             if crush {
                 uninstall_crush_hook()?;
+            } else if reasonix {
+                uninstall_reasonix_hook()?;
             } else {
                 uninstall_hook(purge)?;
             }
@@ -2886,6 +2941,32 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
     };
 
+    // A PowerShell or Cmd payload activates the windows.* packs on any host
+    // (#451). The plain hook path computes that from the payload it just read;
+    // this reader builds one pack set for the WHOLE stream before reading any
+    // line, so it could only ever ask the payload-blind question — and the
+    // same command that denied through `dcg` was allowed through
+    // `dcg hook --batch` (#493).
+    //
+    // Both views are built up front rather than lazily. It costs one extra
+    // keyword-index build per invocation, on a bulk path that is not the hook
+    // hot path, and in exchange the per-line choice is a borrow rather than a
+    // build — so the rayon loop below composes with it unchanged, with no
+    // synchronisation. When the two pack sets are identical (a Windows host,
+    // or a config that already enables the windows packs) the second view is
+    // not built at all and every line uses the first.
+    let windows_view = build_windows_payload_view(config, cmd, external_store, &enabled_packs);
+    let windows_view_ref = windows_view.as_ref().map(|view| PackView {
+        enabled_keywords: &view.0,
+        ordered_packs: &view.1,
+        keyword_index: view.2.as_ref(),
+    });
+    let base_view = PackView {
+        enabled_keywords: &enabled_keywords,
+        ordered_packs: &ordered_packs,
+        keyword_index: keyword_index.as_ref(),
+    };
+
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout_lock = stdout.lock();
@@ -2898,7 +2979,8 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
     //   definitive decision, the process exits non-zero so a caller can gate
     //   on the exit code, like `dcg test` does (issues #148, #213).
     // - `parse_halt`: without `--continue-on-error`, the first malformed line
-    //   emits an `error` result and then halts processing (issue #165).
+    //   emits an `error` result and then halts processing (issue #165). A line
+    //   stdin could not decode counts as malformed here (issue #430).
     let mut emit_index = 0usize;
     let mut any_blocked = false;
     let mut parse_halt = false;
@@ -2907,13 +2989,23 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
         // Parallel processing: collect all non-blank lines, evaluate in
         // parallel, then emit in input order. Blank lines are dropped here so
         // they neither create indexed entries nor consume an index (#154).
-        let lines: Vec<(usize, String)> = stdin
-            .lock()
-            .lines()
-            .map_while(std::result::Result::ok)
-            .filter(|l| !l.trim().is_empty())
-            .enumerate()
-            .collect();
+        // A decode failure is KEPT so it becomes an `error` result. Dropping it
+        // (and, with `map_while`, everything after it) silently shortened the
+        // batch and still exited 0 — see `batch_line_outcome`.
+        let mut lines: Vec<(usize, std::io::Result<String>)> = Vec::new();
+        let mut read_halt = false;
+        for line in stdin.lock().lines() {
+            // Blank lines are skipped entirely: no output, no index (#154).
+            if line.as_ref().is_ok_and(|text| text.trim().is_empty()) {
+                continue;
+            }
+            let can_continue = batch_read_can_continue(&line);
+            lines.push((lines.len(), line));
+            if !can_continue {
+                read_halt = true;
+                break;
+            }
+        }
 
         #[cfg(feature = "rayon")]
         let mut results: Vec<(usize, BatchHookOutput)> = {
@@ -2924,12 +3016,11 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                 .map(|(order, line)| {
                     (
                         order,
-                        evaluate_batch_line(
+                        batch_line_outcome(
                             config,
-                            &line,
-                            &enabled_keywords,
-                            &ordered_packs,
-                            keyword_index.as_ref(),
+                            line,
+                            base_view,
+                            windows_view_ref,
                             &compiled_overrides,
                             &allowlists,
                             &heredoc_settings,
@@ -2945,12 +3036,11 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
             .map(|(order, line)| {
                 (
                     order,
-                    evaluate_batch_line(
+                    batch_line_outcome(
                         config,
-                        &line,
-                        &enabled_keywords,
-                        &ordered_packs,
-                        keyword_index.as_ref(),
+                        line,
+                        base_view,
+                        windows_view_ref,
                         &compiled_overrides,
                         &allowlists,
                         &heredoc_settings,
@@ -2979,40 +3069,33 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                 break;
             }
         }
+
+        // Reading stopped before EOF, so the batch is short of the input even
+        // though every collected line was emitted. Report that as a halt rather
+        // than exiting 0 on a truncated batch (#430).
+        if read_halt {
+            parse_halt = true;
+        }
     } else {
         // Sequential processing: stream input to output.
         for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => {
-                    if cmd.continue_on_error {
-                        let result = BatchHookOutput {
-                            index: emit_index,
-                            decision: "error",
-                            mode: None,
-                            rule_id: None,
-                            pack_id: None,
-                            error: Some(format!("IO error: {e}")),
-                        };
-                        emit_index += 1;
-                        writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-            };
-
             // Blank lines are skipped entirely: no output, no index (#154).
-            if line.trim().is_empty() {
+            if line.as_ref().is_ok_and(|text| text.trim().is_empty()) {
                 continue;
             }
 
-            let mut result = evaluate_batch_line(
+            // A decode failure is an `error` result on exactly the same footing
+            // as a malformed line: reported with its index, upgraded to `deny`
+            // under fail-closed, and halting unless `--continue-on-error`
+            // (#430). Handling it separately here meant `--continue-on-error`
+            // skipped the fail-closed upgrade and left the exit code at 0, and
+            // the default path returned a bare `Err` with no result line at all.
+            let can_continue = batch_read_can_continue(&line);
+            let mut result = batch_line_outcome(
                 config,
-                &line,
-                &enabled_keywords,
-                &ordered_packs,
-                keyword_index.as_ref(),
+                line,
+                base_view,
+                windows_view_ref,
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
@@ -3027,7 +3110,10 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
             if matches!(result.decision, "deny" | "indeterminate") {
                 any_blocked = true;
             }
-            let halt = result.decision == "error" && !cmd.continue_on_error;
+            // `!can_continue` also halts: reading cannot make progress, so
+            // stopping here is the only option, and the truncated batch must not
+            // exit 0 (#430).
+            let halt = (result.decision == "error" && !cmd.continue_on_error) || !can_continue;
             writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
             if halt {
                 parse_halt = true;
@@ -3039,7 +3125,8 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
     // Exit code contract for `dcg hook` (issues #148, #165):
     // - any deny/indeterminate -> EXIT_DENIED (1): callers can gate on the
     //   exit code, and incomplete safety analysis never becomes success.
-    // - parse halt -> EXIT_PARSE_ERROR (4): a malformed line stopped processing.
+    // - parse halt -> EXIT_PARSE_ERROR (4): a malformed or undecodable line
+    //   stopped processing before the end of the input.
     // - otherwise  -> EXIT_SUCCESS (0).
     let exit_code = if any_blocked {
         crate::exit_codes::EXIT_DENIED
@@ -3051,6 +3138,131 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
     Ok(exit_code)
 }
 
+/// Whether `BufRead::lines()` can still make progress after this outcome.
+///
+/// `read_line` reports `InvalidData` only after `read_until` has already
+/// consumed the offending bytes, so the next call reads the following line and
+/// the undecodable one can be reported as an `error` result and left behind.
+/// Any other I/O error may have consumed nothing, in which case `Lines` hands
+/// back the same failure on every subsequent call — so reading stops instead of
+/// spinning, and the caller learns the batch was truncated through the
+/// `parse_halt` exit code (#430).
+fn batch_read_can_continue(line: &std::io::Result<String>) -> bool {
+    match line {
+        Ok(_) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::InvalidData,
+    }
+}
+
+/// One batch result for one input line, including a line stdin could not decode.
+///
+/// A line stdin cannot decode must produce an `error` result rather than vanish,
+/// and both batch paths route through here so they agree on it (issue #430).
+///
+/// The parallel path used `map_while(Result::ok)`, which stops at the first
+/// decode failure and discards every line after it, so one stray byte silently
+/// truncated the batch — and because no `error` result was emitted,
+/// `any_blocked` stayed false and the process exited 0. A caller saw success
+/// plus fewer result lines than it sent, with the unevaluated commands
+/// unreported. The sequential path did report the line under
+/// `--continue-on-error`, but built the result by hand and so skipped the
+/// fail-closed upgrade to `deny` and the non-zero exit; without that flag it
+/// returned a bare `Err` and emitted no result line at all.
+///
+/// Returning the result instead lets the shared emit loop apply fail-closed,
+/// assign the index, and decide the exit code, exactly as it does for a
+/// syntactically malformed line.
+#[allow(clippy::too_many_arguments)]
+/// The pack-derived evaluation inputs for one `dcg hook` line.
+///
+/// `dcg hook` builds these once for the whole stream, which is why the
+/// payload-driven `windows.*` activation needed a second view rather than a
+/// recomputation (#493). Borrowed, never owned, so selecting between views is
+/// free and thread-safe inside the rayon loop.
+#[derive(Clone, Copy)]
+struct PackView<'a> {
+    enabled_keywords: &'a [&'a str],
+    ordered_packs: &'a [String],
+    keyword_index: Option<&'a crate::packs::EnabledKeywordIndex>,
+}
+
+/// Build the windows-payload pack view, or `None` when it would be identical
+/// to the base view (a Windows host, or a config that already enables them).
+///
+/// Mirrors the base construction above step for step — `--with-packs`,
+/// external packs, ordered expansion, and the index's external-pack carve-out
+/// — because a view that disagreed with the base on anything except the
+/// `windows.*` packs would make the two paths differ for a second reason.
+fn build_windows_payload_view(
+    config: &Config,
+    cmd: &HookCommand,
+    external_store: &crate::packs::ExternalPackStore,
+    base_pack_ids: &std::collections::HashSet<String>,
+) -> Option<(
+    Vec<&'static str>,
+    Vec<String>,
+    Option<crate::packs::EnabledKeywordIndex>,
+)> {
+    let mut packs = config.enabled_pack_ids_for_payload(true);
+    if let Some(extra) = cmd.with_packs.as_ref() {
+        for pack in extra {
+            packs.insert(pack.clone());
+        }
+    }
+    for id in external_store.pack_ids() {
+        packs.insert(id.clone());
+    }
+    if &packs == base_pack_ids {
+        return None;
+    }
+    let mut keywords = REGISTRY.collect_enabled_keywords(&packs);
+    keywords.extend(external_store.keywords().iter().copied());
+    let mut ordered = REGISTRY.expand_enabled_ordered(&packs);
+    for id in external_store.pack_ids() {
+        if !ordered.contains(id) {
+            ordered.push(id.clone());
+        }
+    }
+    let index = if external_store.pack_ids().next().is_some() {
+        None
+    } else {
+        REGISTRY.build_enabled_keyword_index(&ordered)
+    };
+    Some((keywords, ordered, index))
+}
+
+fn batch_line_outcome(
+    config: &Config,
+    line: std::io::Result<String>,
+    base_view: PackView<'_>,
+    windows_view: Option<PackView<'_>>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &crate::allowlist::LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+) -> BatchHookOutput {
+    match line {
+        Ok(text) => evaluate_batch_line(
+            config,
+            &text,
+            base_view,
+            windows_view,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+        ),
+        // `index` is assigned by the emit loop, which also applies fail-closed
+        // and sets the non-zero exit.
+        Err(error) => BatchHookOutput {
+            index: 0,
+            decision: "error",
+            mode: None,
+            rule_id: None,
+            pack_id: None,
+            error: Some(format!("IO error: {error}")),
+        },
+    }
+}
+
 /// Evaluate a single batch line and return the result.
 ///
 /// The returned `index` is a placeholder (`0`); the caller assigns the real
@@ -3059,9 +3271,8 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
 fn evaluate_batch_line(
     config: &Config,
     line: &str,
-    enabled_keywords: &[&str],
-    ordered_packs: &[String],
-    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    base_view: PackView<'_>,
+    windows_view: Option<PackView<'_>>,
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &crate::allowlist::LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
@@ -3124,23 +3335,54 @@ fn evaluate_batch_line(
     // a fail-open once `[policy]` could turn that entry into a warn/log
     // `allow` (#330): the entries after it were never evaluated.
     let project_path = std::env::current_dir().ok();
-    let mut decisive: Option<BatchEntryOutcome> = None;
-    for (command, dialect) in
+    let entries: Vec<(String, crate::normalize::ShellDialect)> =
         std::iter::once((extracted_command.command, extracted_command.dialect))
             .chain(extracted_command.additional_commands)
-    {
-        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            .collect();
+
+    // Decide the pack set for the LINE, not per entry, and by the same rule
+    // `main.rs` uses: an explicit PowerShell/Cmd dialect, or a payload whose
+    // own shape says Windows even though the tool label said `Bash`. Deciding
+    // per line rather than per entry is what keeps this identical to the plain
+    // path, which activates the packs for the whole request once any entry
+    // qualifies (#493).
+    let windows_payload = entries.iter().any(|(command, dialect)| match dialect {
+        crate::normalize::ShellDialect::PowerShell | crate::normalize::ShellDialect::Cmd => true,
+        crate::normalize::ShellDialect::Unknown => {
+            crate::hook::command_is_windows_shell_payload(command)
+        }
+        crate::normalize::ShellDialect::Posix => false,
+    });
+    let view = if windows_payload {
+        windows_view.unwrap_or(base_view)
+    } else {
+        base_view
+    };
+
+    let mut decisive: Option<BatchEntryOutcome> = None;
+    for (command, dialect) in entries {
+        let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                view.enabled_keywords,
+                view.ordered_packs,
+                view.keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path.as_deref(), // scope path-aware allowlist entries (#186)
+                None,                    // No deadline for batch mode
+                dialect,
+            )
+        };
+        // A warn/log/ask first match must not hide a later deny (#498).
+        let result = crate::evaluator::escalate_masked_findings(
+            config,
             &command,
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
-            compiled_overrides,
             allowlists,
-            heredoc_settings,
-            None,
-            project_path.as_deref(), // scope path-aware allowlist entries (#186)
-            None,                    // No deadline for batch mode
-            dialect,
+            evaluate(&command, allowlists),
+            evaluate,
         );
         let outcome = resolve_batch_entry(config, &command, result);
         if decisive
@@ -3552,9 +3794,14 @@ fn pack_info(
     pack_id: &str,
     show_patterns: bool,
     json_output: bool,
+    external_store: &ExternalPackStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // External packs participate in evaluation and `dcg packs`; `pack info`
+    // must resolve against the same loaded store rather than consulting only
+    // the built-in registry (#437).
     let pack = REGISTRY
         .get(pack_id)
+        .or_else(|| external_store.get(pack_id))
         .ok_or_else(|| format!("Pack not found: {pack_id}"))?;
 
     if json_output {
@@ -3705,7 +3952,7 @@ fn pack_info(
 
 /// Handle all `dcg pack` subcommands
 fn handle_pack_command(
-    _config: &Config,
+    config: &Config,
     action: PackAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
@@ -3714,7 +3961,9 @@ fn handle_pack_command(
             no_patterns,
             json,
         } => {
-            pack_info(&pack_id, !no_patterns, json)?;
+            let external_paths = config.packs.expand_custom_paths();
+            let external_store = load_external_packs(&external_paths);
+            pack_info(&pack_id, !no_patterns, json, external_store)?;
         }
         PackAction::Validate {
             file_path,
@@ -4385,7 +4634,9 @@ fn prompt_allowlist_target(rule_id: Option<&str>) -> InteractiveAllowlistTarget 
 fn prompt_allowlist_path_scope() -> Vec<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let scope_path = cwd.canonicalize().unwrap_or(cwd);
-    let scope_path_str = scope_path.to_string_lossy().into_owned();
+    // The form scope matching compares against: `/`-separated, without the
+    // Windows `\\?\` prefix `canonicalize` adds.
+    let scope_path_str = crate::allowlist::normalize_resolved_path(&scope_path);
 
     let scoped = format!("Current directory only ({scope_path_str})");
     let global = "All directories (global)".to_string();
@@ -4919,18 +5170,29 @@ fn test_command(
     // Use shared evaluator for consistent behavior with hook mode
     let project_path = std::env::current_dir().ok();
     let start = Instant::now();
-    let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+    let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
+        evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            allowlists,
+            &heredoc_settings,
+            None,                    // allow_once_audit
+            project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+            evaluation_deadline.as_ref(),
+            dialect.into(),
+        )
+    };
+    // Same escalation the hook applies, so `dcg test` reports the deny a
+    // warn/log/ask first match would otherwise hide (#498).
+    let mut result = crate::evaluator::escalate_masked_findings(
+        &effective_config,
         command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
         &allowlists,
-        &heredoc_settings,
-        None,                    // allow_once_audit
-        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
-        evaluation_deadline.as_ref(),
-        dialect.into(),
+        evaluate(command, &allowlists),
+        evaluate,
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -5557,17 +5819,27 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
 
     // Evaluate the command
     let project_path = std::env::current_dir().ok();
-    let result = evaluate_command_with_pack_order_deadline_at_path(
+    let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
+        evaluate_command_with_pack_order_deadline_at_path(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            allowlists,
+            &heredoc_settings,
+            None,                    // allow_once_audit
+            project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+            None,                    // deadline
+        )
+    };
+    // A warn/log/ask first match must not hide a later deny (#498).
+    let result = crate::evaluator::escalate_masked_findings(
+        &effective_config,
         command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
         &allowlists,
-        &heredoc_settings,
-        None,                    // allow_once_audit
-        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
-        None,                    // deadline
+        evaluate(command, &allowlists),
+        evaluate,
     );
 
     // Map EvaluationResult to classification
@@ -6534,7 +6806,7 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     // Removed config keys (#327): a key that parses but is never enforced is
     // indistinguishable from one that simply didn't match, so say it here —
     // the command a user actually runs to check their configuration.
-    let removed_key_warnings = config.overrides.removed_key_warnings();
+    let removed_key_warnings = config.inert_config_warnings();
     if !removed_key_warnings.is_empty() {
         println!();
         println!("Warnings:");
@@ -6649,7 +6921,7 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "packs": policy_packs_view,
             "rules": policy_rules_view,
         },
-        "warnings": config.overrides.removed_key_warnings(),
+        "warnings": config.inert_config_warnings(),
     });
 
     println!(
@@ -7952,20 +8224,37 @@ fn handle_explain(
     // Start tracing
     let mut collector = TraceCollector::new(command);
 
+    // Scope path-aware allowlist entries (#186) to where explain runs, exactly
+    // as `dcg test` does. Passing no path made every `paths = [...]` grant
+    // inapplicable here, so explain reported DENY for a command the hook and
+    // `dcg test` both allow.
+    let project_path = std::env::current_dir().ok();
+
     // Evaluate with timing
     collector.begin_step();
-    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+    let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
+        evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            allowlists,
+            &heredoc_settings,
+            None, // allow_once_audit
+            project_path.as_deref(),
+            None, // deadline
+            dialect.into(),
+        )
+    };
+    // Explain the deny the hook enforces, not a warn/log/ask first match that
+    // would have hidden it (#498).
+    let result = crate::evaluator::escalate_masked_findings(
+        &effective_config,
         command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
         &allowlists,
-        &heredoc_settings,
-        None, // allow_once_audit
-        None, // project_path
-        None, // deadline
-        dialect.into(),
+        evaluate(command, &allowlists),
+        evaluate,
     );
     collector.end_step(
         "full_evaluation",
@@ -7990,27 +8279,41 @@ fn handle_explain(
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // project_path: matches the evaluation above
+        project_path.as_deref(), // matches the evaluation above
     );
 
-    // Add match info if present
-    if let Some(ref pattern) = result.pattern_info {
-        let rule_id = pattern
+    let match_info = |pattern: &crate::evaluator::PatternMatch| MatchInfo {
+        rule_id: pattern
             .pack_id
             .as_ref()
             .zip(pattern.pattern_name.as_ref())
-            .map(|(pack, name)| format!("{pack}:{name}"));
-        collector.set_match(MatchInfo {
-            rule_id,
-            pack_id: pattern.pack_id.clone(),
-            pattern_name: pattern.pattern_name.clone(),
-            severity: pattern.severity,
-            reason: pattern.reason.clone(),
-            source: pattern.source,
-            match_start: pattern.matched_span.map(|s| s.start),
-            match_end: pattern.matched_span.map(|s| s.end),
-            matched_text_preview: pattern.matched_text_preview.clone(),
-            explanation: pattern.explanation.clone(),
+            .map(|(pack, name)| format!("{pack}:{name}")),
+        pack_id: pattern.pack_id.clone(),
+        pattern_name: pattern.pattern_name.clone(),
+        severity: pattern.severity,
+        reason: pattern.reason.clone(),
+        source: pattern.source,
+        match_start: pattern.matched_span.map(|s| s.start),
+        match_end: pattern.matched_span.map(|s| s.end),
+        matched_text_preview: pattern.matched_text_preview.clone(),
+        explanation: pattern.explanation.clone(),
+    };
+
+    // Add match info if present
+    if let Some(ref pattern) = result.pattern_info {
+        collector.set_match(match_info(pattern));
+    }
+
+    // An allowlisted command is an ALLOW that configuration produced: name the
+    // layer, the entry's reason, and the rule it lifted. The trace renderers
+    // (pretty, compact, JSON) always had a section for this, but nothing ever
+    // filled it, so explain reported a bare ALLOW with no hint of which grant
+    // caused it — the one question explain exists to answer.
+    if let Some(ref allowlisted) = result.allowlist_override {
+        collector.set_allowlist(crate::trace::AllowlistInfo {
+            layer: allowlisted.layer,
+            entry_reason: allowlisted.reason.clone(),
+            original_match: match_info(&allowlisted.matched),
         });
     }
 
@@ -8600,7 +8903,7 @@ fn handle_stats_command(
     } else if let Some(ref log_file) = config.general.log_file {
         // Expand ~ in path
         if log_file.starts_with("~/") {
-            dirs::home_dir().map_or_else(
+            crate::config::home_dir().map_or_else(
                 || std::path::PathBuf::from(log_file),
                 |h| h.join(&log_file[2..]),
             )
@@ -8609,7 +8912,7 @@ fn handle_stats_command(
         }
     } else {
         // Default log file location
-        dirs::data_local_dir()
+        crate::config::user_data_local_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
             .join("dcg")
             .join("blocked.log")
@@ -10721,7 +11024,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     let grok_session_present = std::env::var_os("GROK_SESSION_ID").is_some()
         || std::env::var_os("GROK_HOOK_EVENT").is_some()
         || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
-    let grok_home = dirs::home_dir().map(|h| h.join(".grok"));
+    let grok_home = crate::config::home_dir().map(|h| h.join(".grok"));
     let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
     if grok_session_present || grok_home_exists {
         print!("Checking Grok hook registration... ");
@@ -10826,6 +11129,44 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 issues += 1;
                 println!("  {} cannot be parsed: {err}", config_path.display());
                 println!("  → Fix the JSON by hand, then run 'dcg install --crush'");
+            }
+        }
+    }
+
+    // Check 3b1b: Reasonix hook registration (#358). Reasonix reads native
+    // hooks only from its own settings.json; an unregistered hook means the
+    // guard is not guarding.
+    if reasonix_appears_in_use() {
+        print!("Checking Reasonix hook registration... ");
+        let settings_path = reasonix_user_settings_path();
+        match reasonix_user_settings_register_dcg() {
+            Ok(true) => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", settings_path.display());
+            }
+            Ok(false) => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                if fix {
+                    println!("  Attempting install...");
+                    if install_reasonix_hook_at(&settings_path, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!(
+                        "  → Run 'dcg install --reasonix' to register the hook in {}",
+                        settings_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                println!("{}", "INVALID".red());
+                issues += 1;
+                println!("  {} cannot be parsed: {err}", settings_path.display());
+                println!("  → Fix the JSON by hand, then run 'dcg install --reasonix'");
             }
         }
     }
@@ -10977,46 +11318,57 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     if opencode_appears_in_use() {
         print!("Checking OpenCode plugin registration... ");
         let plugin_path = opencode_user_plugin_path();
-        match probe_opencode_plugin(&plugin_path) {
-            OpencodePluginProbe::Current => {
-                println!("{}", "OK".green());
-                println!("  Found: {}", plugin_path.display());
-            }
-            OpencodePluginProbe::OwnedStale => {
-                println!("{}", "OUTDATED OR MODIFIED".red());
-                issues += 1;
-                println!(
-                    "  {} is dcg-owned but does not match the canonical plugin \
-                     (edited, stubbed, or generated by another dcg version)",
-                    plugin_path.display()
-                );
-                if fix {
-                    println!("  Attempting plugin refresh...");
-                    if install_opencode_plugin(true, false).is_ok() {
-                        println!("  {}", "Fixed!".green());
-                        fixed += 1;
-                    } else {
-                        println!("  {}", "Failed to fix".red());
+        {
+            match probe_opencode_plugin(&plugin_path) {
+                OpencodePluginProbe::Current => {
+                    println!("{}", "OK".green());
+                    println!("  Found: {}", plugin_path.display());
+                    // The plugin carries both contracts, so the version is
+                    // reported rather than gating anything (#419).
+                    if let Some(major) = detected_opencode_major_version() {
+                        println!(
+                            "  OpenCode v{major} detected; the plugin exports both the v1 and v2 shapes"
+                        );
                     }
-                } else {
-                    println!("  → Run 'dcg install --opencode --force' to restore it");
-                    println!("    (a modified plugin may guard nothing)");
                 }
-            }
-            OpencodePluginProbe::MissingOrUnowned => {
-                println!("{}", "NOT REGISTERED".yellow());
-                issues += 1;
-                if fix {
-                    println!("  Attempting plugin install...");
-                    if install_opencode_plugin(false, false).is_ok() {
-                        println!("  {}", "Fixed!".green());
-                        fixed += 1;
+                OpencodePluginProbe::OwnedStale => {
+                    println!("{}", "OUTDATED OR MODIFIED".red());
+                    issues += 1;
+                    println!(
+                        "  {} is dcg-owned but does not match the canonical plugin \
+                     (edited, stubbed, or generated by another dcg version)",
+                        plugin_path.display()
+                    );
+                    if fix {
+                        println!("  Attempting plugin refresh...");
+                        if install_opencode_plugin(true, false).is_ok() {
+                            println!("  {}", "Fixed!".green());
+                            fixed += 1;
+                        } else {
+                            println!("  {}", "Failed to fix".red());
+                        }
                     } else {
-                        println!("  {}", "Failed to fix".red());
+                        println!("  → Run 'dcg install --opencode --force' to restore it");
+                        println!("    (a modified plugin may guard nothing)");
                     }
-                } else {
-                    println!("  → Run 'dcg install --opencode' to install the native plugin");
-                    println!("    (OpenCode shell commands are NOT guarded until it is installed)");
+                }
+                OpencodePluginProbe::MissingOrUnowned => {
+                    println!("{}", "NOT REGISTERED".yellow());
+                    issues += 1;
+                    if fix {
+                        println!("  Attempting plugin install...");
+                        if install_opencode_plugin(false, false).is_ok() {
+                            println!("  {}", "Fixed!".green());
+                            fixed += 1;
+                        } else {
+                            println!("  {}", "Failed to fix".red());
+                        }
+                    } else {
+                        println!("  → Run 'dcg install --opencode' to install the native plugin");
+                        println!(
+                            "    (OpenCode shell commands are NOT guarded until it is installed)"
+                        );
+                    }
                 }
             }
         }
@@ -12095,7 +12447,7 @@ fn collect_doctor_report(
     let grok_session_present = std::env::var_os("GROK_SESSION_ID").is_some()
         || std::env::var_os("GROK_HOOK_EVENT").is_some()
         || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
-    let grok_home = dirs::home_dir().map(|h| h.join(".grok"));
+    let grok_home = crate::config::home_dir().map(|h| h.join(".grok"));
     let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
     if grok_session_present || grok_home_exists {
         let user_hook = grok_user_hook_path();
@@ -12198,6 +12550,61 @@ fn collect_doctor_report(
             message,
             remediation,
             fixed: crush_fixed,
+        });
+    }
+
+    // Reasonix hook registration (#358). Mirrored in `doctor_pretty`. Reasonix
+    // reads native hooks only from its own settings.json.
+    if reasonix_appears_in_use() {
+        let mut reasonix_fixed = false;
+        let settings_path = reasonix_user_settings_path();
+        let (status, message, remediation) = match reasonix_user_settings_register_dcg() {
+            Ok(true) => (
+                DoctorCheckStatus::Ok,
+                format!(
+                    "Reasonix dcg hook registered in {}",
+                    settings_path.display()
+                ),
+                None,
+            ),
+            Ok(false) => {
+                issues += 1;
+                if fix && install_reasonix_hook_at(&settings_path, false).is_ok() {
+                    fixed += 1;
+                    reasonix_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!("Installed Reasonix dcg hook in {}", settings_path.display()),
+                        None,
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        format!(
+                            "Reasonix is in use but {} has no dcg PreToolUse hook — its shell \
+                             tool calls are not guarded",
+                            settings_path.display()
+                        ),
+                        Some("Run 'dcg install --reasonix'".to_string()),
+                    )
+                }
+            }
+            Err(err) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!("{} cannot be parsed: {err}", settings_path.display()),
+                    Some("Fix the JSON by hand, then run 'dcg install --reasonix'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "reasonix_hook",
+            name: "Reasonix hook registration",
+            status,
+            message,
+            remediation,
+            fixed: reasonix_fixed,
         });
     }
 
@@ -12367,61 +12774,63 @@ fn collect_doctor_report(
     if opencode_appears_in_use() {
         let plugin_path = opencode_user_plugin_path();
         let mut opencode_fixed = false;
-        let (status, message, remediation) = match probe_opencode_plugin(&plugin_path) {
-            OpencodePluginProbe::Current => (
-                DoctorCheckStatus::Ok,
-                format!("Native OpenCode plugin found at {}", plugin_path.display()),
-                None,
-            ),
-            OpencodePluginProbe::OwnedStale => {
-                issues += 1;
-                if fix && install_opencode_plugin(true, false).is_ok() {
-                    fixed += 1;
-                    opencode_fixed = true;
-                    (
-                        DoctorCheckStatus::Ok,
-                        format!(
-                            "Refreshed native OpenCode plugin at {}",
-                            plugin_path.display()
-                        ),
-                        None,
-                    )
-                } else {
-                    (
-                        DoctorCheckStatus::Error,
-                        format!(
-                            "OpenCode plugin at {} is dcg-owned but does not match the \
+        let (status, message, remediation) = {
+            match probe_opencode_plugin(&plugin_path) {
+                OpencodePluginProbe::Current => (
+                    DoctorCheckStatus::Ok,
+                    format!("Native OpenCode plugin found at {}", plugin_path.display()),
+                    None,
+                ),
+                OpencodePluginProbe::OwnedStale => {
+                    issues += 1;
+                    if fix && install_opencode_plugin(true, false).is_ok() {
+                        fixed += 1;
+                        opencode_fixed = true;
+                        (
+                            DoctorCheckStatus::Ok,
+                            format!(
+                                "Refreshed native OpenCode plugin at {}",
+                                plugin_path.display()
+                            ),
+                            None,
+                        )
+                    } else {
+                        (
+                            DoctorCheckStatus::Error,
+                            format!(
+                                "OpenCode plugin at {} is dcg-owned but does not match the \
                              canonical plugin (edited, stubbed, or generated by another \
                              dcg version) — it may guard nothing",
-                            plugin_path.display()
-                        ),
-                        Some("Run 'dcg install --opencode --force'".to_string()),
-                    )
+                                plugin_path.display()
+                            ),
+                            Some("Run 'dcg install --opencode --force'".to_string()),
+                        )
+                    }
                 }
-            }
-            OpencodePluginProbe::MissingOrUnowned => {
-                // OpenCode has no Claude-compatibility fallback: without the
-                // plugin, its shell calls never reach dcg at all.
-                issues += 1;
-                if fix && install_opencode_plugin(false, false).is_ok() {
-                    fixed += 1;
-                    opencode_fixed = true;
-                    (
-                        DoctorCheckStatus::Ok,
-                        format!(
-                            "Installed native OpenCode plugin at {}",
-                            plugin_path.display()
-                        ),
-                        None,
-                    )
-                } else {
-                    (
+                OpencodePluginProbe::MissingOrUnowned => {
+                    // OpenCode has no Claude-compatibility fallback: without the
+                    // plugin, its shell calls never reach dcg at all.
+                    issues += 1;
+                    if fix && install_opencode_plugin(false, false).is_ok() {
+                        fixed += 1;
+                        opencode_fixed = true;
+                        (
+                            DoctorCheckStatus::Ok,
+                            format!(
+                                "Installed native OpenCode plugin at {}",
+                                plugin_path.display()
+                            ),
+                            None,
+                        )
+                    } else {
+                        (
                         DoctorCheckStatus::Error,
                         "OpenCode is in use but has no dcg plugin — its shell commands are not \
                          guarded"
                             .to_string(),
                         Some("Run 'dcg install --opencode'".to_string()),
                     )
+                    }
                 }
             }
         };
@@ -13200,6 +13609,21 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
     };
 
     let changed = install_dcg_hook_into_settings(&mut settings, force)?;
+
+    // A stale PowerShell `$PROFILE` check (written by an older install.ps1)
+    // can misread the hook command this binary writes and warn "Hook missing"
+    // in every session, pointing the user here (#503). Repair it whether or
+    // not the hook itself changed — "already installed" is exactly the case
+    // the stale check gets wrong.
+    #[cfg(windows)]
+    for profile in repair_powershell_profile_checks() {
+        println!(
+            "{} {}",
+            "Updated the dcg hook check in".green(),
+            profile.display()
+        );
+    }
+
     if !changed {
         println!("{}", "Hook already installed!".yellow());
         println!("Use --force to reinstall");
@@ -13392,7 +13816,7 @@ fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn st
 /// old path to it. Both paths resolve to this file, so editing it is correct
 /// regardless of which one `agy` was last run with.
 fn antigravity_hooks_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".gemini")
         .join("config")
@@ -13436,7 +13860,7 @@ fn crush_user_config_path() -> std::path::PathBuf {
     crush_user_config_path_for(
         std::env::var_os("CRUSH_GLOBAL_CONFIG"),
         std::env::var_os("XDG_CONFIG_HOME"),
-        dirs::home_dir().unwrap_or_default(),
+        crate::config::home_dir().unwrap_or_default(),
     )
 }
 
@@ -13590,11 +14014,21 @@ fn install_crush_hook_into_config(
     let original = hooks.clone();
 
     let previous = remove_dcg_hooks_from_crush_hooks(hooks)?;
+    let desired_keys: Vec<String> = desired_entry
+        .as_object()
+        .map(|desired| desired.keys().cloned().collect())
+        .unwrap_or_default();
     let mut merged = match previous.as_ref().and_then(serde_json::Value::as_object) {
         Some(previous) => {
+            // Owned keys the new entry still carries are overwritten in place
+            // below, so a re-install keeps the key order it wrote the first
+            // time; removing and re-inserting them moved them after `name` and
+            // `timeout`, rewriting an unchanged crush.json on every --force.
             let mut merged = previous.clone();
             for key in DCG_OWNED_CRUSH_HOOK_KEYS {
-                merged.remove(*key);
+                if !desired_keys.iter().any(|desired| desired == key) {
+                    merged.remove(*key);
+                }
             }
             merged
         }
@@ -13764,6 +14198,414 @@ fn crush_appears_in_use() -> bool {
             .is_some_and(std::path::Path::is_dir)
 }
 
+/// The `match` regex dcg's Reasonix hook uses (#358). Reasonix passes hooks
+/// the canonical name of its shell tool: `bash`, or `pwsh` when the host
+/// rebinds the tool to PowerShell (`ResolveCall` in `internal/tool/tool.go` of
+/// esengine/DeepSeek-Reasonix). The match is anchored by Reasonix, so this
+/// names exactly those two tools.
+const REASONIX_SHELL_MATCH: &str = "bash|pwsh";
+
+/// The `hooks` key Reasonix reads for pre-execution hooks.
+const REASONIX_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
+
+/// Reasonix home (#358), resolved as `reasonixHomeDir` in Reasonix's
+/// `internal/config/paths.go` resolves it.
+fn reasonix_home() -> std::path::PathBuf {
+    reasonix_home_for(
+        reasonix_home_override(),
+        std::env::var_os("APPDATA"),
+        cfg!(windows),
+        crate::config::home_dir().unwrap_or_default(),
+    )
+}
+
+/// `REASONIX_HOME`, normalized as Reasonix's `cleanEnvDir` normalizes it, or
+/// `None` when it is unset or blank (see
+/// [`normalize_reasonix_home_override`]).
+fn reasonix_home_override() -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os("REASONIX_HOME")?;
+    normalize_reasonix_home_override(
+        &raw.to_string_lossy(),
+        &crate::config::home_dir().unwrap_or_default(),
+        |name| std::env::var(name).ok().filter(|value| !value.is_empty()),
+    )
+}
+
+/// Pure normalizer behind [`reasonix_home_override`], mirroring `cleanEnvDir`
+/// in Reasonix's `internal/config/paths.go`: trim, expand `${VAR}` and
+/// `${VAR:-default}`, expand a leading `~`, then make the path absolute. Using
+/// the raw value instead made `REASONIX_HOME=~/rx` write
+/// `./~/rx/settings.json` under the current directory, a file Reasonix never
+/// reads.
+fn normalize_reasonix_home_override(
+    raw: &str,
+    home: &std::path::Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let expanded = expand_reasonix_env_refs(trimmed, &lookup);
+    let path = if expanded == "~" && !home.as_os_str().is_empty() {
+        home.to_path_buf()
+    } else if let Some(rest) = expanded
+        .strip_prefix("~/")
+        .or_else(|| expanded.strip_prefix("~\\"))
+        .filter(|_| !home.as_os_str().is_empty())
+    {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(expanded)
+    };
+    Some(std::path::absolute(&path).unwrap_or(path))
+}
+
+/// Reasonix's `ExpandVars` (`internal/config/expand.go`): each `${NAME}` or
+/// `${NAME:-default}` is replaced by the variable's non-empty value, else the
+/// default, else nothing. Anything that is not such a reference stays literal.
+fn expand_reasonix_env_refs(value: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let name_len = after
+            .char_indices()
+            .take_while(|&(index, character)| {
+                character == '_'
+                    || character.is_ascii_alphabetic()
+                    || (index > 0 && character.is_ascii_digit())
+            })
+            .count();
+        let (name, tail) = after.split_at(name_len);
+        let reference = if name.is_empty() {
+            None
+        } else if let Some(remaining) = tail.strip_prefix('}') {
+            Some((None, remaining))
+        } else if let Some(default_and_rest) = tail.strip_prefix(":-") {
+            default_and_rest
+                .find('}')
+                .map(|end| (Some(&default_and_rest[..end]), &default_and_rest[end + 1..]))
+        } else {
+            None
+        };
+        if let Some((default, remaining)) = reference {
+            let replacement = lookup(name).or_else(|| default.map(str::to_string));
+            out.push_str(&replacement.unwrap_or_default());
+            rest = remaining;
+        } else {
+            out.push_str("${");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Pure resolver behind [`reasonix_home`]. The order is `REASONIX_HOME`
+/// (already normalized), then `%APPDATA%\reasonix` on Windows
+/// (`%USERPROFILE%\AppData\Roaming\reasonix` when `APPDATA` is unset), then
+/// `~/.reasonix` elsewhere.
+fn reasonix_home_for(
+    reasonix_home: Option<std::path::PathBuf>,
+    appdata: Option<std::ffi::OsString>,
+    windows: bool,
+    home: std::path::PathBuf,
+) -> std::path::PathBuf {
+    if let Some(dir) = reasonix_home {
+        return dir;
+    }
+    if windows {
+        if let Some(appdata) = appdata.filter(|value| !value.is_empty()) {
+            return std::path::PathBuf::from(appdata).join("reasonix");
+        }
+        return home.join("AppData").join("Roaming").join("reasonix");
+    }
+    home.join(".reasonix")
+}
+
+/// The user-level settings.json that Reasonix actually loads global hooks
+/// from (see [`reasonix_user_settings_path_for`]).
+fn reasonix_user_settings_path() -> std::path::PathBuf {
+    reasonix_user_settings_path_for(
+        &reasonix_home(),
+        reasonix_home_override().is_some(),
+        &crate::config::home_dir().unwrap_or_default(),
+        |path| {
+            !matches!(
+                std::fs::metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        },
+    )
+}
+
+/// Pure resolver behind [`reasonix_user_settings_path`].
+///
+/// Reasonix normally reads `<home>/settings.json`. When that file does not
+/// exist, it falls back to the legacy `~/.reasonix/settings.json`, except
+/// under `REASONIX_HOME` or when the two paths coincide (`Load` in
+/// `internal/hook/hook.go`). The two differ only on Windows. Creating the
+/// primary file there would make Reasonix stop reading a legacy file the user
+/// still relies on, and silently drop every hook in it. So dcg edits the file
+/// Reasonix actually reads.
+fn reasonix_user_settings_path_for(
+    reasonix_home: &std::path::Path,
+    isolated: bool,
+    user_home: &std::path::Path,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> std::path::PathBuf {
+    let primary = reasonix_home.join("settings.json");
+    if isolated || exists(&primary) {
+        return primary;
+    }
+    let legacy_home = user_home.join(".reasonix");
+    if legacy_home == reasonix_home {
+        return primary;
+    }
+    let legacy = legacy_home.join("settings.json");
+    if exists(&legacy) { legacy } else { primary }
+}
+
+/// `<repo>/.reasonix/settings.json`, Reasonix's project-level hooks file.
+fn project_reasonix_settings_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    Ok(repo_root.join(".reasonix").join("settings.json"))
+}
+
+/// The `hooks.PreToolUse[]` entry dcg writes into Reasonix's settings.
+///
+/// Reasonix runs `command` through `sh -c` on macOS/Linux and `cmd /c` on
+/// Windows, pipes the tool call to stdin, and blocks the call when the hook
+/// exits 2. dcg recognizes the envelope itself, so no arguments are needed.
+/// The timeout is in milliseconds; Reasonix blocks on a timeout too, and 5s is
+/// its own default for blocking hooks and far above dcg's fast path.
+fn reasonix_dcg_hook_entry_for_executable(
+    executable: &std::path::Path,
+    windows: bool,
+) -> std::io::Result<serde_json::Value> {
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "dcg hook executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dcg hook executable path is not valid UTF-8: {}",
+                executable.display()
+            ),
+        )
+    })?;
+    let command = if windows {
+        format!("\"{executable}\"")
+    } else {
+        posix_quote_hook_program(executable)
+    };
+    Ok(serde_json::json!({
+        "match": REASONIX_SHELL_MATCH,
+        "command": command,
+        "description": "dcg: block destructive shell commands",
+        "timeout": 5000
+    }))
+}
+
+fn reasonix_hook_entry_is_dcg(entry: &serde_json::Value) -> bool {
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_dcg_command)
+}
+
+/// Install (or refresh) dcg's entry in an in-memory Reasonix settings object.
+///
+/// Stale dcg entries are removed and the fresh one is inserted first:
+/// Reasonix runs a scope's hooks in array order and stops at the first block.
+/// A user's own `timeout` or `description` on the previous dcg entry is kept.
+/// Returns `Ok(true)` when the settings changed (always `true` with `force`).
+///
+/// # Errors
+///
+/// Returns an error for a shape dcg does not understand (not an object, a
+/// non-object `hooks`, a non-array `PreToolUse`, or the editor's bare
+/// event-keyed shorthand); dcg never rewrites what it cannot read.
+fn install_reasonix_hook_into_settings(
+    settings: &mut serde_json::Value,
+    force: bool,
+    desired_entry: serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let settings_obj = settings
+        .as_object_mut()
+        .ok_or("Invalid Reasonix settings.json (expected a JSON object with a \"hooks\" key)")?;
+    if !settings_obj.contains_key("hooks") && settings_obj.contains_key(REASONIX_PRE_TOOL_USE_EVENT)
+    {
+        return Err(
+            "Reasonix settings.json uses the bare event-keyed shorthand; save it once from \
+             Reasonix (Settings -> Hooks) so it is written as {\"hooks\": ...}, then retry"
+                .into(),
+        );
+    }
+    let hooks = settings_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let original = hooks.clone();
+    let entries = hooks
+        .as_object_mut()
+        .ok_or("Invalid hooks format in Reasonix settings.json (expected JSON object)")?
+        .entry(REASONIX_PRE_TOOL_USE_EVENT)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse format in Reasonix settings.json (expected JSON array)")?;
+
+    let previous = entries
+        .iter()
+        .find(|entry| reasonix_hook_entry_is_dcg(entry))
+        .cloned();
+    entries.retain(|entry| !reasonix_hook_entry_is_dcg(entry));
+    let mut entry = desired_entry;
+    if let (Some(previous), Some(entry)) = (
+        previous.as_ref().and_then(serde_json::Value::as_object),
+        entry.as_object_mut(),
+    ) {
+        for key in ["timeout", "description"] {
+            if let Some(value) = previous.get(key) {
+                entry.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    entries.insert(0, entry);
+
+    Ok(force || *hooks != original)
+}
+
+/// Remove dcg's entries from an in-memory Reasonix settings object. Returns
+/// `Ok(true)` when at least one entry was removed.
+fn uninstall_dcg_hook_from_reasonix_settings(
+    settings: &mut serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(entries) = settings
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut(REASONIX_PRE_TOOL_USE_EVENT))
+    else {
+        return Ok(false);
+    };
+    let entries = entries
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse format in Reasonix settings.json (expected JSON array)")?;
+    let before = entries.len();
+    entries.retain(|entry| !reasonix_hook_entry_is_dcg(entry));
+    Ok(entries.len() != before)
+}
+
+fn read_reasonix_settings(
+    path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    Ok(serde_json::from_str(&content)?)
+}
+
+/// Merge dcg's hook entry into the Reasonix settings at `path` without
+/// printing (shared by `dcg install --reasonix` and `dcg doctor --fix`).
+/// Returns `Ok(true)` when the file was (re)written.
+fn install_reasonix_hook_at(
+    path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut settings = if path.exists() {
+        read_reasonix_settings(path)?
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        serde_json::json!({})
+    };
+    let entry = reasonix_dcg_hook_entry_for_executable(&current_dcg_executable()?, cfg!(windows))?;
+    let changed = install_reasonix_hook_into_settings(&mut settings, force, entry)?;
+    if changed {
+        std::fs::write(path, serde_json::to_string_pretty(&settings)?)?;
+    }
+    Ok(changed)
+}
+
+/// Install the dcg hook into Reasonix's settings (#358).
+fn install_reasonix_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = if project {
+        project_reasonix_settings_path()?
+    } else {
+        reasonix_user_settings_path()
+    };
+    if !install_reasonix_hook_at(&path, force)? {
+        println!("{}", "Hook already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+    let level = if project { "project" } else { "user" };
+    println!("{}", "Reasonix hook installed successfully!".green().bold());
+    println!("Settings updated ({level}): {}", path.display());
+    println!();
+    println!(
+        "{}",
+        "Restart Reasonix for the change to take effect (hooks load when a session is \
+         built; /new does not reload them)."
+            .yellow()
+    );
+    Ok(())
+}
+
+/// Remove the dcg hook entry from Reasonix's user-level settings (#358).
+fn uninstall_reasonix_hook() -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = reasonix_user_settings_path();
+    if !path.exists() {
+        println!(
+            "{} {}",
+            "No Reasonix settings found at".yellow(),
+            path.display()
+        );
+        return Ok(());
+    }
+    let mut settings = read_reasonix_settings(&path)?;
+    if uninstall_dcg_hook_from_reasonix_settings(&mut settings)? {
+        std::fs::write(&path, serde_json::to_string_pretty(&settings)?)?;
+        println!("{}", "Reasonix hook removed successfully!".green().bold());
+        println!("Settings updated: {}", path.display());
+    } else {
+        println!("{}", "No dcg hook found in Reasonix settings.".yellow());
+    }
+    Ok(())
+}
+
+/// Whether the user-level Reasonix settings register a dcg `PreToolUse` hook.
+/// `Err` means the file exists but cannot be parsed.
+fn reasonix_user_settings_register_dcg() -> Result<bool, String> {
+    let path = reasonix_user_settings_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let settings = read_reasonix_settings(&path).map_err(|error| error.to_string())?;
+    Ok(settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(REASONIX_PRE_TOOL_USE_EVENT))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| entries.iter().any(reasonix_hook_entry_is_dcg)))
+}
+
+/// Whether Reasonix is plausibly in use on this machine: its home, or the
+/// settings file it reads, exists.
+fn reasonix_appears_in_use() -> bool {
+    reasonix_home().is_dir() || reasonix_user_settings_path().is_file()
+}
+
 /// Ownership marker embedded in the generated OpenCode plugin (#318).
 ///
 /// The installer refuses to overwrite a plugin file that lacks this marker
@@ -13778,7 +14620,11 @@ fn opencode_user_plugin_path() -> std::path::PathBuf {
     let config_root = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map_or_else(
-            || dirs::home_dir().unwrap_or_default().join(".config"),
+            || {
+                crate::config::home_dir()
+                    .unwrap_or_default()
+                    .join(".config")
+            },
             std::path::PathBuf::from,
         );
     config_root
@@ -13799,13 +14645,15 @@ fn project_opencode_plugin_path() -> Result<std::path::PathBuf, Box<dyn std::err
 
 /// Generate the OpenCode `tool.execute.before` plugin source (#318).
 ///
-/// The plugin routes every OpenCode `bash` tool call through dcg's
+/// The legacy OpenCode v1 plugin routes every `bash` tool call through dcg's
 /// Claude-compatible hook protocol: an empty stdout means allow; a
 /// `hookSpecificOutput.permissionDecision` of `deny` (or `ask`, since
-/// OpenCode has no operator-review state) aborts the tool call by throwing,
-/// which is OpenCode's documented veto mechanism. Infrastructure failures
-/// (dcg missing/unrunnable) fail open with a stderr notice, matching the
-/// hook-envelope failure policy; the *evaluation* itself stays fail-closed
+/// OpenCode has no operator-review state) aborts the v1 tool hook by throwing.
+/// OpenCode v2 changed both its module/runtime contract and its interception
+/// APIs; dcg refuses to install or bless this v1 bridge when v2+ is detected
+/// until an authoritative veto path is verified (#419). Infrastructure
+/// failures (dcg missing/unrunnable) fail open with a stderr notice, matching
+/// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
 /// inside dcg.
 ///
 /// The dcg binary path is embedded as a JSON string literal (valid JSON
@@ -13829,51 +14677,85 @@ fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result
 // Routes every OpenCode bash tool call through dcg (Destructive Command
 // Guard) before execution. Remove with `uninstall.sh` or by deleting this
 // file. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
+//
+// One file serves both plugin contracts (#419). OpenCode v1 loads the named
+// `DcgGuard` export and calls `tool.execute.before(input, output)`; v2 loads
+// the default export and requires `{{ id, setup(ctx) }}`, registering through
+// `ctx.tool.hook("execute.before", cb)` with a single `event` argument. An ES
+// module may carry both, and each loader reads only the shape it knows, so
+// the plugin does not depend on detecting the runtime — which matters because
+// `dcg update` regenerates this file and the installed OpenCode may have
+// changed major version since `dcg install` ran.
+//
+// `node:child_process` rather than `Bun.spawn`: v2 migrated Bun -> Node, so
+// `Bun` is undefined there, while Bun implements the `node:` modules — so the
+// one spawn path works under both runtimes.
+import {{ spawnSync }} from "node:child_process";
+
 const DCG_BIN = {path_literal};
 
+// Returns a deny reason, or null to allow. Infrastructure failures (dcg
+// missing, unrunnable, timed out) fail OPEN with a stderr notice, matching
+// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
+// inside dcg.
+function dcgDenyReason(command) {{
+  if (typeof command !== "string" || command.length === 0) return null;
+  let result;
+  try {{
+    result = spawnSync(process.env.DCG_BIN || DCG_BIN, {{
+      input: JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }} }}),
+      encoding: "utf8",
+      env: {{ ...process.env, OPENCODE: "1" }},
+      timeout: 10000,
+    }});
+  }} catch (err) {{
+    console.error(`[dcg] OpenCode guard could not run dcg: ${{err}}`);
+    return null;
+  }}
+  if (!result || result.error) {{
+    console.error(`[dcg] OpenCode guard could not run dcg: ${{result && result.error}}`);
+    return null;
+  }}
+
+  const text = (result.stdout || "").trim();
+  if (!text) return null; // empty stdout = allow
+
+  let decision;
+  try {{
+    decision = JSON.parse(text);
+  }} catch {{
+    return null; // non-JSON stdout: treat as allow (matches other harnesses)
+  }}
+  const hso = decision.hookSpecificOutput;
+  const verdict = hso && hso.permissionDecision;
+  // OpenCode has no operator-review state, so `ask` fails closed.
+  if (verdict === "deny" || verdict === "ask") {{
+    return (hso && hso.permissionDecisionReason) || "Blocked by dcg";
+  }}
+  return null;
+}}
+
+// OpenCode v1: named export, hook map, command in `output.args`.
 export const DcgGuard = async () => {{
   return {{
     "tool.execute.before": async (input, output) => {{
       if (!input || input.tool !== "bash") return;
-      const command = output?.args?.command;
-      if (typeof command !== "string" || command.length === 0) return;
-
-      let stdoutText;
-      try {{
-        const proc = Bun.spawn([process.env.DCG_BIN || DCG_BIN], {{
-          stdin: new TextEncoder().encode(
-            JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }} }})
-          ),
-          stdout: "pipe",
-          stderr: "ignore",
-          env: {{ ...process.env, OPENCODE: "1" }},
-        }});
-        stdoutText = await new Response(proc.stdout).text();
-        await proc.exited;
-      }} catch (err) {{
-        // dcg missing or unrunnable is an infrastructure failure, not a
-        // safety verdict: fail open, but say so.
-        console.error(`[dcg] OpenCode guard could not run dcg: ${{err}}`);
-        return;
-      }}
-
-      const text = (stdoutText || "").trim();
-      if (!text) return; // empty stdout = allow
-
-      let decision;
-      try {{
-        decision = JSON.parse(text);
-      }} catch {{
-        return; // non-JSON stdout: treat as allow (matches other harnesses)
-      }}
-      const hso = decision.hookSpecificOutput;
-      const verdict = hso && hso.permissionDecision;
-      if (verdict === "deny" || verdict === "ask") {{
-        // OpenCode has no operator-review state, so `ask` fails closed.
-        throw new Error(hso.permissionDecisionReason || "Blocked by dcg");
-      }}
+      const reason = dcgDenyReason(output?.args?.command);
+      if (reason) throw new Error(reason);
     }},
   }};
+}};
+
+// OpenCode v2: default export with `id` + `setup`, command in `event.input`.
+export default {{
+  id: "dcg-guard",
+  async setup(ctx) {{
+    await ctx.tool.hook("execute.before", async (event) => {{
+      if (!event || event.tool !== "bash") return;
+      const reason = dcgDenyReason(event.input && event.input.command);
+      if (reason) throw new Error(reason);
+    }});
+  }},
 }};
 "#
     ))
@@ -13891,6 +14773,35 @@ fn opencode_appears_in_use() -> bool {
         .parent()
         .and_then(std::path::Path::parent)
         .is_some_and(std::path::Path::is_dir)
+        || which_executable("opencode").is_some()
+}
+
+/// Extract the first dotted-version major from OpenCode's CLI version text.
+///
+/// OpenCode has emitted both bare versions (for example `2.0.4`) and
+/// decorated forms. Keep the parser deliberately small and independent of a
+/// semver dependency: the only policy boundary here is v1 versus v2+.
+fn parse_opencode_major_version(raw: &str) -> Option<u64> {
+    raw.split(|character: char| !character.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse().ok())
+}
+
+/// Detect the installed OpenCode CLI major version when it can be executed.
+///
+/// Failure to execute or parse is not treated as v1: it is simply unknown and
+/// preserves the existing behavior. When v2+ is positively identified, dcg
+/// must not write or bless the legacy v1 bridge (#419).
+fn detected_opencode_major_version() -> Option<u64> {
+    let output = std::process::Command::new("opencode")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_opencode_major_version(&String::from_utf8_lossy(&output.stdout))
+        .or_else(|| parse_opencode_major_version(&String::from_utf8_lossy(&output.stderr)))
 }
 
 /// Fidelity of an installed OpenCode plugin against the canonical source
@@ -13946,7 +14857,7 @@ fn probe_opencode_plugin(path: &std::path::Path) -> OpencodePluginProbe {
 
 /// User-level Codex hooks file (written by the dcg install script).
 fn codex_hooks_json_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".codex")
         .join("hooks.json")
@@ -13955,7 +14866,7 @@ fn codex_hooks_json_path() -> std::path::PathBuf {
 /// User-level Codex configuration, which carries the `[hooks.state]` trust
 /// and enablement table.
 fn codex_config_toml_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".codex")
         .join("config.toml")
@@ -14193,7 +15104,7 @@ fn codex_hook_command_exists(command: &str) -> bool {
         return false;
     }
     if let Some(rest) = program.strip_prefix("~/") {
-        return dirs::home_dir().is_some_and(|home| home.join(rest).is_file());
+        return crate::config::home_dir().is_some_and(|home| home.join(rest).is_file());
     }
     if program.contains(['/', '\\']) {
         return std::path::Path::new(program).is_file();
@@ -14359,9 +15270,12 @@ fn enable_codex_hook_state_at(
         .and_then(|state| state.get_mut(state_key))
         .and_then(toml_edit::Item::as_table_like_mut)
         .ok_or_else(|| {
+            // Render the key as TOML would: a Windows key holds backslashes,
+            // which a hand-quoted basic string turns into escapes.
             format!(
-                "no [hooks.state.\"{state_key}\"] entry exists in {}; approve the hook in \
+                "no [hooks.state.{}] entry exists in {}; approve the hook in \
                  Codex first (doctor will not forge a trust entry)",
+                toml_edit::Key::new(state_key),
                 config_path.display()
             )
         })?;
@@ -14583,6 +15497,8 @@ fn omp_default_agent_dir_from(
     std::path::PathBuf::from(agent_dir_override)
 }
 
+// The only error is the Unix UTF-8 check; the signature stays uniform.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn omp_coding_agent_dir_env_value(
     value: Option<std::ffi::OsString>,
 ) -> std::io::Result<Option<std::ffi::OsString>> {
@@ -14602,7 +15518,7 @@ fn omp_coding_agent_dir_env_value(
 /// `PI_CODING_AGENT_DIR` override when a named profile is active, so dcg does
 /// the same.
 fn omp_user_agent_dir() -> std::io::Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| {
+    let home = crate::config::home_dir().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "could not determine the home directory for Oh My Pi",
@@ -15306,7 +16222,8 @@ fn omp_appears_in_use() -> bool {
     {
         return true;
     }
-    let default_root_exists = dirs::home_dir().is_some_and(|home| home.join(".omp").is_dir());
+    let default_root_exists =
+        crate::config::home_dir().is_some_and(|home| home.join(".omp").is_dir());
     default_root_exists
         || omp_user_agent_dir().is_ok_and(|path| path.is_dir())
         || project_omp_extension_path()
@@ -15595,6 +16512,135 @@ fn install_omp_extension(
     Ok(())
 }
 
+/// Marker line of the PowerShell `$PROFILE` hook check `install.ps1` writes.
+#[cfg(any(windows, test))]
+const DCG_PROFILE_CHECK_MARKER: &str = "# dcg: warn if the Claude Code hook was silently removed";
+
+/// The current PowerShell `$PROFILE` hook check, byte for byte
+/// `install.ps1`'s `$script:DcgProfileCheckBlock` (a test pins the two
+/// together).
+///
+/// Only `install.ps1` ever adds this block, but a profile keeps whatever
+/// version was current when the installer last ran, while `dcg update`
+/// replaces only the binary. When the check's parser falls behind the hook
+/// command dcg writes, every new PowerShell session warns that the hook is
+/// missing although it is installed (#503), and the warning's own advice —
+/// `dcg install` — is where the stale block gets repaired.
+#[cfg(any(windows, test))]
+const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+  try {
+    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgHas = $false
+    foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
+      foreach ($dcgH in @($dcgE.hooks)) {
+        $dcgCmd = ([string]$dcgH.command).Trim()
+        if ($dcgCmd -match '^&\s*''((?:[^'']|'''')*)''') { $dcgExe = $Matches[1] -replace '''''', '''' }
+        elseif ($dcgCmd -match '^&\s*"([^"]*)"') { $dcgExe = $Matches[1] }
+        else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
+        if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
+      }
+    }
+    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+  } catch { }
+}"#;
+
+/// Replace a stale dcg `$PROFILE` check with the current block.
+///
+/// Mirrors `Repair-DcgProfileCheckContent` in `install.ps1`: the managed
+/// region runs from the marker line through the first column-0 `}` line, and
+/// its interior braces are all indented, so the region cannot end early.
+/// Returns `None` when there is nothing to do: no marker (the user never
+/// opted in, and this never adds the check), the block is already current
+/// (compared ignoring CRLF, since editors re-save profiles either way), or
+/// the region's end cannot be found (a hand-edited block is left alone).
+#[cfg(any(windows, test))]
+fn repair_powershell_profile_check(content: &str) -> Option<String> {
+    if !content.contains(DCG_PROFILE_CHECK_MARKER) {
+        return None;
+    }
+    if content.replace("\r\n", "\n").contains(&format!(
+        "{DCG_PROFILE_CHECK_MARKER}\n{DCG_PROFILE_CHECK_BLOCK}"
+    )) {
+        return None;
+    }
+    let mut region_start = None;
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\r', '\n']);
+        if region_start.is_none() {
+            if bare.trim_start().starts_with(DCG_PROFILE_CHECK_MARKER) {
+                region_start = Some(offset);
+            }
+        } else if bare.trim_end() == "}" && bare.starts_with('}') {
+            let start = region_start?;
+            let end = offset + line.len();
+            let newline = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+            let block = DCG_PROFILE_CHECK_BLOCK.replace('\n', newline);
+            let mut repaired = String::with_capacity(content.len() + block.len());
+            repaired.push_str(&content[..start]);
+            repaired.push_str(DCG_PROFILE_CHECK_MARKER);
+            repaired.push_str(newline);
+            repaired.push_str(&block);
+            // A block that ended the file without a newline stays that way.
+            if line.ends_with('\n') {
+                repaired.push_str(newline);
+            }
+            repaired.push_str(&content[end..]);
+            return Some(repaired);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// The `profile.ps1` files a stale check may live in: Windows PowerShell 5.1
+/// and PowerShell 7 keep separate ones, and Documents may be redirected into
+/// OneDrive. Resolved under [`crate::config::home_dir`] only, so a sandboxed
+/// run (`USERPROFILE` pointed elsewhere) never reaches the operator's real
+/// profile.
+#[cfg(windows)]
+fn powershell_profile_candidates() -> Vec<std::path::PathBuf> {
+    let Some(home) = crate::config::home_dir() else {
+        return Vec::new();
+    };
+    let mut documents = vec![
+        home.join("Documents"),
+        home.join("OneDrive").join("Documents"),
+    ];
+    // The known folder catches a Documents redirected elsewhere under the
+    // profile; one outside `home` is ignored for the sandbox reason above.
+    if let Some(known) = dirs::document_dir().filter(|known| known.starts_with(&home)) {
+        if !documents.contains(&known) {
+            documents.push(known);
+        }
+    }
+    documents
+        .iter()
+        .flat_map(|docs| {
+            [
+                docs.join("WindowsPowerShell").join("profile.ps1"),
+                docs.join("PowerShell").join("profile.ps1"),
+            ]
+        })
+        .collect()
+}
+
+/// Repair every stale dcg `$PROFILE` check in place; returns the files
+/// rewritten. Best effort: an unreadable or unwritable profile is skipped,
+/// because this runs alongside hook installation and must never fail it.
+#[cfg(windows)]
+fn repair_powershell_profile_checks() -> Vec<std::path::PathBuf> {
+    powershell_profile_candidates()
+        .into_iter()
+        .filter(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|content| repair_powershell_profile_check(&content))
+                .is_some_and(|repaired| std::fs::write(path, repaired).is_ok())
+        })
+        .collect()
+}
+
 /// The shell snippet that checks whether the DCG hook is still present in
 /// Claude Code settings on every new shell session. Runs in milliseconds,
 /// silent when the hook is present, yellow warning when missing.
@@ -15766,7 +16812,7 @@ fn run_shell_check_setup(
         return Ok(());
     }
 
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let home = crate::config::home_dir().ok_or("Could not determine home directory")?;
 
     // Collect candidate RC files that actually exist (or that the user's
     // current shell would source).
@@ -16400,7 +17446,7 @@ Write-Output ([string]$created.ProcessId)
 "#;
 
 fn windows_update_log_path() -> std::path::PathBuf {
-    dirs::cache_dir()
+    crate::config::user_cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("dcg")
         .join("update.log")
@@ -16597,7 +17643,7 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
 
 /// Get the path to user-level Claude Code settings (`~/.claude/settings.json`).
 fn claude_settings_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".claude")
         .join("settings.json")
@@ -16620,7 +17666,7 @@ fn project_claude_settings_path() -> Result<std::path::PathBuf, Box<dyn std::err
 /// than editing `~/.grok/user-settings.json`) keeps installs/uninstalls
 /// independent of unrelated user settings.
 fn grok_user_hook_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".grok")
         .join("hooks")
@@ -16641,7 +17687,7 @@ fn project_grok_hook_path() -> Result<std::path::PathBuf, Box<dyn std::error::Er
 /// Prefers `$XDG_CONFIG_HOME/dcg/`, then XDG-style `~/.config/dcg/` if it exists,
 /// otherwise falls back to the platform-native location. This ensures users can
 /// use `~/.config/dcg/` on all platforms, including macOS where
-/// `dirs::config_dir()` returns `~/Library/Application Support`.
+/// `crate::config::user_config_dir()` returns `~/Library/Application Support`.
 fn config_dir() -> std::path::PathBuf {
     // Check XDG_CONFIG_HOME first (if set)
     if let Ok(xdg_home) = std::env::var("XDG_CONFIG_HOME") {
@@ -16651,7 +17697,7 @@ fn config_dir() -> std::path::PathBuf {
     }
 
     // Check XDG-style path next (~/.config/dcg/)
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         let xdg_dir = home.join(".config").join("dcg");
         if xdg_dir.exists() {
             return xdg_dir;
@@ -16659,8 +17705,12 @@ fn config_dir() -> std::path::PathBuf {
     }
 
     // Fall back to platform-native or default to ~/.config/dcg
-    dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+    crate::config::user_config_dir()
+        .unwrap_or_else(|| {
+            crate::config::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+        })
         .join("dcg")
 }
 
@@ -16676,14 +17726,14 @@ fn config_path() -> std::path::PathBuf {
         }
     }
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         let path = home.join(".config").join("dcg").join("config.toml");
         if path.exists() {
             return path;
         }
     }
 
-    if let Some(config_dir) = dirs::config_dir() {
+    if let Some(config_dir) = crate::config::user_config_dir() {
         let path = config_dir.join("dcg").join("config.toml");
         if path.exists() {
             return path;
@@ -17275,7 +18325,7 @@ fn validate_config_diagnostics(
     // Removed config keys that still parse are indistinguishable from working
     // ones without a warning; surface them the same way inert exemptions are
     // (#327).
-    diag.removed_key_warnings = config.overrides.removed_key_warnings();
+    diag.removed_key_warnings = config.inert_config_warnings();
 
     diag
 }
@@ -17775,6 +18825,9 @@ fn handle_allow_once_command(
     // already been printed — which read as a successful grant while the store
     // was never written (#262).
     let needs_prompt = !(cmd.yes || cmd.dry_run);
+    // "Allow once" means once (#378): a grant is consumed on first use unless
+    // `--reusable` asks for the old reuse-until-expiry behaviour.
+    let single_use = !cmd.reusable;
     if needs_prompt && !std::io::stdin().is_terminal() {
         return Err(format!(
             "Allow-once needs an interactive confirmation, but stdin is not a terminal, so the \
@@ -17802,7 +18855,7 @@ fn handle_allow_once_command(
         now,
         scope_kind,
         &scope_path_str,
-        cmd.single_use,
+        single_use,
         cmd.force && is_config_block,
         &config.logging.redaction,
     );
@@ -17812,7 +18865,7 @@ fn handle_allow_once_command(
             "status": "ok",
             "code": code,
             "dry_run": cmd.dry_run,
-            "single_use": cmd.single_use,
+            "single_use": single_use,
             "force": entry.force_allow_config,
             "scope_kind": format!("{scope_kind:?}").to_lowercase(),
             "scope_path": scope_path_str,
@@ -17835,10 +18888,10 @@ fn handle_allow_once_command(
         println!("  CWD: {}", selected.cwd);
         println!("  Expires: {}", entry.expires_at);
         println!("  Scope: {scope_kind:?} ({scope_path_str})");
-        if cmd.single_use {
+        if single_use {
             println!("  Mode: single-use");
         } else {
-            println!("  Mode: reusable until expiry");
+            println!("  Mode: reusable until expiry (--reusable)");
         }
 
         if needs_prompt {
@@ -17871,6 +18924,17 @@ fn handle_allow_once_command(
     let allow_once_path = AllowOnceStore::default_path(Some(&selected_cwd));
     let allow_once_store = AllowOnceStore::new(allow_once_path.clone());
     let _maintenance = allow_once_store.add_entry(&entry, now)?;
+
+    // Redeeming a code is the step that lifts a block — including a `--force`
+    // over an explicit config block — so it is the one most worth auditing.
+    if let Some(audit) = config.allow_once_audit() {
+        let _ = crate::pending_exceptions::log_code_resolved(
+            audit.log_file,
+            &entry,
+            audit.redaction,
+            audit.format,
+        );
+    }
 
     // Remove the pending exception so it doesn't show up in lists anymore.
     // This is best-effort (if it fails, the allowed command still works).
@@ -18251,6 +19315,18 @@ fn select_pending_entry<'a>(
         return Ok(&matches[0]);
     }
 
+    // The same command denied twice in one second (an agent retrying) writes
+    // two records with the same hash: the hash covers the second, the cwd and
+    // the command, so they are one grant, not a choice. Asking the user to
+    // disambiguate them was unanswerable, since `--hash` cannot tell them apart.
+    if let Some(first) = matches.first()
+        && matches
+            .iter()
+            .all(|record| record.full_hash == first.full_hash)
+    {
+        return Ok(first);
+    }
+
     if let Some(hash) = cmd.hash.as_deref() {
         let record = matches
             .iter()
@@ -18412,8 +19488,33 @@ fn allowlist_add_rule_with_paths(
         layer.label()
     );
     println!("  File: {}", path.display());
+    if let Some(note) = refined_rule_grant_note(&parsed_rule) {
+        eprintln!("{note}");
+    }
 
     Ok(())
+}
+
+/// A note for a base embedded-code rule id, which may never match (#470).
+///
+/// Allowlists match the exact reported id, and many embedded-code rules only
+/// ever block under a refined id: every blocking `fs.rmSync` match reports
+/// `heredoc.javascript:fs_rmsync.catastrophic` (or `.non_temp`), never the
+/// base id `docs/patterns.md` tabulates. Such a grant was accepted with a
+/// success message and changed nothing. Widening a base grant to cover its
+/// refinements would be the wrong repair — a grant written for a benign
+/// Medium report of `heredoc.go:exec_command` must not also admit
+/// `exec_command.rm_rf_catastrophic` — so say what the grant does instead.
+fn refined_rule_grant_note(rule: &RuleId) -> Option<String> {
+    if !rule.pack_id.starts_with("heredoc.") || rule.pattern_name.contains(['.', '*']) {
+        return None;
+    }
+    Some(format!(
+        "  Note: this grant matches only a denial reported as exactly `{}:{}`. Embedded-code \
+         rules usually block under a refined id such as `{}:{}.catastrophic`; if the denial you \
+         are granting named a longer id, grant that id (`dcg explain '<command>'` prints it).",
+        rule.pack_id, rule.pattern_name, rule.pack_id, rule.pattern_name
+    ))
 }
 
 /// Add an exact command to the allowlist.
@@ -20354,6 +21455,99 @@ mod tests {
         );
     }
 
+    /// `dcg install` repairs a stale PowerShell `$PROFILE` hook check (#503).
+    mod powershell_profile_check_repair {
+        use super::super::{
+            DCG_PROFILE_CHECK_BLOCK, DCG_PROFILE_CHECK_MARKER, repair_powershell_profile_check,
+        };
+
+        /// The block the reporter's profile carried: the pre-#282 naive split.
+        const PRE_282: &str = r#"# dcg: warn if the Claude Code hook was silently removed
+if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+  try {
+    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgHas = $false
+    foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
+      foreach ($dcgH in @($dcgE.hooks)) {
+        if (((([string]$dcgH.command) -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
+      }
+    }
+    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+  } catch { }
+}
+"#;
+
+        fn current() -> String {
+            format!("{DCG_PROFILE_CHECK_MARKER}\n{DCG_PROFILE_CHECK_BLOCK}\n")
+        }
+
+        /// The Rust copy is the installer's block, so `dcg install` never
+        /// "repairs" a profile into something install.ps1 would rewrite back.
+        #[test]
+        fn block_matches_install_ps1() {
+            let installer = include_str!("../install.ps1");
+            let start_tag = "$script:DcgProfileCheckBlock = @'\n";
+            let start = installer
+                .replace("\r\n", "\n")
+                .find(start_tag)
+                .expect("install.ps1 defines the block")
+                + start_tag.len();
+            let normalized = installer.replace("\r\n", "\n");
+            let end = normalized[start..]
+                .find("\n'@")
+                .expect("here-string terminator")
+                + start;
+            assert_eq!(&normalized[start..end], DCG_PROFILE_CHECK_BLOCK);
+            assert!(normalized.contains(&format!(
+                "$script:DcgProfileCheckMarker = \"{DCG_PROFILE_CHECK_MARKER}\""
+            )));
+        }
+
+        #[test]
+        fn stale_block_is_replaced_and_surroundings_kept() {
+            let content = format!("# mine before\n{PRE_282}# mine after\n");
+            let repaired = repair_powershell_profile_check(&content).expect("stale block repaired");
+            assert_eq!(
+                repaired,
+                format!("# mine before\n{}# mine after\n", current())
+            );
+            assert_eq!(repair_powershell_profile_check(&repaired), None, "stable");
+        }
+
+        #[test]
+        fn crlf_profiles_stay_crlf_and_current_crlf_is_left_alone() {
+            let content = PRE_282.replace('\n', "\r\n");
+            let repaired = repair_powershell_profile_check(&content).expect("repaired");
+            assert_eq!(repaired, current().replace('\n', "\r\n"));
+            assert!(
+                !repaired.replace("\r\n", "").contains('\n'),
+                "no bare LF mixed in"
+            );
+            assert_eq!(repair_powershell_profile_check(&repaired), None);
+        }
+
+        #[test]
+        fn block_at_end_of_file_without_newline() {
+            let content = PRE_282.trim_end_matches('\n');
+            let repaired = repair_powershell_profile_check(content).expect("repaired");
+            assert_eq!(repaired, current().trim_end_matches('\n'));
+        }
+
+        #[test]
+        fn nothing_to_do() {
+            // Never adds the check to a profile that did not opt in.
+            assert_eq!(repair_powershell_profile_check(""), None);
+            assert_eq!(
+                repair_powershell_profile_check("Set-Alias ll Get-ChildItem\n"),
+                None
+            );
+            assert_eq!(repair_powershell_profile_check(&current()), None);
+            // A hand-mangled block with no column-0 closing brace is left alone.
+            let mangled = format!("{DCG_PROFILE_CHECK_MARKER}\n  if ($x) {{\n  }}\n");
+            assert_eq!(repair_powershell_profile_check(&mangled), None);
+        }
+    }
+
     /// The shell startup check self-repairs a stale marker-guarded block
     /// instead of skipping it (the Unix analog of install.ps1's #282 fix).
     #[cfg(unix)]
@@ -20507,9 +21701,16 @@ mod tests {
                 let mut result = evaluate_batch_line(
                     &ctx.config,
                     line,
-                    &ctx.enabled_keywords,
-                    &ctx.ordered_packs,
-                    ctx.keyword_index.as_ref(),
+                    PackView {
+                        enabled_keywords: &ctx.enabled_keywords,
+                        ordered_packs: &ctx.ordered_packs,
+                        keyword_index: ctx.keyword_index.as_ref(),
+                    },
+                    // These helpers build the DEFAULT pack set only, so there is
+                    // no windows-payload view to offer; the selection inside
+                    // falls back to the base view, exactly as it does on a
+                    // Windows host where the two sets are identical.
+                    None,
                     &ctx.compiled_overrides,
                     &ctx.allowlists,
                     &ctx.heredoc_settings,
@@ -20615,8 +21816,18 @@ mod tests {
 
     // ---- Crush installer (#388) -------------------------------------------
 
+    /// A Unix-style absolute test path made absolute on the host too:
+    /// `is_absolute` is host-specific, so `/opt/dcg` needs a drive on Windows.
+    fn host_abs(path: &str) -> String {
+        if cfg!(windows) && path.starts_with('/') {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
     fn crush_entry_for(path: &str) -> serde_json::Value {
-        crush_dcg_hook_entry_for_executable(std::path::Path::new(path)).expect("entry")
+        crush_dcg_hook_entry_for_executable(std::path::Path::new(&host_abs(path))).expect("entry")
     }
 
     fn crush_pre_tool_use(config: &serde_json::Value) -> &Vec<serde_json::Value> {
@@ -20630,7 +21841,16 @@ mod tests {
         let entry = crush_entry_for("/opt/tools/dcg");
         assert_eq!(entry["name"], "dcg");
         assert_eq!(entry["matcher"], "^bash$");
-        assert_eq!(entry["command"], "/opt/tools/dcg");
+        assert_eq!(
+            dcg_command_program(entry["command"].as_str().unwrap()),
+            Some(host_abs("/opt/tools/dcg"))
+        );
+        if cfg!(unix) {
+            assert_eq!(
+                entry["command"], "/opt/tools/dcg",
+                "a plain path stays unquoted"
+            );
+        }
         assert_eq!(entry["timeout"], 5);
         // Crush's entry is flat: no Claude-style nested `hooks`/`type`.
         assert!(entry.get("hooks").is_none());
@@ -20700,6 +21920,14 @@ mod tests {
                 .expect("install ok");
         assert!(changed, "--force always reports a rewrite");
         assert_eq!(crush_pre_tool_use(&config).len(), 1);
+
+        // Map equality ignores key order, so also compare the bytes a
+        // re-install writes: on native Windows a forced re-install reordered
+        // the entry's keys and rewrote an otherwise unchanged crush.json.
+        let fresh = serde_json::to_string_pretty(&config).unwrap();
+        install_crush_hook_into_config(&mut config, true, crush_entry_for("/opt/dcg"))
+            .expect("install ok");
+        assert_eq!(serde_json::to_string_pretty(&config).unwrap(), fresh);
     }
 
     #[test]
@@ -20723,7 +21951,11 @@ mod tests {
 
         let entries = crush_pre_tool_use(&config);
         assert_eq!(entries.len(), 2, "dcg first, then the user's hook");
-        assert_eq!(entries[0]["command"], "/new/dcg", "dcg-owned: refreshed");
+        assert_eq!(
+            entries[0]["command"],
+            crush_entry_for("/new/dcg")["command"],
+            "dcg-owned: refreshed"
+        );
         assert_eq!(entries[0]["matcher"], "^bash$", "dcg-owned: refreshed");
         assert_eq!(entries[0]["name"], "my-guard", "host-owned: preserved");
         assert_eq!(entries[0]["timeout"], 30, "host-owned: preserved");
@@ -20807,6 +22039,249 @@ mod tests {
         assert_eq!(
             crush_user_config_path_for(Some(OsString::new()), Some(OsString::new()), home),
             std::path::PathBuf::from("/home/jane/.config/crush/crush.json")
+        );
+    }
+
+    /// #358: Reasonix's home follows its own `reasonixHomeDir` order.
+    #[test]
+    fn reasonix_home_follows_reasonix_precedence() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        let home = PathBuf::from("/home/jane");
+        assert_eq!(
+            reasonix_home_for(None, None, false, home.clone()),
+            PathBuf::from("/home/jane/.reasonix")
+        );
+        // APPDATA means nothing off Windows.
+        assert_eq!(
+            reasonix_home_for(None, Some(OsString::from("/appdata")), false, home.clone()),
+            PathBuf::from("/home/jane/.reasonix")
+        );
+        assert_eq!(
+            reasonix_home_for(None, Some(OsString::from("/appdata")), true, home.clone()),
+            PathBuf::from("/appdata/reasonix")
+        );
+        // Windows without APPDATA: the Roaming directory under the profile,
+        // never ~/.reasonix.
+        assert_eq!(
+            reasonix_home_for(None, Some(OsString::new()), true, home.clone()),
+            home.join("AppData").join("Roaming").join("reasonix")
+        );
+        // REASONIX_HOME (normalized) wins everywhere.
+        for windows in [false, true] {
+            assert_eq!(
+                reasonix_home_for(
+                    Some(PathBuf::from("/iso")),
+                    Some(OsString::from("/appdata")),
+                    windows,
+                    home.clone()
+                ),
+                PathBuf::from("/iso")
+            );
+        }
+    }
+
+    /// #358: `REASONIX_HOME` is normalized as Reasonix's `cleanEnvDir` does,
+    /// so dcg edits the directory Reasonix reads rather than a literal
+    /// `./~/...` under the current directory.
+    #[test]
+    fn reasonix_home_override_is_normalized_like_reasonix() {
+        use std::path::{Path, PathBuf};
+        let home = Path::new("/home/jane");
+        let lookup = |name: &str| match name {
+            "BASE" => Some("/srv/base".to_string()),
+            _ => None,
+        };
+        let normalize = |raw: &str| normalize_reasonix_home_override(raw, home, lookup);
+
+        // Blank is unset.
+        assert_eq!(normalize(""), None);
+        assert_eq!(normalize("   "), None);
+        // Absolute values pass through, trimmed.
+        assert_eq!(normalize("  /iso  "), Some(PathBuf::from("/iso")));
+        // A leading tilde is the user's home.
+        assert_eq!(normalize("~"), Some(PathBuf::from("/home/jane")));
+        assert_eq!(normalize("~/rx"), Some(PathBuf::from("/home/jane/rx")));
+        assert_eq!(normalize("~\\rx"), Some(home.join("rx")));
+        // `${VAR}` and `${VAR:-default}`; an unset reference without a default
+        // expands to nothing, and non-references stay literal.
+        assert_eq!(normalize("${BASE}/rx"), Some(PathBuf::from("/srv/base/rx")));
+        assert_eq!(
+            normalize("${MISSING:-/fallback}/rx"),
+            Some(PathBuf::from("/fallback/rx"))
+        );
+        assert_eq!(normalize("/a${MISSING}/rx"), Some(PathBuf::from("/a/rx")));
+        assert_eq!(normalize("/a/${1}/rx"), Some(PathBuf::from("/a/${1}/rx")));
+        assert_eq!(normalize("/a/$BASE"), Some(PathBuf::from("/a/$BASE")));
+        assert_eq!(normalize("/a/${BASE"), Some(PathBuf::from("/a/${BASE")));
+        // A relative value is made absolute, never left relative.
+        assert!(normalize("rel/dir").is_some_and(|path| path.is_absolute()));
+    }
+
+    /// #358: when the primary settings file is missing, Reasonix reads the
+    /// legacy `~/.reasonix/settings.json`. dcg must edit that file rather
+    /// than create the primary one, which would hide every legacy hook from
+    /// Reasonix.
+    #[test]
+    fn reasonix_settings_path_follows_the_file_reasonix_loads() {
+        use std::path::{Path, PathBuf};
+        let user_home = Path::new("/home/jane");
+        let windows_home = Path::new("/appdata/reasonix");
+        let primary = windows_home.join("settings.json");
+        let legacy = PathBuf::from("/home/jane/.reasonix/settings.json");
+
+        let only = |present: &'static [&'static str]| {
+            move |path: &Path| present.iter().any(|p| Path::new(p) == path)
+        };
+        // Only the legacy file exists: that is the one Reasonix reads.
+        assert_eq!(
+            reasonix_user_settings_path_for(
+                windows_home,
+                false,
+                user_home,
+                only(&["/home/jane/.reasonix/settings.json"])
+            ),
+            legacy
+        );
+        // Once the primary exists, Reasonix stops reading the legacy file.
+        assert_eq!(
+            reasonix_user_settings_path_for(
+                windows_home,
+                false,
+                user_home,
+                only(&[
+                    "/appdata/reasonix/settings.json",
+                    "/home/jane/.reasonix/settings.json"
+                ])
+            ),
+            primary
+        );
+        // Neither exists: create the primary.
+        assert_eq!(
+            reasonix_user_settings_path_for(windows_home, false, user_home, only(&[])),
+            primary
+        );
+        // REASONIX_HOME isolates Reasonix from the legacy location.
+        assert_eq!(
+            reasonix_user_settings_path_for(
+                windows_home,
+                true,
+                user_home,
+                only(&["/home/jane/.reasonix/settings.json"])
+            ),
+            primary
+        );
+        // On macOS/Linux the two locations are the same directory.
+        assert_eq!(
+            reasonix_user_settings_path_for(
+                Path::new("/home/jane/.reasonix"),
+                false,
+                user_home,
+                only(&[])
+            ),
+            legacy
+        );
+    }
+
+    fn reasonix_entry_for(path: &str) -> serde_json::Value {
+        reasonix_dcg_hook_entry_for_executable(std::path::Path::new(path), false)
+            .expect("absolute path")
+    }
+
+    /// #358: the settings merge keeps foreign keys and hooks, is idempotent,
+    /// refreshes a stale path in place, keeps a user-tuned timeout, and
+    /// refuses shapes it cannot read.
+    #[test]
+    fn reasonix_settings_merge_preserves_user_state() {
+        let mut settings = serde_json::json!({
+            "theme": "dark",
+            "hooks": {
+                "PreToolUse": [{ "match": "bash", "command": "node check.js" }],
+                "Stop": [{ "command": "echo done" }]
+            }
+        });
+        assert!(
+            install_reasonix_hook_into_settings(
+                &mut settings,
+                false,
+                reasonix_entry_for("/opt/dcg")
+            )
+            .unwrap()
+        );
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["command"], "/opt/dcg");
+        assert_eq!(entries[0]["match"], "bash|pwsh");
+        assert_eq!(entries[0]["timeout"], 5000);
+        assert_eq!(entries[1]["command"], "node check.js");
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["hooks"]["Stop"][0]["command"], "echo done");
+
+        // Same entry again: nothing to do.
+        assert!(
+            !install_reasonix_hook_into_settings(
+                &mut settings,
+                false,
+                reasonix_entry_for("/opt/dcg")
+            )
+            .unwrap()
+        );
+
+        // A moved binary replaces the stale entry; the user's timeout stays.
+        settings["hooks"]["PreToolUse"][0]["timeout"] = serde_json::json!(9000);
+        assert!(
+            install_reasonix_hook_into_settings(
+                &mut settings,
+                false,
+                reasonix_entry_for("/new place/dcg")
+            )
+            .unwrap()
+        );
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{settings}");
+        assert_eq!(entries[0]["command"], "\"/new place/dcg\"");
+        assert_eq!(entries[0]["timeout"], 9000);
+
+        assert!(uninstall_dcg_hook_from_reasonix_settings(&mut settings).unwrap());
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], "node check.js");
+        assert!(!uninstall_dcg_hook_from_reasonix_settings(&mut settings).unwrap());
+
+        // Shapes dcg cannot read are refused, never rewritten.
+        for unreadable in [
+            serde_json::json!([]),
+            serde_json::json!({ "PreToolUse": [] }),
+            serde_json::json!({ "hooks": [] }),
+            serde_json::json!({ "hooks": { "PreToolUse": {} } }),
+        ] {
+            let mut settings = unreadable.clone();
+            assert!(
+                install_reasonix_hook_into_settings(
+                    &mut settings,
+                    false,
+                    reasonix_entry_for("/opt/dcg")
+                )
+                .is_err(),
+                "{unreadable}"
+            );
+            assert_eq!(settings, unreadable);
+        }
+    }
+
+    /// #358: the Windows command form is a double-quoted path, which Reasonix
+    /// hands to `cmd.exe /d /s /c "<command>"`; dcg must recognize it as its
+    /// own on reinstall and uninstall.
+    #[test]
+    fn reasonix_windows_entry_is_quoted_and_recognized() {
+        let entry =
+            reasonix_dcg_hook_entry_for_executable(std::path::Path::new("/opt/my tools/dcg"), true)
+                .unwrap();
+        assert_eq!(entry["command"], "\"/opt/my tools/dcg\"");
+        assert!(reasonix_hook_entry_is_dcg(&entry));
+        assert!(
+            reasonix_dcg_hook_entry_for_executable(std::path::Path::new("dcg"), false).is_err(),
+            "a relative path is never written"
         );
     }
 
@@ -21745,6 +23220,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21770,6 +23246,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(force);
@@ -21795,6 +23272,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21820,6 +23298,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21845,6 +23324,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21870,6 +23350,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21895,6 +23376,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21920,6 +23402,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(force);
@@ -21945,6 +23428,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(force);
@@ -21970,6 +23454,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(force);
@@ -21987,7 +23472,7 @@ if ($errors.Count -ne 0) {
     #[test]
     fn test_cli_parse_uninstall_crush_excludes_purge() {
         let cli = Cli::parse_from(["dcg", "uninstall", "--crush"]);
-        if let Some(Command::Uninstall { purge, crush }) = cli.command {
+        if let Some(Command::Uninstall { purge, crush, .. }) = cli.command {
             assert!(!purge);
             assert!(crush);
         } else {
@@ -22054,9 +23539,12 @@ if ($errors.Count -ne 0) {
         std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
         let config_path = dir.path().join("config.toml");
         let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        // TOML-quoted as Codex writes it: a Windows path in a hand-written
+        // basic string turns `\U...` into an escape and the key never matches.
+        let key_toml = toml_edit::Key::new(key.as_str());
         std::fs::write(
             &config_path,
-            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\n"),
+            format!("[hooks.state.{key_toml}]\ntrusted_hash = \"sha256:abc\"\n"),
         )
         .expect("write");
         assert_eq!(
@@ -22100,9 +23588,12 @@ if ($errors.Count -ne 0) {
         std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
         let config_path = dir.path().join("config.toml");
         let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        // TOML-quoted as Codex writes it: a Windows path in a hand-written
+        // basic string turns `\U...` into an escape and the key never matches.
+        let key_toml = toml_edit::Key::new(key.as_str());
         std::fs::write(
             &config_path,
-            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\nenabled = false\n"),
+            format!("[hooks.state.{key_toml}]\ntrusted_hash = \"sha256:abc\"\nenabled = false\n"),
         )
         .expect("write");
         assert_eq!(
@@ -22331,9 +23822,12 @@ if ($errors.Count -ne 0) {
         std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
         let config_path = dir.path().join("config.toml");
         let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        // TOML-quoted as Codex writes it: a Windows path in a hand-written
+        // basic string turns `\U...` into an escape and the key never matches.
+        let key_toml = toml_edit::Key::new(key.as_str());
         std::fs::write(
             &config_path,
-            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\n"),
+            format!("[hooks.state.{key_toml}]\ntrusted_hash = \"sha256:abc\"\n"),
         )
         .expect("write");
         // Trusted and enabled, yet the program is gone: that outranks the
@@ -22480,6 +23974,78 @@ if ($errors.Count -ne 0) {
         );
     }
 
+    #[test]
+    fn opencode_version_parser_distinguishes_v1_from_v2_419() {
+        assert_eq!(parse_opencode_major_version("1.2.3"), Some(1));
+        assert_eq!(parse_opencode_major_version("opencode 2.0.4"), Some(2));
+        assert_eq!(parse_opencode_major_version("OpenCode v12.7.1\n"), Some(12));
+        assert_eq!(parse_opencode_major_version("version unknown"), None);
+    }
+
+    /// #419: the generated plugin must load under BOTH OpenCode plugin
+    /// contracts.
+    ///
+    /// v1 reads the named `DcgGuard` export and calls
+    /// `tool.execute.before(input, output)`; v2 requires a default export
+    /// `{ id, setup(ctx) }` and registers through
+    /// `ctx.tool.hook("execute.before", cb)`. A v1-only file fails v2's loader
+    /// with `SchemaError: Missing key at ["default"]` and the bash tool then
+    /// runs unguarded, with nothing visible outside OpenCode's log.
+    ///
+    /// Both shapes live in one file rather than being selected by a detected
+    /// version, because detection answers `None` whenever `opencode` is not on
+    /// PATH at install time, and `dcg update` regenerates this file long after
+    /// `dcg install` ran — so a version-selected template can be written for
+    /// the wrong major.
+    #[test]
+    fn opencode_plugin_source_exports_both_v1_and_v2_shapes_419() {
+        let source = build_opencode_plugin_source(std::path::Path::new("/opt/bin/dcg"))
+            .expect("plugin generation");
+
+        // v1 contract.
+        assert!(
+            source.contains("export const DcgGuard"),
+            "v1 loads the named DcgGuard export"
+        );
+        assert!(
+            source.contains("\"tool.execute.before\""),
+            "v1 registers a tool.execute.before hook map"
+        );
+
+        // v2 contract.
+        assert!(
+            source.contains("export default"),
+            "v2 requires a default export, absent one it reports \
+             SchemaError: Missing key at [\"default\"]"
+        );
+        assert!(
+            source.contains("id: \"dcg-guard\""),
+            "v2's default export must carry an id"
+        );
+        assert!(
+            source.contains("async setup(ctx)"),
+            "v2's default export must carry a setup function"
+        );
+        assert!(
+            source.contains("ctx.tool.hook(\"execute.before\""),
+            "v2 registers hooks through ctx.tool.hook"
+        );
+
+        // v2 migrated Bun -> Node, so `Bun` is undefined there. Bun implements
+        // the `node:` modules, so one spawn path serves both runtimes.
+        assert!(
+            source.contains("node:child_process"),
+            "the spawn path must work on both the Bun and Node runtimes"
+        );
+        // The call, not the mention: the generated file's own comment explains
+        // why `Bun.spawn` is not used, so a bare substring test flags its own
+        // documentation.
+        assert!(
+            !source.contains("Bun.spawn("),
+            "Bun.spawn is undefined under OpenCode v2's Node runtime"
+        );
+    }
+
     /// #318: the generated OpenCode plugin embeds the absolute dcg path as a
     /// JSON string literal (never a bare PATH lookup, never shell-quoted) and
     /// carries the ownership marker the installer/uninstaller key on.
@@ -22547,7 +24113,7 @@ if ($errors.Count -ne 0) {
         let original_dir = std::env::current_dir().expect("current directory before probe");
         std::env::set_current_dir(&root).expect("enter persistent project fixture");
         assert_eq!(
-            dirs::home_dir().as_deref(),
+            crate::config::home_dir().as_deref(),
             Some(isolated_home.as_path()),
             "run this gate with HOME bound to its isolated-home fixture"
         );
@@ -25742,6 +27308,20 @@ console.log(JSON.stringify({
     // ========================================================================
 
     #[test]
+    fn base_embedded_rule_grants_carry_a_refinement_note_470() {
+        let note = |id: &str| refined_rule_grant_note(&RuleId::parse(id).expect("valid id"));
+        let base = note("heredoc.javascript:fs_rmsync").expect("base heredoc id gets a note");
+        assert!(
+            base.contains("heredoc.javascript:fs_rmsync.catastrophic"),
+            "{base}"
+        );
+        // Already refined, wildcarded, or not an embedded-code rule: no note.
+        assert!(note("heredoc.javascript:fs_rmsync.catastrophic").is_none());
+        assert!(note("heredoc.python:*").is_none());
+        assert!(note("core.git:reset-hard").is_none());
+    }
+
+    #[test]
     fn test_cli_parse_allowlist_add() {
         let cli = Cli::parse_from([
             "dcg",
@@ -25936,6 +27516,29 @@ console.log(JSON.stringify({
         } else {
             unreachable!("Expected Allowlist AddCommand command with paths");
         }
+    }
+
+    /// Single-use is the default; `--reusable` is the opt-out, and it cannot
+    /// be combined with an explicit `--single-use` (#378).
+    #[test]
+    fn allow_once_reusable_is_opt_in_issue_378() {
+        let cli = Cli::parse_from(["dcg", "allow-once", "ab12", "--reusable", "--yes"]);
+        let Some(Command::AllowOnce(cmd)) = cli.command else {
+            panic!("expected allow-once");
+        };
+        assert!(cmd.reusable);
+        assert!(!cmd.single_use);
+
+        let cli = Cli::parse_from(["dcg", "allow-once", "ab12", "--yes"]);
+        let Some(Command::AllowOnce(cmd)) = cli.command else {
+            panic!("expected allow-once");
+        };
+        assert!(!cmd.reusable, "with no flag the grant is single-use");
+
+        assert!(
+            Cli::try_parse_from(["dcg", "allow-once", "ab12", "--reusable", "--single-use"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -28278,6 +29881,7 @@ exclude = ["target/**"]
             dry_run: true,
             json: true,
             single_use: false,
+            reusable: false,
             force: false,
             pick: Some(2),
             hash: None,
@@ -28294,6 +29898,7 @@ exclude = ["target/**"]
             dry_run: true,
             json: true,
             single_use: false,
+            reusable: false,
             force: false,
             pick: None,
             hash: Some(b.full_hash.clone()),
@@ -28301,6 +29906,46 @@ exclude = ["target/**"]
         let records = [a, b.clone()];
         let selected = select_pending_entry(&records, &cmd_hash).unwrap();
         assert_eq!(selected.full_hash, b.full_hash);
+    }
+
+    /// Two records for one denial (same second, cwd and command) share their
+    /// full hash; redeeming the code must not demand a choice between them.
+    #[test]
+    fn identical_pending_records_are_one_grant() {
+        use crate::logging::RedactionConfig;
+
+        let ts = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = RedactionConfig::default();
+        let record = || {
+            PendingExceptionRecord::new(
+                ts,
+                "/repo",
+                "git reset --hard",
+                "blocked",
+                &redaction,
+                false,
+                None,
+            )
+        };
+        let records = [record(), record()];
+        assert_eq!(records[0].full_hash, records[1].full_hash);
+
+        let cmd = AllowOnceCommand {
+            action: None,
+            code: Some(records[0].short_code.clone()),
+            yes: true,
+            show_raw: false,
+            dry_run: true,
+            json: true,
+            single_use: false,
+            reusable: false,
+            force: false,
+            pick: None,
+            hash: None,
+        };
+        assert!(select_pending_entry(&records, &cmd).is_ok());
     }
 
     #[test]
@@ -28337,6 +29982,7 @@ exclude = ["target/**"]
             dry_run: true,
             json: true,
             single_use: false,
+            reusable: false,
             force: false,
             pick: Some(3),
             hash: None,
@@ -29159,6 +30805,80 @@ exclude = ["target/**"]
             &heredoc_settings,
             None,
         )
+    }
+
+    /// The default dialect now covers the semantic delete front ends (#491).
+    ///
+    /// This test used to pin the OPPOSITE, and it carried its own retirement
+    /// instruction: "when the union is completed, invert this test and drop the
+    /// caveats". `Remove-Item -Recurse -Force /etc` was denied by `--dialect ps`
+    /// and allowed at the default, because
+    /// `parse_rm_command_segment_in_dialect` dispatched its Windows front ends
+    /// on an EXACT dialect and `Unknown` matched no arm. It now tries POSIX
+    /// first and then both Windows front ends, so the gap this test was written
+    /// to record is closed and the assertion is inverted.
+    ///
+    /// The claim is deliberately no broader than that. This pins the ONE
+    /// command the caveat named; it does not assert that `Unknown` denies
+    /// everything some concrete dialect denies, which has not been measured
+    /// across every pack. `DialectArg::Unknown`'s doc says the same, in the same
+    /// terms — if a future spelling is found that denies under `ps` or `cmd` and
+    /// allows here, that is a new instance of the same shape, not a regression
+    /// of this one.
+    #[test]
+    fn default_dialect_covers_the_semantic_delete_front_ends_issue_491() {
+        let command = "Remove-Item -Recurse -Force /etc";
+
+        let ps = evaluate_at_dialect(command, DialectArg::Ps);
+        assert!(
+            matches!(ps, EvaluationDecision::Deny),
+            "the PowerShell view must still deny this; if it does not, #451 has \
+             regressed and this test is measuring the wrong thing"
+        );
+
+        let unknown = evaluate_at_dialect(command, DialectArg::Unknown);
+        assert!(
+            matches!(unknown, EvaluationDecision::Deny),
+            "#491: the default dialect must deny what the PowerShell view denies \
+             for this command — the Unknown fan-out in \
+             `parse_rm_command_segment_in_dialect` is what closes it"
+        );
+
+        // The POSIX reading is tried first and is unaffected: an ordinary
+        // recursive delete of a project path keeps its own rule, and a literal
+        // temp path keeps its carve-out.
+        assert!(
+            !matches!(
+                evaluate_at_dialect("rm -rf /tmp/scratch/x", DialectArg::Unknown),
+                EvaluationDecision::Deny
+            ),
+            "#491: the fan-out must not disturb the literal-temp carve-out"
+        );
+    }
+
+    fn evaluate_at_dialect(command: &str, dialect: DialectArg) -> EvaluationDecision {
+        let config = Config::default();
+        let compiled_overrides = config.overrides.compile();
+        let allowlists = crate::allowlist::LayeredAllowlist::default();
+        let heredoc_settings = config.heredoc_settings();
+        let enabled_packs = config.enabled_pack_ids();
+        let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            dialect.into(),
+        )
+        .decision
     }
 
     #[test]

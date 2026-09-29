@@ -462,16 +462,26 @@ pub fn evaluate_extracted_command(
             std::env::current_dir().ok().map(|cwd| cwd.join(candidate))
         }
     };
-    let result = evaluate_command_with_pack_order_at_path_in_dialect(
+    let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
+        evaluate_command_with_pack_order_at_path_in_dialect(
+            command,
+            &ctx.enabled_keywords,
+            &ctx.ordered_packs,
+            ctx.keyword_index.as_ref(),
+            &ctx.compiled_overrides,
+            allowlists,
+            &ctx.heredoc_settings,
+            project_path.as_deref(),
+            shell_dialect_for_extractor_id(&extracted.extractor_id),
+        )
+    };
+    // A warn/log/ask first match must not hide a later deny (#498).
+    let result = crate::evaluator::escalate_masked_findings(
+        config,
         &extracted.command,
-        &ctx.enabled_keywords,
-        &ctx.ordered_packs,
-        ctx.keyword_index.as_ref(),
-        &ctx.compiled_overrides,
         &ctx.allowlists,
-        &ctx.heredoc_settings,
-        project_path.as_deref(),
-        shell_dialect_for_extractor_id(&extracted.extractor_id),
+        evaluate(&extracted.command, &ctx.allowlists),
+        evaluate,
     );
 
     match result.decision {
@@ -4712,7 +4722,11 @@ fail_on = "nope"
             line: 1,
             col: None,
             extractor_id: "shell.script".to_string(),
-            command: "rm -rf ./some/path".to_string(),
+            // `man` only reads a manual page: the rule matches text in the
+            // operands of a different command, which is what confidence
+            // scoring is for. A direct `rm -rf ./some/path` scores a full 1.0
+            // and correctly stays a deny even at this threshold.
+            command: "man rm -rf ./some/path".to_string(),
             metadata: None,
         };
 

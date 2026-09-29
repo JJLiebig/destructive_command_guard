@@ -44,9 +44,10 @@ loaded in full rather than through the enforcement-only project filter.
 
 On Unix, automatic discovery additionally requires `.dcg.toml` to be a direct
 regular file and binds the pathname to the same descriptor used for the
-bounded read. Native Windows currently ignores automatic project config until
-dcg has equivalent reparse-point-safe open and file-identity checks. A reviewed
-file remains available there through explicit `DCG_CONFIG` selection.
+bounded read. Native Windows applies the equivalent policy: the file is opened
+with `FILE_FLAG_OPEN_REPARSE_POINT` so a symlinked or junctioned `.dcg.toml` is
+refused rather than followed, must be a regular file, and the path must still
+name the opened handle's file when validation finishes.
 
 Implicit system config is likewise accepted only on Unix, from a direct
 root-owned path whose file and ancestor directories are not group/world
@@ -369,6 +370,23 @@ The database path resolves in this order (highest priority first):
 Directories dcg creates for the database are `0700` on Unix. `dcg doctor`
 reports the resolved path, its source, and whether the hook can write there
 (check id `history` in `--format json`).
+
+## Decision Log
+
+```toml
+[logging]
+enabled = false              # opt-in
+file = "~/.local/state/dcg/decisions.log"
+format = "text"              # "text" | "json"
+# caller_env = "FLYWHEEL_AGENT_ID"
+```
+
+`caller_env` names an environment variable whose value identifies the caller.
+It is recorded on every entry as `caller` (JSON) or `[caller:…]` (text), for
+setups where one host runs many agents and the built-in agent detection only
+recognises vendor variables. Whoever sets the variable controls it, so it is
+treated as a label and never as input: it is reduced to printable ASCII on a
+single line, capped at 64 characters, and never consulted by any decision.
 
 ## Editor Autocomplete & Validation (JSON Schema)
 

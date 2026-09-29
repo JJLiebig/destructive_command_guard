@@ -54,13 +54,10 @@ description = "sudo rm -rf"
 command = "sudo rm -rf /"
 expected = "deny"
 
-# NOTE: git clean -d -f (flags separated) is not currently detected.
-# The pattern expects -fd or -df combined. This is a gap.
-# Tracked in: tests/corpus/README.md (future enhancement)
-# [[case]]
-# description = "git clean variations"
-# command = "git clean -d -f"
-# expected = "deny"
+[[case]]
+description = "git clean variations (flags separated)"
+command = "git clean -d -f"
+expected = "deny"
 
 [[case]]
 description = "backslash escaped git"
@@ -183,4 +180,24 @@ expected = "deny"
 [[case]]
 description = "trash rescue does not launder a sensitive source"
 command = "mv /etc ~/.Trash/"
+expected = "deny"
+
+[[case]]
+description = "a literal cd makes a relative rm operand a protected file (#480)"
+command = "cd ~/.ssh && rm id_rsa"
+expected = "deny"
+
+[[case]]
+description = "a literal cd makes a relative redirect target a credential file (#480)"
+command = "cd /home/user/.ssh; echo k >>authorized_keys"
+expected = "deny"
+
+[[case]]
+description = "a glued relative redirect is not echo data (#480)"
+command = "echo x >.git/config"
+expected = "deny"
+
+[[case]]
+description = "a literal brace alternation names each protected file (#482)"
+command = "rm ~/.ssh/{id_rsa,id_ed25519}"
 expected = "deny"

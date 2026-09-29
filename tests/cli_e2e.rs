@@ -19,13 +19,39 @@ fn dcg_binary() -> std::path::PathBuf {
 }
 
 /// Helper to run dcg with arguments and capture output.
+///
+/// Hermetic, for the same reason `tests/golden_artifacts.rs` is: without an
+/// isolated `HOME`/`XDG_CONFIG_HOME`, dcg reads the developer's real
+/// `~/.config/dcg/config.toml`. That made assertions here depend on the
+/// machine — a maintainer with `[policy.rules] "core.git:reset-hard" = "warn"`
+/// (a documented, supported setting, and precisely the one #417 exists to
+/// support) saw `explain_json_format_is_valid` fail on `mode`, while CI stayed
+/// green. Clear the environment, then re-export only what the binary needs.
 fn run_dcg(args: &[&str]) -> std::process::Output {
-    Command::new(dcg_binary())
-        .args(args)
+    let home = tempfile::tempdir().expect("create isolated HOME for run_dcg");
+    std::fs::create_dir_all(home.path().join(".config/dcg"))
+        .expect("create XDG_CONFIG_HOME/dcg under isolated HOME");
+    std::fs::create_dir_all(home.path().join("tmp")).expect("create isolated TMPDIR");
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.args(args).env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("DCG_NO_SELF_HEAL", "1")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("TERM", "dumb")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("failed to execute dcg")
+        .stderr(Stdio::piped());
+
+    cmd.output().expect("failed to execute dcg")
 }
 
 /// Run `dcg create-new` with byte-exact piped input and capture every output
@@ -466,6 +492,106 @@ fn bare_hook_unverified_decision_controls_oversized_fallback() {
         String::from_utf8_lossy(&safe_out.stdout).trim().is_empty(),
         "unverified_decision=deny must still allow a valid safe command"
     );
+}
+
+/// A payload that declares `bypassPermissions`/`dontAsk` gets the unattended
+/// posture without configuration: Claude Code documents that a hook `deny`
+/// holds in those modes but not what a hook `ask` does there, and an `ask`
+/// waved through would run exactly the command dcg could not inspect.
+/// A payload serde still cannot parse -- nesting past its recursion limit, a
+/// trailing comma -- gets the best-effort scan the oversized and invalid-UTF-8
+/// payloads already had, instead of failing open with the destructive command
+/// in plain view. Malformed input with no visible shell command still fails
+/// open (the documented default).
+#[test]
+fn bare_hook_unparseable_json_with_a_visible_destructive_command_is_denied() {
+    let deep = format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":"rm -rf ~"}},"x":{}{}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    let trailing_comma = r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"},}"#;
+    for raw in [deep.as_str(), trailing_comma] {
+        let out = run_dcg_hook_raw(raw.as_bytes(), &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("\"permissionDecision\":\"deny\""),
+            "unparseable payload with a destructive command must be judged.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for raw in [
+        r#"{"tool_name":"Bash","tool_input":{"command":"git status"},}"#,
+        r#"{"tool_name":"Read","tool_input":{"command":"rm -rf ~"},}"#,
+        "not json at all",
+    ] {
+        let out = run_dcg_hook_raw(raw.as_bytes(), &[]);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "{raw}: stdout {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+/// Through the real binary: a lone surrogate escape used to fail the parse
+/// and so allow the destructive command beside it (fail-open).
+#[test]
+fn bare_hook_lone_surrogate_escape_does_not_fail_open() {
+    let raw = br#"{"tool_name":"Bash","tool_input":{"command":"rm -rf ~ # \ud800"}}"#;
+    let out = run_dcg_hook_raw(raw, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "a lone surrogate must not make the command fail open.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not parse hook input"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn bare_hook_unattended_permission_mode_denies_unverified_commands() {
+    let padding = "x".repeat(70 * 1024);
+    let payload = |mode: &str| {
+        format!(
+            r#"{{"hook_event_name":"PreToolUse","permission_mode":"{mode}","tool_name":"Bash","tool_input":{{"command":"echo {padding}"}}}}"#
+        )
+        .into_bytes()
+    };
+
+    for mode in ["bypassPermissions", "dontAsk"] {
+        let out = run_dcg_hook_raw(&payload(mode), &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("\"permissionDecision\":\"deny\""),
+            "{mode}: an unverified command must be denied, not asked.\nstdout: {stdout}"
+        );
+    }
+    for mode in ["default", "acceptEdits", "plan"] {
+        let out = run_dcg_hook_raw(&payload(mode), &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("\"permissionDecision\":\"ask\""),
+            "{mode}: a human can answer, so the default ask stays.\nstdout: {stdout}"
+        );
+    }
+    // An explicit operator choice still wins.
+    let out = run_dcg_hook_raw(
+        &payload("bypassPermissions"),
+        &[("DCG_UNVERIFIED_DECISION", "ask")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"ask\""),
+        "explicit DCG_UNVERIFIED_DECISION=ask must be honoured.\nstdout: {stdout}"
+    );
+    // Verified commands are untouched: a safe command stays silent.
+    let safe = br#"{"permission_mode":"bypassPermissions","tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+    let out = run_dcg_hook_raw(safe, &[]);
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
 }
 
 /// Run bare `dcg` with raw stdin, optional env, and an optional user config
@@ -1015,6 +1141,11 @@ mod allow_once_flow_tests {
 
         /// Run dcg in hook mode with JSON input.
         fn run_hook(&self, command: &str) -> HookRunOutput {
+            self.run_hook_with_env(command, &[])
+        }
+
+        /// [`Self::run_hook`] with extra environment variables for the child.
+        fn run_hook_with_env(&self, command: &str, extra_env: &[(&str, &str)]) -> HookRunOutput {
             let input = serde_json::json!({
                 "tool_name": "Bash",
                 "tool_input": {
@@ -1031,6 +1162,7 @@ mod allow_once_flow_tests {
                 .env("DCG_PACKS", "core.git,core.filesystem")
                 .env("DCG_PENDING_EXCEPTIONS_PATH", &self.pending_path)
                 .env("DCG_ALLOW_ONCE_PATH", &self.allow_once_path)
+                .envs(extra_env.iter().copied())
                 .current_dir(self.temp.path())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1207,9 +1339,198 @@ mod allow_once_flow_tests {
         let result2 = env.run_hook(command);
         assert_is_allowed(&result2);
 
-        // Step 4: Run it again to verify reusable (not single-use)
+        // Step 4: the grant was single-use (the default since #378), so the
+        // same command is denied again.
         let result3 = env.run_hook(command);
-        assert_is_allowed(&result3);
+        assert_is_denial(&result3);
+    }
+
+    /// With `general.log_file` set, the allow-once lifecycle is audited: the
+    /// code issued at the block, the redemption that lifts it, and the grant
+    /// when the command then runs. Every production caller used to pass no
+    /// audit config, so only `clear`/`revoke` were ever written — the
+    /// redemption, the step that actually lifts a block, went unrecorded.
+    #[test]
+    fn allow_once_lifecycle_is_written_to_the_audit_log() {
+        let env = FlowTestEnv::new();
+        let log_path = env.temp.path().join("dcg-audit.log");
+        let config = format!("[general]\nlog_file = {:?}\n", log_path.to_string_lossy());
+        // The user config under both spellings the platforms resolve.
+        for dir in [
+            env.xdg_config_dir.join("dcg"),
+            env.home_dir.join(".config").join("dcg"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("config.toml"), &config).expect("write config");
+        }
+        let command = "git reset --hard";
+
+        let denied = env.run_hook(command);
+        let code = extract_code_from_denial(&assert_is_denial(&denied))
+            .expect("blocked command should emit allow-once code");
+        let allow_output = env.run_cli(&["allow-once", &code, "--yes"]);
+        assert!(
+            allow_output.status.success(),
+            "allow-once should succeed: {}",
+            String::from_utf8_lossy(&allow_output.stderr)
+        );
+        assert_is_allowed(&env.run_hook(command));
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        for event in ["code_issued", "code_resolved", "allow_granted"] {
+            assert!(log.contains(event), "audit log is missing {event}:\n{log}");
+        }
+    }
+
+    /// `[logging] enabled = true` writes one structured line per hook decision.
+    /// The section was parsed, validated and exported in the schema, and
+    /// `DecisionLogger` was implemented and unit-tested, but nothing ever
+    /// constructed it: the file stayed empty whatever the config said.
+    #[test]
+    fn logging_section_records_hook_decisions() {
+        let env = FlowTestEnv::new();
+        let log_path = env.temp.path().join("decisions.jsonl");
+        let config = format!(
+            "[logging]\nenabled = true\nfile = {:?}\nformat = \"json\"\n\
+             [logging.events]\ndeny = true\nallow = true\n",
+            log_path.to_string_lossy()
+        );
+        for dir in [
+            env.xdg_config_dir.join("dcg"),
+            env.home_dir.join(".config").join("dcg"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("config.toml"), &config).expect("write config");
+        }
+
+        assert_is_denial(&env.run_hook("git reset --hard"));
+        assert_is_allowed(&env.run_hook("git status"));
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let entries: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json log line"))
+            .collect();
+        assert_eq!(entries.len(), 2, "one line per decision:\n{log}");
+        assert_eq!(entries[0]["decision"], "deny");
+        assert_eq!(entries[0]["rule_id"], "core.git:reset-hard");
+        assert_eq!(entries[1]["decision"], "allow");
+        assert_eq!(entries[1]["mode"], "allow");
+    }
+
+    /// `[logging] caller_env` attributes each record to a caller the built-in
+    /// agent detection does not know (#378), sanitized to a single line.
+    #[test]
+    fn logging_records_the_configured_caller_issue_378() {
+        let env = FlowTestEnv::new();
+        let log_path = env.temp.path().join("decisions.jsonl");
+        let config = format!(
+            "[logging]\nenabled = true\nfile = {:?}\nformat = \"json\"\n\
+             caller_env = \"DCG_TEST_CALLER\"\n[logging.events]\ndeny = true\n",
+            log_path.to_string_lossy()
+        );
+        for dir in [
+            env.xdg_config_dir.join("dcg"),
+            env.home_dir.join(".config").join("dcg"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("config.toml"), &config).expect("write config");
+        }
+
+        assert_is_denial(&env.run_hook_with_env(
+            "git reset --hard",
+            &[("DCG_TEST_CALLER", "agent-7\nforged")],
+        ));
+        assert_is_denial(&env.run_hook("git reset --hard"));
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let entries: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json log line"))
+            .collect();
+        assert_eq!(entries.len(), 2, "{log}");
+        assert_eq!(entries[0]["caller"], "agent-7forged", "{log}");
+        assert!(
+            entries[1].get("caller").is_none(),
+            "unset variable, no label: {log}"
+        );
+    }
+
+    /// An allow-once grant is consumed by its first use unless `--reusable`
+    /// asks otherwise (#378): "allow once" means once.
+    #[test]
+    fn allow_once_is_single_use_by_default_issue_378() {
+        let env = FlowTestEnv::new();
+        let command = "git reset --hard";
+
+        let code = extract_code_from_denial(&assert_is_denial(&env.run_hook(command)))
+            .expect("denial carries a code");
+        assert!(
+            env.run_cli(&["allow-once", &code, "--yes"])
+                .status
+                .success()
+        );
+        assert_is_allowed(&env.run_hook(command));
+        assert_is_denial(&env.run_hook(command));
+
+        let code = extract_code_from_denial(&assert_is_denial(&env.run_hook(command)))
+            .expect("a fresh denial carries a code");
+        let reusable = env.run_cli(&["allow-once", &code, "--yes", "--reusable"]);
+        assert!(
+            reusable.status.success(),
+            "reusable grant failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&reusable.stdout),
+            String::from_utf8_lossy(&reusable.stderr)
+        );
+        assert_is_allowed(&env.run_hook(command));
+        assert_is_allowed(&env.run_hook(command));
+    }
+
+    /// `dcg explain` must agree with `dcg test` on a path-scoped grant and say
+    /// which grant allowed the command. It used to evaluate with no project
+    /// path, so a `paths = [...]` entry never applied and explain reported
+    /// DENY where the hook and `dcg test` allowed; and when a grant did apply
+    /// it printed a bare ALLOW, naming neither the layer nor the entry.
+    #[test]
+    fn explain_names_the_allowlist_grant_and_honours_its_paths() {
+        let env = FlowTestEnv::new();
+        let project = env.temp.path().canonicalize().expect("canonical temp");
+        let allowlist = format!(
+            "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"reviewed reset\"\n\
+             added_at = \"2026-09-22T00:00:00Z\"\npaths = [{:?}, {:?}]\n",
+            project.to_string_lossy(),
+            project.join("**").to_string_lossy()
+        );
+        for dir in [
+            env.xdg_config_dir.join("dcg"),
+            env.home_dir.join(".config").join("dcg"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("allowlist.toml"), &allowlist).expect("write allowlist");
+        }
+
+        let test_json: serde_json::Value = serde_json::from_slice(
+            &env.run_cli(&["test", "--format", "json", "git reset --hard"])
+                .stdout,
+        )
+        .expect("test json");
+        let explain_json: serde_json::Value = serde_json::from_slice(
+            &env.run_cli(&["explain", "--format", "json", "git reset --hard"])
+                .stdout,
+        )
+        .expect("explain json");
+
+        assert_eq!(test_json["decision"], "allow", "{test_json}");
+        assert_eq!(explain_json["decision"], "allow", "{explain_json}");
+        assert_eq!(explain_json["allowlist"]["layer"], "user", "{explain_json}");
+        assert_eq!(
+            explain_json["allowlist"]["entry_reason"], "reviewed reset",
+            "{explain_json}"
+        );
+        assert_eq!(
+            explain_json["allowlist"]["original_match"]["rule_id"], "core.git:reset-hard",
+            "{explain_json}"
+        );
     }
 
     /// #262: without `--yes` and without a terminal, the confirmation can
@@ -2046,6 +2367,116 @@ mod config_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(cwd.join(".omp/extensions/dcg-guard.ts").is_file());
+    }
+
+    /// #358: `dcg install --reasonix` merges a `hooks.PreToolUse` entry into
+    /// `<Reasonix home>/settings.json`, keeps unrelated settings and hooks, is
+    /// idempotent, and keeps a user's timeout on reinstall. The installed
+    /// command is then run the way Reasonix runs it (`sh -c`, the Reasonix
+    /// payload on stdin): exit 2 with the reason on stderr blocks a
+    /// destructive command, exit 0 lets a safe one through. `dcg uninstall
+    /// --reasonix` removes exactly what it added.
+    #[test]
+    fn install_reasonix_hook_blocks_through_the_installed_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let reasonix_home = temp.path().join("reasonix-home");
+        let settings_path = reasonix_home.join("settings.json");
+        std::fs::create_dir_all(&reasonix_home).expect("reasonix home");
+        std::fs::write(
+            &settings_path,
+            r#"{"theme":"dark","hooks":{"PreToolUse":[{"match":"bash","command":"node check.js"}],"Stop":[{"command":"echo done"}]}}"#,
+        )
+        .expect("seed settings.json");
+
+        let run = |args: &[&str]| {
+            std::process::Command::new(dcg_binary())
+                .args(args)
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("REASONIX_HOME", &reasonix_home)
+                .current_dir(temp.path())
+                .output()
+                .expect("run dcg")
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("settings.json stays valid JSON")
+        };
+
+        let output = run(&["install", "--reasonix"]);
+        assert!(
+            output.status.success(),
+            "install --reasonix: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let settings = read();
+        assert_eq!(settings["theme"], "dark", "unrelated settings kept");
+        assert_eq!(settings["hooks"]["Stop"][0]["command"], "echo done");
+        let entries = settings["hooks"]["PreToolUse"].as_array().expect("array");
+        assert_eq!(entries.len(), 2, "{settings}");
+        assert_eq!(entries[0]["match"], "bash|pwsh");
+        assert_eq!(entries[0]["timeout"], 5000);
+        assert_eq!(entries[1]["command"], "node check.js");
+        let command = entries[0]["command"].as_str().expect("command").to_string();
+
+        // Idempotent, and a user's timeout survives a forced reinstall.
+        assert!(
+            String::from_utf8_lossy(&run(&["install", "--reasonix"]).stdout)
+                .contains("already installed")
+        );
+        let mut settings = read();
+        settings["hooks"]["PreToolUse"][0]["timeout"] = serde_json::json!(8000);
+        std::fs::write(&settings_path, settings.to_string()).expect("edit timeout");
+        assert!(run(&["install", "--reasonix", "--force"]).status.success());
+        assert_eq!(read()["hooks"]["PreToolUse"][0]["timeout"], 8000);
+        assert_eq!(read()["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+
+        // The installed command, run as Reasonix runs it.
+        #[cfg(unix)]
+        {
+            let hook = |shell_command: &str| {
+                let payload = serde_json::json!({
+                    "event": "PreToolUse",
+                    "cwd": temp.path(),
+                    "toolName": "bash",
+                    "toolArgs": { "command": shell_command },
+                });
+                let mut child = std::process::Command::new("sh")
+                    .args(["-c", &command])
+                    .env_clear()
+                    .env("HOME", &home_dir)
+                    .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                    .env("PATH", "/usr/bin:/bin")
+                    .current_dir(temp.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn installed hook");
+                serde_json::to_writer(child.stdin.as_mut().unwrap(), &payload).unwrap();
+                child.wait_with_output().expect("hook output")
+            };
+            let blocked = hook("git reset --hard");
+            assert_eq!(blocked.status.code(), Some(2), "exit 2 blocks in Reasonix");
+            assert!(blocked.stdout.is_empty(), "Reasonix never reads stdout");
+            let reason = String::from_utf8_lossy(&blocked.stderr);
+            assert!(reason.contains("BLOCKED by dcg"), "{reason}");
+            assert!(reason.contains("core.git:reset-hard"), "{reason}");
+
+            let allowed = hook("git status");
+            assert_eq!(allowed.status.code(), Some(0), "exit 0 passes");
+        }
+
+        let output = run(&["uninstall", "--reasonix"]);
+        assert!(output.status.success());
+        let settings = read();
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{settings}");
+        assert_eq!(entries[0]["command"], "node check.js");
+        assert_eq!(settings["theme"], "dark");
     }
 
     /// #388: `dcg install --crush` merges a flat `hooks.PreToolUse` entry into
@@ -3120,7 +3551,13 @@ mod config_tests {
         let check = doctor_history_check(&temp, &home_dir, &xdg_config_dir, &bin_dir, &[]);
         assert_eq!(check["status"], "ok", "{check}");
         let message = check["message"].as_str().expect("message");
-        let expected = home_dir.join(".local").join("state").join("dcg");
+        // Windows: %LOCALAPPDATA%\dcg, derived from the redirected profile
+        // because this environment is cleared.
+        let expected = if cfg!(windows) {
+            home_dir.join("AppData").join("Local").join("dcg")
+        } else {
+            home_dir.join(".local").join("state").join("dcg")
+        };
         assert!(
             message.contains(&expected.display().to_string()),
             "default must live under the state directory: {message}"
@@ -3164,16 +3601,19 @@ mod config_tests {
             &[("XDG_STATE_HOME", xdg_state.as_os_str())],
         );
         let message = check["message"].as_str().expect("message").to_string();
-        assert!(
-            message.contains(
-                &xdg_state
-                    .join("dcg")
-                    .join("history.db")
-                    .display()
-                    .to_string()
-            ),
-            "XDG_STATE_HOME must relocate the default: {message}"
-        );
+        // XDG_STATE_HOME is a Unix convention; Windows keeps %LOCALAPPDATA%.
+        if cfg!(unix) {
+            assert!(
+                message.contains(
+                    &xdg_state
+                        .join("dcg")
+                        .join("history.db")
+                        .display()
+                        .to_string()
+                ),
+                "XDG_STATE_HOME must relocate the default: {message}"
+            );
+        }
 
         // Config override.
         std::fs::write(
@@ -6074,7 +6514,6 @@ custom_paths = ["{}"]
     }
 
     #[test]
-    #[ignore = "External pack loading not yet integrated into evaluation path"]
     fn custom_pack_blocks_matching_command() {
         let pack_content = r#"
 schema_version: 1
@@ -6103,8 +6542,94 @@ destructive_patterns:
         );
     }
 
+    /// A redirect-style pack authors its own closing instruction (#416); a
+    /// rule's text wins over the pack's, and the deny, the `BLOCKED` header
+    /// and the rule id stay dcg's.
     #[test]
-    #[ignore = "External pack loading not yet integrated into evaluation path"]
+    fn custom_pack_authors_its_denial_trailer_issue_416() {
+        let pack_content = r#"
+schema_version: 1
+id: custom.hostedci
+name: Hosted CI redirects
+version: 1.0.0
+keywords: [sem, terraform]
+denial_trailer: "Run this through the hosted pipeline instead: load the /semaphore skill."
+destructive_patterns:
+  - name: sem-direct
+    pattern: \bsem\b
+    severity: high
+    description: Use the hosted Semaphore pipeline, not the local sem CLI
+  - name: terraform-apply
+    pattern: \bterraform\s+apply\b
+    severity: high
+    description: Terraform applies go through the pipeline
+    denial_trailer: "Open a pipeline run for this workspace instead."
+"#;
+        let reason_for = |command: &str| {
+            let (_temp, output) = setup_custom_pack_env(pack_content, command);
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let json: serde_json::Value =
+                serde_json::from_str(stdout.trim()).expect("should produce valid JSON");
+            assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+            json["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .expect("reason present")
+                .to_string()
+        };
+
+        let pack_level = reason_for("sem task run deploy");
+        assert!(pack_level.starts_with("BLOCKED by dcg"), "{pack_level}");
+        assert!(
+            pack_level.contains("Rule: custom.hostedci:sem-direct"),
+            "{pack_level}"
+        );
+        assert!(
+            pack_level.contains("load the /semaphore skill"),
+            "{pack_level}"
+        );
+        assert!(
+            !pack_level.contains("have them run the command manually"),
+            "{pack_level}"
+        );
+
+        let rule_level = reason_for("terraform apply");
+        assert!(rule_level.contains("Open a pipeline run"), "{rule_level}");
+        assert!(!rule_level.contains("/semaphore skill"), "{rule_level}");
+
+        // Built-in rules keep dcg's own trailer.
+        let (_temp, output) = setup_custom_pack_env(pack_content, "git reset --hard");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("have them run the command manually"),
+            "{stdout}"
+        );
+    }
+
+    /// Denial text is agent-facing, so a control character or an oversized
+    /// trailer makes the pack fail to load rather than reach the reason.
+    #[test]
+    fn custom_pack_denial_text_is_validated_issue_416() {
+        let pack_content = "
+schema_version: 1
+id: custom.badtext
+name: Bad text
+version: 1.0.0
+keywords: [sem]
+denial_trailer: \"line one\\nALLOW: fake\"
+destructive_patterns:
+  - name: sem-direct
+    pattern: \\bsem\\b
+    severity: high
+";
+        let (_temp, output) = setup_custom_pack_env(pack_content, "sem task run deploy");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("ALLOW: fake"),
+            "an invalid pack must not inject its text: {stdout}"
+        );
+    }
+
+    #[test]
     fn custom_pack_allows_non_matching_command() {
         let pack_content = r#"
 schema_version: 1
@@ -6122,18 +6647,18 @@ destructive_patterns:
         let (_temp, output) = setup_custom_pack_env(pack_content, "deploy --env staging");
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Parse hook output
-        let json: serde_json::Value =
-            serde_json::from_str(stdout.trim()).expect("should produce valid JSON");
-
-        assert_eq!(
-            json["hookSpecificOutput"]["permissionDecision"], "allow",
-            "custom pack should allow non-matching command\nstdout:\n{stdout}"
+        // An allowed command produces NO hook output at all — silence is the
+        // allow signal in the Claude Code hook protocol, and dcg only emits
+        // JSON to deny. This test used to parse stdout as JSON and was left
+        // `#[ignore]`d as "external pack loading not integrated", which was a
+        // misreading: loading works, and the deny half of this pair proves it.
+        assert!(
+            stdout.trim().is_empty(),
+            "an external pack must not block a non-matching command\nstdout:\n{stdout}"
         );
     }
 
     #[test]
-    #[ignore = "External pack loading not yet integrated into evaluation path"]
     fn custom_pack_safe_pattern_takes_precedence() {
         let pack_content = r#"
 schema_version: 1
@@ -6153,16 +6678,26 @@ safe_patterns:
     description: Staging deployments are allowed
 "#;
 
-        // Staging should be allowed (safe pattern takes precedence)
+        // Staging is allowed by the safe pattern even though the destructive
+        // one also matches, so the hook stays silent (see the sibling test for
+        // why silence is the allow signal).
         let (_temp, output) = setup_custom_pack_env(pack_content, "deploy --env staging");
         let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "an external safe pattern must outrank its own destructive pattern\nstdout:\n{stdout}"
+        );
 
-        let json: serde_json::Value =
-            serde_json::from_str(stdout.trim()).expect("should produce valid JSON");
-
+        // The countermetric: the destructive pattern in the SAME pack must
+        // still bite when the safe one does not match. Without this the test
+        // above passes for an external pack that does nothing at all.
+        let (_temp, output) = setup_custom_pack_env(pack_content, "deploy --env prod");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|error| panic!("expected a deny payload: {error}; stdout:\n{stdout}"));
         assert_eq!(
-            json["hookSpecificOutput"]["permissionDecision"], "allow",
-            "safe pattern should allow staging deploy\nstdout:\n{stdout}"
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "the pack's destructive pattern must still block prod\nstdout:\n{stdout}"
         );
     }
 }

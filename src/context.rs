@@ -1347,10 +1347,9 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             // `/etc/passwd` arrives at sanitize as a single token. Mask
             // only the prefix BEFORE the operator (echo's data part);
             // leave the operator and target visible so the destructive
-            // regex can match. The split heuristic requires the byte
-            // after `>` to be a path-start (`/`, `~`, `$`) or a quote
-            // (`"`, `'`), so plain-data arrows like `echo "user>admin"`
-            // remain fully masked (the `>` is followed by `a`, no split).
+            // regex can match. Only an unquoted, unescaped `>` splits,
+            // which is exactly when bash reads one as a redirection, so
+            // quoted arrows like `echo "user>admin"` remain fully masked.
             if is_shell_redirect_operator(token_text) {
                 next_token_is_redirect_target = true;
                 continue;
@@ -2247,14 +2246,16 @@ enum SanitizeTokenKind {
     Comment,
 }
 
-/// Returns the byte position of an unquoted glued shell-redirect operator
-/// inside `token` whose immediate next byte looks like a path-target start.
-/// Matches `>` followed by `/`, `~`, `$`, `"`, or `'` — exactly the set
-/// of characters that begin the redirect-truncate-root-home regex's
-/// sensitive-path arms (incl. the optional ANSI-C `$'...'` and locale
-/// `$"..."` quoting forms). Returns `None` when no glued redirect is
-/// found, so plain-data arrows like `"user>admin"` and redirect-looking text
-/// inside a quoted argument stay fully masked.
+/// Returns the byte position of the first unquoted, unescaped `>` inside
+/// `token`: bash ends the word there and opens a redirection, whatever
+/// follows. Returns `None` when there is none, so plain-data arrows inside
+/// quotes (`"user>admin"`) and escaped ones (`a\>b`) stay fully masked.
+///
+/// An earlier version split only when the target began with `/`, `~`, `$`
+/// or a quote, which kept every RELATIVE target masked: `echo x >.git/config`
+/// was allowed while `echo x > .git/config` denied under
+/// `redirect-truncate-git-internals-relative`, and a `cd` into a protected
+/// directory followed by `echo k >authorized_keys` could not be judged (#480).
 ///
 /// Used by `sanitize_for_pattern_matching` to handle `echo`/`printf`
 /// args of the form `data>/etc/passwd` where the dcg tokenizer keeps
@@ -2275,12 +2276,9 @@ fn glued_redirect_split_position(token: &str) -> Option<usize> {
         match bytes[i] {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
-            b'>' if !in_single
-                && !in_double
-                && matches!(bytes[i + 1], b'/' | b'~' | b'$' | b'"' | b'\'') =>
-            {
-                return Some(i);
-            }
+            // `\>` is a literal `>`; inside double quotes `\` still escapes.
+            b'\\' if !in_single => i += 1,
+            b'>' if !in_single && !in_double => return Some(i),
             _ => {}
         }
         i += 1;
@@ -2786,17 +2784,33 @@ fn is_inline_code_flag(word: &str) -> bool {
     if word == "-S" {
         return true;
     }
-    if !word.starts_with('-') || word.starts_with("--") || word.len() < 2 {
+    // The long spellings of the same flags (#425). A `--` word used to be
+    // rejected outright, which made `node --eval '<payload>'` a one-word bypass
+    // of the `node -e '<payload>'` deny — verified live against real node and
+    // bun, both of which honour `--eval` and `--print`.
+    //
+    // Matched by NAME rather than by the letter scan below, because `--` words
+    // are overwhelmingly ordinary options: scanning the value of every one of
+    // them as code would widen this far past interpreters. The `=` spelling is
+    // handled by taking the part before it, so `--eval=<payload>` counts too.
+    if let Some(name) = word.strip_prefix("--") {
+        let name = name.split('=').next().unwrap_or(name);
+        return matches!(name, "eval" | "print" | "command" | "run" | "execute");
+    }
+    if !word.starts_with('-') || word.len() < 2 {
         return false;
     }
 
-    // `p` covers Node's (and Bun's) `-p`/`--print`, which evaluates its argument
+    // `p` covers the SHORT `-p` of Node and Bun, which evaluates its argument
     // exactly as `-e` does and then prints the result (issue #397). This is only
     // a cheap pre-filter: `check_inline_code_context` still requires the
     // segment's executable to be one of `inline_code_commands`, so `cp -p`,
     // `mkdir -p`, and `rsync -p` are untouched. Over-classifying an
     // interpreter's argument as code only widens what gets scanned, which is the
-    // safe direction for a guard.
+    // safe direction for a guard — and it is the same reason the long-flag list
+    // above carries names (`command`, `run`, `execute`) that no interpreter dcg
+    // models actually accepts today. A command using one of those errors out, so
+    // reading its argument costs a wasted scan and nothing else.
     word.as_bytes()
         .iter()
         .skip(1)
@@ -3090,6 +3104,63 @@ mod tests {
             inline_span.is_some(),
             "Should detect inline code after bash -c"
         );
+    }
+
+    /// The LONG spellings of the inline-code flags classify their argument as
+    /// code, just as the short ones do (issue #425).
+    ///
+    /// Regression: every `--` word was rejected before the flag scan ran, so
+    /// `node --eval '<payload>'` was a one-word bypass of the `node -e
+    /// '<payload>'` deny. Verified live: real node and bun both honour `--eval`
+    /// and `--print`.
+    #[test]
+    fn long_inline_code_flags_classify_their_argument_as_code() {
+        for command in [
+            "node --eval 'rm -rf /'",
+            "node --print 'rm -rf /'",
+            "node --eval='rm -rf /'",
+            "bun --eval 'rm -rf /'",
+            "php --run 'rm -rf /'",
+            // Short spellings must keep working.
+            "node -e 'rm -rf /'",
+            "node -p 'rm -rf /'",
+        ] {
+            let spans = classify_command(command);
+            assert!(
+                spans
+                    .spans()
+                    .iter()
+                    .any(|span| span.kind == SpanKind::InlineCode),
+                "the flag argument is code: {command:?}"
+            );
+        }
+    }
+
+    /// The long-flag names are matched exactly, so an ordinary `--` option does
+    /// not turn its value into code. `check_inline_code_context` also requires
+    /// the executable to be an interpreter, but the flag test should not be the
+    /// thing relying on that.
+    #[test]
+    fn an_ordinary_long_option_is_not_an_inline_code_flag() {
+        for word in [
+            "--version",
+            "--help",
+            "--experimental-modules",
+            "--recursive",
+            "--exec-path",
+            "--evaluate",
+            "--printer",
+            "--runtime",
+            "--commands",
+        ] {
+            assert!(
+                !is_inline_code_flag(word),
+                "{word:?} must not be read as an inline-code flag"
+            );
+        }
+        for word in ["--eval", "--print", "--command", "--run", "--execute"] {
+            assert!(is_inline_code_flag(word), "{word:?} is an inline-code flag");
+        }
     }
 
     #[test]

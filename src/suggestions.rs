@@ -129,9 +129,21 @@ pub static SUGGESTION_REGISTRY: LazyLock<HashMap<&'static str, Vec<Suggestion>>>
 ///     }
 /// }
 /// ```
+///
+/// A refined embedded-code rule id (`heredoc.javascript:fs_rmsync.catastrophic`)
+/// falls back to its base rule's suggestions. Every blocking `fs.rmSync`
+/// match carries such a refinement, so the exact-key lookup alone meant the
+/// registered `heredoc.javascript:fs_rmsync` guidance was never shown.
 #[must_use]
 pub fn get_suggestions(rule_id: &str) -> Option<&'static [Suggestion]> {
-    SUGGESTION_REGISTRY.get(rule_id).map(Vec::as_slice)
+    if let Some(found) = SUGGESTION_REGISTRY.get(rule_id) {
+        return Some(found.as_slice());
+    }
+    let (pack, pattern) = rule_id.split_once(':')?;
+    let (base, _refinement) = pattern.split_once('.')?;
+    SUGGESTION_REGISTRY
+        .get(format!("{pack}:{base}").as_str())
+        .map(Vec::as_slice)
 }
 
 /// Get the first suggestion of a specific kind for a rule.
@@ -309,6 +321,10 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
         ),
     ];
     m.insert("core.git:push-force-long", force_push_suggestions.clone());
+    m.insert(
+        "core.git:push-force-refspec",
+        force_push_suggestions.clone(),
+    );
     m.insert("core.git:push-force-short", force_push_suggestions);
 
     // Checkout patterns that discard changes
@@ -537,6 +553,134 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
                 "Restore the LFS filters and hooks if they were already removed",
             )
             .with_command("git lfs install"),
+        ],
+    );
+    m.insert(
+        "core.git:checkout-discard-cwd",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review exactly what would be discarded with `git diff`",
+            )
+            .with_command("git diff"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Save the changes first, then restore later with `git stash pop`",
+            )
+            .with_command("git stash"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Limit the overwrite to reviewed files: `git checkout <ref> -- <file>`",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:filter-branch",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Back up the current refs before rewriting: `git branch backup-before-rewrite`",
+            )
+            .with_command("git branch backup-before-rewrite"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Prefer git-filter-repo (faster and safer) and review the result",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Force-push a rewritten branch only with --force-with-lease after review",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:reflog-expire-now",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Recover what you need first: `git reflog`, then `git branch <name> <sha>`",
+            )
+            .with_command("git reflog"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Let the reflog expire on its default 90-day schedule instead of --expire=now",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Only expire the reflog once you have confirmed nothing else needs recovery",
+            ),
+        ],
+    );
+    let force_switch = || {
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "See exactly what the force would discard: `git status` and `git diff`",
+            )
+            .with_command("git status"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Save the changes first with `git stash`, switch, then `git stash pop`",
+            )
+            .with_command("git stash"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Check the other branch out alongside: `git worktree add ../other <branch>`",
+            ),
+        ]
+    };
+    m.insert("core.git:checkout-force", force_switch());
+    m.insert("core.git:switch-discard", force_switch());
+    m.insert(
+        "core.git:rm-force",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview which files would be removed: `git rm -n <path>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Stop tracking but keep the file on disk: `git rm --cached <path>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Commit or stash the modifications, then `git rm` without -f",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:read-tree-reset",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "See what would be discarded: `git status` and `git diff`",
+            )
+            .with_command("git status"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Save the changes first: `git stash`, then restore with `git stash pop`",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Merge instead, which refuses to overwrite local changes: `git read-tree -m -u <tree>`",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:update-ref-delete",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review the ref first: `git branch -vv`",
+            )
+            .with_command("git branch -vv"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use the porcelain delete, which refuses unmerged branches: `git branch -d <branch>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Keep a pointer before deleting: `git branch backup/<name> <ref>`",
+            ),
         ],
     );
 }
@@ -909,6 +1053,26 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ],
     );
 
+    m.insert(
+        "core.filesystem:rm-protected-file",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Confirm which file the operand actually names before deleting it",
+            )
+            .with_command("ls -la"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Move the file aside instead: reversible, and it proves nothing depended on it",
+            )
+            .with_command("mv /path/to/file /tmp/delete-me-reviewed"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "For an SSH key, remove the authorized entry rather than the key file, so a live session is not the last one you have",
+            ),
+        ],
+    );
+
     // redirect-truncate-*: shell-syntax truncate-equivalent. These need
     // redirect-specific guidance; deletion suggestions read as a non sequitur
     // on a redirect denial (issues #316/#317).
@@ -956,12 +1120,72 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ],
     );
     m.insert(
+        "core.filesystem:git-internals-write",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Read the current content first; reads under `.git/` are never blocked",
+            )
+            .with_command("git config --list --show-origin"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Let git edit its own config; it validates the key and picks the right scope",
+            )
+            .with_command("git config remote.origin.url <url>"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Change a remote through porcelain rather than by rewriting `.git/config`",
+            )
+            .with_command("git remote set-url origin <url>"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "For a change the user has approved, grant this one command with `dcg allow-once`, or allowlist `core.filesystem:git-internals-write` in the project config with a reason — note this is deliberately separate from `credential-file-write`, so allowing one does not allow the other",
+            ),
+        ],
+    );
+    // The `.git` rules cannot take the generic redirect advice, because its
+    // second entry is "use append instead". For an ordinary file that is the
+    // safer spelling; for a git internal it is the more useful one, since a
+    // section appended to `.git/config` runs on the next git command and
+    // leaves everything already there working (#457). These rules get their
+    // own list, built around the routes git provides.
+    let git_internals_write_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Read the current content first; reads under `.git` are never blocked",
+        )
+        .with_command("cat .git/config"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Change repository configuration through git, which validates the key and writes atomically",
+        )
+        .with_command("git config <key> <value>"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Move a ref through git rather than by writing `.git/refs` or `.git/HEAD`",
+        )
+        .with_command("git update-ref <ref> <sha>"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Stage the proposed file outside the repository and copy it in after review",
+        )
+        .with_command("echo data > /tmp/scratch/config && cp /tmp/scratch/config .git/config"),
+    ];
+    m.insert(
         "core.filesystem:redirect-truncate-root-home",
         redirect_truncate_suggestions.clone(),
     );
     m.insert(
         "core.filesystem:redirect-truncate-dynamic-path",
         redirect_truncate_suggestions,
+    );
+    m.insert(
+        "core.filesystem:redirect-truncate-git-internals-relative",
+        git_internals_write_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:redirect-append-git-internals-relative",
+        git_internals_write_suggestions,
     );
     m.insert(
         "core.filesystem:fork-bomb",
@@ -973,6 +1197,87 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
             Suggestion::new(
                 SuggestionKind::SaferAlternative,
                 "To test process limits, use `ulimit -u` inside a disposable VM or container",
+            ),
+        ],
+    );
+    // Windows disk-destruction verbs (cross-platform baseline, #451).
+    m.insert(
+        "core.filesystem:format-volume",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Confirm the target volume with `Get-Volume` before reformatting anything",
+            )
+            .with_command("Get-Volume"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add `-WhatIf` to report what Format-Volume would do without erasing the volume",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Reformatting a volume must be run interactively by a human who has confirmed the target drive",
+            ),
+        ],
+    );
+    m.insert(
+        "core.filesystem:clear-disk",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect the disk with `Get-Disk` before removing its partitions and data",
+            )
+            .with_command("Get-Disk"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add `-WhatIf` to preview Clear-Disk without changing the disk",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Wiping a disk must be run interactively by a human who has confirmed the target disk number",
+            ),
+        ],
+    );
+    let shadow_copy_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "List the shadow copies first with `vssadmin list shadows`",
+        )
+        .with_command("vssadmin list shadows"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Manage restore points through System Protection instead of deleting shadow copies",
+        ),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Deleting Volume Shadow Copies destroys the local means of recovery; do not run it unattended",
+        ),
+    ];
+    m.insert(
+        "core.filesystem:vssadmin-delete-shadows",
+        shadow_copy_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:wmic-shadowcopy-delete",
+        shadow_copy_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:wmi-shadowcopy-delete",
+        shadow_copy_suggestions,
+    );
+    m.insert(
+        "core.filesystem:rsync-delete-sensitive-dest",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview the deletions first with `--dry-run` (or `-n`) and read the list",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Drop `--delete` to copy without removing extra files in the destination",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Mirror into a dedicated non-system directory you own, and back it up first",
             ),
         ],
     );
@@ -2080,6 +2385,7 @@ mod tests {
             "core.filesystem:credential-file-write",
             "core.filesystem:redirect-truncate-root-home",
             "core.filesystem:redirect-truncate-dynamic-path",
+            "core.filesystem:redirect-truncate-git-internals-relative",
         ];
 
         for rule in expected_rules {
@@ -2388,6 +2694,27 @@ mod tests {
             .as_deref(),
             Some("ls -la /"),
         );
+    }
+
+    /// The ids a blocking `fs.rmSync` match actually reports are refined; they
+    /// must reach the base rule's guidance.
+    #[test]
+    fn refined_heredoc_rule_ids_fall_back_to_the_base_rule() {
+        let base = get_suggestions("heredoc.javascript:fs_rmsync").expect("base registered");
+        for refined in [
+            "heredoc.javascript:fs_rmsync.catastrophic",
+            "heredoc.javascript:fs_rmsync.non_temp",
+        ] {
+            assert_eq!(
+                get_suggestions(refined).map(<[Suggestion]>::len),
+                Some(base.len()),
+                "{refined}"
+            );
+        }
+        // An unregistered base stays unregistered, and pack-level dots in the
+        // id are never mistaken for a refinement.
+        assert!(get_suggestions("heredoc.javascript:no_such_rule.catastrophic").is_none());
+        assert!(get_suggestions("core.git").is_none());
     }
 
     #[test]

@@ -21,7 +21,8 @@ pub fn create_pack() -> Pack {
         name: "GitHub Platform",
         description: "Protects against destructive GitHub CLI operations like changing repository visibility or deleting repositories, gists, releases, or SSH keys.",
         // Broad on purpose: global `gh` flags can appear before the subcommand.
-        keywords: &["gh"],
+        // `curl` reaches the REST spelling of repository deletion.
+        keywords: &["gh", "curl"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -108,9 +109,36 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // and falls through to the destructive rules (fail closed). The walk
         // also stops at `<`/`>`: a redirection target is the shell's, so
         // `... --yes > --help` is a real deletion writing to a file, not help.
+        //
+        // "`--help` anywhere is inert" is not quite true, though, and the gap
+        // was a live false negative (GitHub #423). cobra binds `--help` as the
+        // *value* of a preceding flag that takes one, and it is then not the
+        // help flag at all — the command runs:
+        //
+        //     $ gh pr list --search --help --state all --json number
+        //     [{"number":214},{"number":254}]
+        //
+        // That searched for the literal string `--help`. The same shape let
+        // `gh repo edit --description --help --visibility public` through
+        // while the bare `gh repo edit --visibility public` was denied, so the
+        // repository really did go public.
+        //
+        // Telling a swallowed `--help` from a real one by looking at the token
+        // before it does not work: `--cleanup-tag` and `--yes` are boolean, so
+        // `gh release delete v1 --yes --cleanup-tag --help` is genuine help,
+        // while `--description` and `--homepage` take a value and swallow it.
+        // Enumerating which gh flags take values would track a moving target
+        // across gh releases.
+        //
+        // The exploit has a simpler shape. In real help cobra exits before
+        // acting, so nothing destructive ever needs to trail the `--help`;
+        // in the swallowed form the flag that acts is precisely what comes
+        // after. So `--help` stops rescuing once a guarded value-taking flag
+        // follows it in the same segment. `gh repo edit … --visibility private
+        // --help` keeps working, because there the flag precedes.
         safe_pattern!(
             "gh-help",
-            r"gh(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?:\s|$)"
+            r"gh(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?:\s|$)(?![^;&|]*--visibility(?:=|\s))"
         ),
         // `-h` is cobra's short help flag for every `gh` command that does not
         // reuse the letter. `gh repo edit` does (`-h` = `--homepage`), and it is
@@ -536,6 +564,36 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
+        // The same endpoint through curl. With `gh repo delete` and `gh api`
+        // both denied, the REST call is the spelling an agent reaches for next
+        // (the #449 shape for Kubernetes). Covers api.github.com and GitHub
+        // Enterprise's `/api/v3`, method before or after the URL. Only the
+        // repository endpoint itself: deeper paths are not mirrored here.
+        destructive_pattern!(
+            "curl-api-delete-repo",
+            r#"(?i)\bcurl\b[^|;&\n]*?(?:(?:-X\s*|--request(?:=|\s+))['"]?DELETE\b[^|;&\n]*?(?:api\.github\.com|/api/v3)/repos/[^/\s'"]+/[^/\s'"?]+/?(?:['"\s?]|$)|(?:api\.github\.com|/api/v3)/repos/[^/\s'"]+/[^/\s'"?]+/?(?:['"\s?]|$)[^|;&\n]*?(?:-X\s*|--request(?:=|\s+))['"]?DELETE\b)"#,
+            "curl DELETE /repos/{owner}/{repo} permanently deletes a GitHub repository. This cannot be undone.",
+            High,
+            "This is the REST spelling of `gh repo delete`. It removes the code, \
+             issues, pull requests, releases, wiki, and Actions history together. GitHub \
+             can restore a deleted repository only within 90 days, only if the name has \
+             not been reused, and only via support.\n\n\
+             Safer alternatives:\n\
+             - gh api -X PATCH repos/<owner>/<repo> -F archived=true: read-only, via the API\n\
+             - gh repo view: confirm the target first",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "gh api -X PATCH repos/<owner>/<repo> -F archived=true",
+                        "Make it read-only instead of deleting it",
+                    ),
+                    PatternSuggestion::new(
+                        "gh repo view <owner>/<repo> --json name,isPrivate,pushedAt",
+                        "Confirm which repository you are about to delete",
+                    ),
+                ]
+            }
+        ),
         // Catch-all for every other `gh api ... DELETE`. Deliberately last:
         // the rules above claim the endpoints whose consequences are known,
         // and this one covers the rest, including endpoints that did not exist
@@ -728,6 +786,33 @@ mod tests {
     /// the rule_id — the key that surfaces in the history DB, `dcg stats`, and
     /// allowlist entries — actively misleading. Deeper endpoints now fall to
     /// `gh-api-delete-generic`; both are still denied.
+    /// The REST spelling of repository deletion, which reached no rule while
+    /// `gh repo delete` and `gh api -X DELETE repos/o/r` both denied.
+    #[test]
+    fn curl_rest_repo_delete_is_denied() {
+        let pack = create_pack();
+        for command in [
+            "curl -X DELETE https://api.github.com/repos/o/r",
+            "curl -X DELETE 'https://api.github.com/repos/o/r'",
+            "curl -XDELETE -H 'Authorization: Bearer x' https://api.github.com/repos/o/r/",
+            "curl --request DELETE \"https://api.github.com/repos/o/r\"",
+            "curl -H 'Authorization: token x' https://api.github.com/repos/o/r -X DELETE",
+            "curl -X DELETE https://ghe.corp.example/api/v3/repos/o/r",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "curl-api-delete-repo");
+        }
+        for command in [
+            "curl https://api.github.com/repos/o/r",
+            "curl -X GET 'https://api.github.com/repos/o/r'",
+            "curl -X PATCH https://api.github.com/repos/o/r -d '{\"archived\":true}'",
+            "curl -X DELETE https://api.github.com/repos/o/r/issues/1/labels/bug",
+            "curl -X DELETE https://example.com/repos/o/r",
+            "curl https://api.github.com/repos/o/r && curl -X DELETE https://example.com/x",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
     #[test]
     fn gh_api_delete_repo_is_not_a_catch_all() {
         let pack = create_pack();
@@ -998,6 +1083,43 @@ mod tests {
             "gh release delete \"v1\" -h",
         ] {
             assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// GitHub #423: `--help` is only the help flag when cobra reads it as one.
+    /// A flag that takes a value binds it instead, and the command then runs:
+    ///
+    /// ```text
+    /// $ gh pr list --search --help --state all --json number
+    /// [{"number":214},{"number":254}]
+    /// ```
+    ///
+    /// That searched for the literal string `--help`. The same shape let
+    /// `gh repo edit --description --help --visibility public` through while
+    /// the bare `gh repo edit --visibility public` was denied, so the
+    /// repository really did change visibility.
+    #[test]
+    fn swallowed_help_does_not_rescue_a_visibility_change_issue_423() {
+        let pack = create_pack();
+
+        for command in [
+            "gh repo edit --description --help --visibility public",
+            "gh repo edit --homepage --help --visibility public",
+            "gh repo edit --default-branch --help --visibility=public",
+            "gh repo edit -d --help --visibility public",
+            "gh repo edit acme/widgets --description --help --visibility internal",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "gh-repo-visibility-change");
+        }
+
+        // The flag preceding the help, rather than following it, is the
+        // ordinary spelling and stays inert: cobra exits before acting, so
+        // nothing destructive trails the `--help`.
+        for command in [
+            "gh repo edit acme/widgets --visibility private --help",
+            "gh release delete v1 --yes --cleanup-tag --help",
+        ] {
             assert_allows(&pack, command);
         }
     }

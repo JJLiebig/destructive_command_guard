@@ -109,7 +109,8 @@
           "deny": true,
           "warn": true,
           "allow": false
-        }
+        },
+        "caller_env": null
       }
     },
     "history": {
@@ -220,7 +221,7 @@
       "type": "object",
       "properties": {
         "color": {
-          "description": "Color output mode: \"auto\", \"always\", \"never\".",
+          "description": "Color output mode: \"auto\", \"always\", \"never\". \"never\" turns color off;\n\"auto\" and \"always\" both follow terminal detection (`NO_COLOR`, `CI`,\nand a non-TTY stdout still disable it).",
           "type": "string",
           "default": "auto"
         },
@@ -764,7 +765,7 @@
           "default": false
         },
         "warn_threshold": {
-          "description": "Confidence threshold below which Deny is downgraded to Warn.\n\nValues range from 0.0 (always warn) to 1.0 (never warn).\nRecommended range: 0.3 - 0.7\n\nDefault: 0.5",
+          "description": "Confidence threshold below which Deny is downgraded to Warn.\n\nA match downgrades when its score is *below* this value, so 0.0 never\ndowngrades and 1.0 downgrades every match short of full confidence.\nA direct invocation (`rm -rf ./build`) scores 1.0 and never downgrades.\nRecommended range: 0.3 - 0.7\n\nDefault: 0.5",
           "type": "number",
           "format": "float",
           "default": 0.5
@@ -815,6 +816,14 @@
             "warn": true,
             "allow": false
           }
+        },
+        "caller_env": {
+          "description": "Name of an environment variable whose value identifies the caller,\nrecorded as `caller` on each entry (#378), e.g. `FLYWHEEL_AGENT_ID`.\nOpt-in. The value is a label only: it is sanitized, bounded, and never\nconsulted by any decision.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       }
     },
@@ -1035,7 +1044,7 @@
       ]
     },
     "GitAwarenessConfig": {
-      "description": "Git branch-aware strictness configuration.\n\nThis allows different strictness levels based on the current git branch,\nproviding more protection on important branches and more freedom on\nexperimental branches.\n\n# Example Configuration (TOML)\n\n```toml\n[git_awareness]\nenabled = true\n\n# Protected branches get extra scrutiny\nprotected_branches = [\"main\", \"production\", \"release/*\"]\nprotected_strictness = \"all\"  # Block everything including Low severity\n\n# Feature branches get more freedom\nrelaxed_branches = [\"feature/*\", \"experiment/*\", \"sandbox/*\"]\nrelaxed_strictness = \"critical\"  # Only block Critical severity\n\n# Packs to disable on relaxed branches\nrelaxed_disabled_packs = []\n\n# Default strictness when not matching any pattern\ndefault_strictness = \"high\"  # Block Critical and High (normal behavior)\n\n# Show branch context in output\nshow_branch_in_output = true\n```",
+      "description": "Git branch-aware strictness configuration.\n\n**`[git_awareness]` is not applied to hook decisions.** Its strictness can\nonly relax a denial, and the agent being guarded can choose its branch\nbefore the command it wants run, so honoring them would be a\nself-service downgrade. `dcg config` and `dcg doctor` warn when\n`enabled = true`.\n\nThis allows different strictness levels based on the current git branch,\nproviding more protection on important branches and more freedom on\nexperimental branches.\n\n# Example Configuration (TOML)\n\n```toml\n[git_awareness]\nenabled = true\n\n# Protected branches get extra scrutiny\nprotected_branches = [\"main\", \"production\", \"release/*\"]\nprotected_strictness = \"all\"  # Block everything including Low severity\n\n# Feature branches get more freedom\nrelaxed_branches = [\"feature/*\", \"experiment/*\", \"sandbox/*\"]\nrelaxed_strictness = \"critical\"  # Only block Critical severity\n\n# Packs to disable on relaxed branches\nrelaxed_disabled_packs = []\n\n# Default strictness when not matching any pattern\ndefault_strictness = \"high\"  # Block Critical and High (normal behavior)\n\n# Show branch context in output\nshow_branch_in_output = true\n```",
       "type": "object",
       "properties": {
         "enabled": {

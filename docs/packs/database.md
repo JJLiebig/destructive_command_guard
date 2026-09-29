@@ -36,6 +36,7 @@ Commands containing these keywords are checked against this pack:
 - `delete`
 - `drop`
 - `truncate`
+- `UPDATE`
 
 ### Safe Patterns (Allowed)
 
@@ -58,6 +59,8 @@ These patterns match potentially destructive commands:
 | `drop-schema` | DROP SCHEMA permanently deletes the schema and all its objects (even with IF EXISTS). | critical |
 | `truncate-table` | TRUNCATE permanently deletes all rows without logging individual deletions. | high |
 | `delete-without-where` | DELETE without WHERE clause deletes ALL rows. Add a WHERE clause or use TRUNCATE intentionally. | high |
+| `update-without-where` | UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause. | high |
+| `drop-column` | ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row. | high |
 | `dropdb-cli` | dropdb permanently deletes the entire database. Verify the database name carefully. | critical |
 | `pg-dump-clean` | pg_dump --clean drops objects before creating them. This can be destructive on restore. | high |
 
@@ -103,6 +106,7 @@ Commands containing these keywords are checked against this pack:
 - `drop`
 - `truncate`
 - `GRANT`
+- `UPDATE`
 
 ### Safe Patterns (Allowed)
 
@@ -127,6 +131,8 @@ These patterns match potentially destructive commands:
 | `drop-table` | DROP TABLE permanently deletes the table. Verify and back up first. | high |
 | `truncate-table` | TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL. | high |
 | `delete-without-where` | DELETE without WHERE clause deletes ALL rows. Add a WHERE clause. | high |
+| `update-without-where` | UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause. | high |
+| `drop-column` | ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row. | high |
 | `mysqladmin-drop` | mysqladmin drop permanently deletes the database. Verify carefully. | critical |
 | `mysqldump-add-drop-database` | mysqldump --add-drop-database drops the database before restore. | high |
 | `mysqldump-add-drop-table` | mysqldump --add-drop-table drops tables before creating them on restore. | medium |
@@ -173,6 +179,7 @@ Commands containing these keywords are checked against this pack:
 - `.drop(`
 - `.remove(`
 - `.deleteMany(`
+- `.updateMany(`
 - `mongorestore`
 - `mongodump`
 
@@ -198,6 +205,7 @@ These patterns match potentially destructive commands:
 | `drop-database` | dropDatabase permanently deletes the entire database. | critical |
 | `drop-collection` | drop/dropCollection permanently deletes the collection. | high |
 | `delete-all` | remove({}) or deleteMany({}) deletes ALL documents. Add filter criteria. | high |
+| `update-all` | updateMany({}, ...) overwrites fields in ALL documents. Add filter criteria. | high |
 | `mongorestore-drop` | mongorestore --drop deletes existing data before restoring. | high |
 | `collection-drop` | collection.drop() permanently deletes the collection. | high |
 
@@ -309,6 +317,7 @@ Commands containing these keywords are checked against this pack:
 - `DROP`
 - `TRUNCATE`
 - `DELETE`
+- `UPDATE`
 
 ### Safe Patterns (Allowed)
 
@@ -330,6 +339,8 @@ These patterns match potentially destructive commands:
 | `stdin-unverified` | sqlite3 receives indirect input that dcg cannot statically verify. | high |
 | `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify it is intended. | critical |
 | `delete-without-where` | DELETE without WHERE deletes ALL rows. Add a WHERE clause. | critical |
+| `update-without-where` | UPDATE without WHERE overwrites the column in ALL rows. Add a WHERE clause. | high |
+| `drop-column` | ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row. | high |
 | `vacuum-into` | VACUUM INTO overwrites the target file if it exists. | medium |
 | `sqlite3-stdin` | Running SQL from file could contain destructive commands. Review the file first. | high |
 
@@ -510,6 +521,7 @@ Protects modern `snow sql` queries, files, stdin, nested sources, data, ingestio
 Commands containing these keywords are checked against this pack:
 
 - `snow`
+- `snowsql`
 - `Snow`
 - `SNOW`
 - `DROP`
@@ -578,6 +590,7 @@ These patterns match potentially destructive commands:
 | `warehouse-settings` | ALTER WAREHOUSE SET can create availability or cost risk. | medium |
 | `abort-query` | !abort cancels an active Snowflake query. | medium |
 | `interactive-edit` | !edit executes SQL modified in an external editor that dcg cannot inspect in advance. | high |
+| `shell-escape` | !system runs a shell command from inside the SnowSQL session, outside dcg's shell analysis. | high |
 | `execute-immediate` | EXECUTE IMMEDIATE runs generated SQL whose rendered semantics require explicit review. | medium |
 | `cli-object-drop-database` | snow object drop database/schema removes the object and everything inside it. | critical |
 | `cli-object-drop` | snow object drop permanently removes a Snowflake object. | high |
@@ -645,41 +658,41 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `supabase-db-diff` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+diff` |
-| `supabase-db-lint` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+lint` |
-| `supabase-db-dump` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+dump` |
-| `supabase-db-shell-safe` | `(?i)supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+shell\s*$` |
-| `supabase-inspect-db` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+inspect\s+db` |
-| `supabase-status` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+status` |
-| `supabase-start` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+start` |
-| `supabase-services` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+services` |
-| `supabase-gen-types` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+gen\s+types` |
-| `supabase-test-db` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+test\s+db` |
-| `supabase-migration-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+list` |
-| `supabase-migration-new` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+new` |
-| `supabase-migration-fetch` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+fetch` |
-| `supabase-db-push-dry-run` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+push\b.*--dry-run(?:=true)?(?:\s\|$)` |
-| `supabase-functions-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+list` |
-| `supabase-functions-serve` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+serve` |
-| `supabase-functions-download` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+download` |
-| `supabase-functions-new` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+new` |
-| `supabase-secrets-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets\s+list` |
-| `supabase-storage-ls` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+ls` |
-| `supabase-projects-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+projects\s+list` |
-| `supabase-orgs-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+orgs\s+list` |
-| `supabase-branches-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+branches\s+list` |
-| `supabase-branches-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+branches\s+get` |
-| `supabase-domains-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+domains\s+get` |
-| `supabase-domains-reverify` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+domains\s+reverify` |
-| `supabase-vanity-subdomains-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+vanity-subdomains\s+get` |
-| `supabase-vanity-subdomains-check` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+vanity-subdomains\s+check-availability` |
-| `supabase-sso-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+sso\s+list` |
-| `supabase-sso-show` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+sso\s+show` |
-| `supabase-sso-info` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+sso\s+info` |
-| `supabase-network-restrictions-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+network-restrictions\s+get` |
-| `supabase-network-bans-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+network-bans\s+get` |
-| `supabase-ssl-enforcement-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+ssl-enforcement\s+get` |
-| `supabase-postgres-config-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+postgres-config\s+get` |
+| `supabase-db-diff` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*db[ \t]+diff(?:[ \t]\|$)` |
+| `supabase-db-lint` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*db[ \t]+lint(?:[ \t]\|$)` |
+| `supabase-db-dump` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*db[ \t]+dump(?:[ \t]\|$)` |
+| `supabase-db-shell-safe` | `(?i)^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*db[ \t]+shell[ \t]*$` |
+| `supabase-inspect-db` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*inspect[ \t]+db(?:[ \t]\|$)` |
+| `supabase-status` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*status(?:[ \t]\|$)` |
+| `supabase-start` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*start(?:[ \t]\|$)` |
+| `supabase-services` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*services(?:[ \t]\|$)` |
+| `supabase-gen-types` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*gen[ \t]+types(?:[ \t]\|$)` |
+| `supabase-test-db` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*test[ \t]+db(?:[ \t]\|$)` |
+| `supabase-migration-list` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*migration[ \t]+list(?:[ \t]\|$)` |
+| `supabase-migration-new` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*migration[ \t]+new(?:[ \t]\|$)` |
+| `supabase-migration-fetch` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*migration[ \t]+fetch(?:[ \t]\|$)` |
+| `supabase-db-push-dry-run` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*db[ \t]+push(?:[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)\|--(?:db-url\|password)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-p(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:linked\|local\|include-all\|include-roles\|include-seed)(?:=(?:true\|false))?))*[ \t]+--dry-run(?:=true)?(?:[ \t]+(?:(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)\|--(?:db-url\|password)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-p(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:linked\|local\|include-all\|include-roles\|include-seed)(?:=(?:true\|false))?)\|--dry-run(?:=true)?))*[ \t]*$` |
+| `supabase-functions-list` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*functions[ \t]+list(?:[ \t]\|$)` |
+| `supabase-functions-serve` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*functions[ \t]+serve(?:[ \t]\|$)` |
+| `supabase-functions-download` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*functions[ \t]+download(?:[ \t]\|$)` |
+| `supabase-functions-new` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*functions[ \t]+new(?:[ \t]\|$)` |
+| `supabase-secrets-list` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*secrets[ \t]+list(?:[ \t]\|$)` |
+| `supabase-storage-ls` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*storage[ \t]+ls(?:[ \t]\|$)` |
+| `supabase-projects-list` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*projects[ \t]+list(?:[ \t]\|$)` |
+| `supabase-orgs-list` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*orgs[ \t]+list(?:[ \t]\|$)` |
+| `supabase-branches-list` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*branches[ \t]+list(?:[ \t]\|$)` |
+| `supabase-branches-get` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*branches[ \t]+get(?:[ \t]\|$)` |
+| `supabase-domains-get` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*domains[ \t]+get(?:[ \t]\|$)` |
+| `supabase-domains-reverify` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*domains[ \t]+reverify(?:[ \t]\|$)` |
+| `supabase-vanity-subdomains-get` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*vanity-subdomains[ \t]+get(?:[ \t]\|$)` |
+| `supabase-vanity-subdomains-check` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*vanity-subdomains[ \t]+check-availability(?:[ \t]\|$)` |
+| `supabase-sso-list` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*sso[ \t]+list(?:[ \t]\|$)` |
+| `supabase-sso-show` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*sso[ \t]+show(?:[ \t]\|$)` |
+| `supabase-sso-info` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*sso[ \t]+info(?:[ \t]\|$)` |
+| `supabase-network-restrictions-get` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*network-restrictions[ \t]+get(?:[ \t]\|$)` |
+| `supabase-network-bans-get` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*network-bans[ \t]+get(?:[ \t]\|$)` |
+| `supabase-ssl-enforcement-get` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*ssl-enforcement[ \t]+get(?:[ \t]\|$)` |
+| `supabase-postgres-config-get` | `^[ \t]*(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:(?:--(?:dns-resolver\|network-id\|output\|profile\|workdir\|project-ref)(?:=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|-o(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+\|[ \t]+[^\s;&\|<>()\x22'\\$`*?\[\]{}~]+)\|--(?:create-ticket\|debug\|experimental\|yes\|help)(?:=(?:true\|false))?\|-h)[ \t]+)*postgres-config[ \t]+get(?:[ \t]\|$)` |
 
 ### Destructive Patterns (Blocked)
 

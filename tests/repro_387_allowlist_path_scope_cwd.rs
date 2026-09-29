@@ -16,6 +16,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// `path` spelled for a POSIX `cd` in the command text. On Windows that is the
+/// git-bash form `C:/…`: the canonical `\\?\C:\…` is backslash escapes there,
+/// so the `cd` never resolved and the out-of-scope row passed vacuously.
+fn sh(path: &Path) -> String {
+    let shown = path.display().to_string();
+    if cfg!(windows) {
+        shown.trim_start_matches(r"\\?\").replace('\\', "/")
+    } else {
+        shown
+    }
+}
+
 fn dcg_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
@@ -70,7 +82,10 @@ impl TestEnv {
         );
         if let Some(paths) = paths {
             use std::fmt::Write as _;
-            let rendered: Vec<String> = paths.iter().map(|p| format!("\"{p}\"")).collect();
+            // TOML literal strings: a Windows path in a basic string reads
+            // `\U` as a unicode escape and `\?` as an error, so the whole
+            // allowlist failed to parse there and no grant ever existed.
+            let rendered: Vec<String> = paths.iter().map(|p| format!("'{p}'")).collect();
             writeln!(entry, "paths = [{}]", rendered.join(", ")).expect("format allowlist entry");
         }
         fs::write(self.xdg_config.join("dcg").join("allowlist.toml"), entry)
@@ -202,7 +217,7 @@ fn process_cwd_is_irrelevant() {
 fn embedded_cd_into_scope_grants() {
     let env = TestEnv::new();
     env.write_allowlist(Some(&env.scope_in_patterns()));
-    let command = format!("cd {} && {PROBE}", env.scope_in.display());
+    let command = format!("cd {} && {PROBE}", sh(&env.scope_in));
     let out = env.run_hook(&command, Some(&env.scope_out), &env.elsewhere);
     assert!(
         allowed(&out),
@@ -214,7 +229,7 @@ fn embedded_cd_into_scope_grants() {
 fn embedded_cd_out_of_scope_revokes_the_grant() {
     let env = TestEnv::new();
     env.write_allowlist(Some(&env.scope_in_patterns()));
-    let command = format!("cd {} && {PROBE}", env.scope_out.display());
+    let command = format!("cd {} && {PROBE}", sh(&env.scope_out));
     let out = env.run_hook(&command, Some(&env.scope_in), &env.elsewhere);
     assert!(
         !allowed(&out),
@@ -231,7 +246,7 @@ fn unresolvable_cwd_fails_closed() {
     for command in [
         format!("cd \"$DEST\" && {PROBE}"),
         format!("cd $(cat dir.txt) && {PROBE}"),
-        format!("cd {} && {PROBE}", env.scope_in.join("missing").display()),
+        format!("cd {} && {PROBE}", sh(&env.scope_in.join("missing"))),
     ] {
         let out = env.run_hook(&command, Some(&env.scope_in), &env.elsewhere);
         assert!(

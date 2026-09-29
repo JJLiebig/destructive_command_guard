@@ -11,6 +11,1512 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.15.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.0) -- 2026-09-29 [Release]
+
+A safety release. Most of what follows is commands that v0.14.4 allowed and
+should have blocked. The minor version bump is because several of those fixes
+change verdicts you may see day to day; nothing was removed from the
+configuration or the hook protocols.
+
+**In short:**
+
+- **A warning no longer hides a later block** (#498). A rule set to `warn`,
+  `log` or `ask` used to be the whole answer for the command line, so
+  `git stash drop && git reset --hard` was allowed. dcg now keeps looking past
+  a non-blocking match and reports the strictest result.
+- **Credential and startup files are protected wherever the home directory
+  lives** (#502). Synology (`/volume1/homes/<u>`, `/var/services/homes/<u>`),
+  `/var/home`, `/usr/home`, `/export/home`, a container's own `$HOME`, macOS
+  firmlinks, WSL and Cygwin mounts of a Windows profile, and many spellings of
+  those paths (quotes, `.`/`..`, globs, brace lists, ANSI-C escapes) are now
+  recognised. Review rounds on this fix found and closed a long list of
+  further bypass classes, listed under Security below.
+- **The PowerShell profile check stops warning "Hook missing" when the hook is
+  installed** (#503). Running `dcg install` rewrites an old profile block in
+  place, and paths containing `''` (for example `O''Brien`) are read
+  correctly.
+- **Commands handed to another program to run are judged.** `watch '…'`,
+  `su -c '…'`, `parallel ::: '…'`, `env -S'…'`, `flock -c`, `nix-shell --run`,
+  `ssh host …`, `docker exec` and similar runners and wrappers pass their
+  command through dcg the way `sh -c '…'` always did.
+- **A redirect or option no longer hides `sh -c`'s script.**
+  `sh 2>/dev/null -c '…'`, `bash -c -e '…'`, `sh <<<x -c '…'`,
+  `powershell 2>&1 -EncodedCommand …` and similar spellings are judged.
+- **Pathological input fails closed quickly instead of stalling the hook.**
+  Very long pipelines, long runs of unclosed brackets, deep glob or `$var`
+  paths and exponential glob patterns are bounded.
+
+**Behaviour changes you may notice:**
+
+- A pipeline of more than 1,024 stages is denied without being parsed
+  (`heredoc.shell:analysis-bounds`).
+- A write target whose path has more than 64 components that the shell can
+  rewrite (`/*/*/…`, `/$x/$x/…`) is denied as a possible credential-file write.
+- `ssh host git commit -m 'rm -rf x'` is now denied. ssh joins its arguments
+  and the remote shell re-parses them, so the remote side really runs
+  `rm -rf x`. Quote the whole remote command
+  (`ssh host "git commit -m 'rm -rf x'"`) if you mean the message.
+- An unquoted heredoc body that contains a command-string runner, such as
+  `cat > notes.md <<EOF` with `watch 'git reset --hard'` inside, can be denied,
+  as `sh -c '…'` in the same place already was. Quote the delimiter
+  (`<<'EOF'`) for text that is only data.
+- Rules that were warn-only in your `[policy]` no longer let later deny rules
+  on the same line through. A line that only matches a warn rule is still a
+  warn.
+
+The full list follows.
+
+### Security
+
+- **A warn, log or ask match hid every later finding on the same line** (#498).
+  `git stash drop && git reset --hard` was allowed: the evaluator stops at its
+  first match and leaves policy to the caller, so the warn for
+  `core.git:stash-drop` was the whole answer and `reset-hard` was never looked
+  at. Any rule downgraded to warn in `[policy]` disarmed every rule evaluated
+  after it. The hook, `dcg hook --batch`, `dcg test`, `dcg explain`,
+  `dcg classify`, scan, simulate, MCP and `evaluate_detailed` now re-evaluate
+  past a non-blocking match with that rule granted, and report the strictest
+  resolved finding (deny > ask > warn > log). A lone warn is still a warn.
+  Two spellings still hid the deny after that change and are closed too: a
+  warn inside an alias body or a resolved `$d` invocation
+  (`alias x='git stash drop'; rm -rf /`, `d=git; $d stash drop; git reset
+  --hard`), where an allowlisted nested rule, which is how the look-past
+  grants the warn, was returned as the answer for the whole line (the same
+  defect let any allowlisted rule there allow the rest of the line); and, with
+  `[confidence]` scoring on, a rule whose first occurrence was downgraded for
+  low confidence while the same rule ran again directly later on the line
+  (`watch rm -rf ./build; rm -rf ./build`). That repeat was found by the
+  rule's regex over the raw text, so one only the evaluator's own views see
+  (`rm -r''f ./build`, `a=(rm -rf ./build); "${a[@]}"`) still went unjudged;
+  a confidence-downgraded line is now re-evaluated with its doubted
+  occurrences blanked out before it is let through.
+
+- **`git` run by `watch`, `xargs`, `parallel` or `find -exec` was not in
+  executable position** for the Bash hook, so `watch git reset --hard`,
+  `echo a | xargs git reset --hard` and `find . -exec git reset --hard \;`
+  were allowed while `rm -rf` behind the same wrappers denied.
+
+- **`credential-file-write` knew four home roots** (#502). A literal path under
+  Synology's `/var/services/homes/<u>` or `/volume<N>/homes/<u>`, or under
+  `/var/home`, `/usr/home` and `/export/home`, was not a home directory to it,
+  so `echo … >> /volume1/homes/luna/.netrc` (or `.zshrc`, `.npmrc`) was
+  allowed. Those roots are now modelled, and the hook's own `$HOME` is one too
+  wherever it lives (`HOME=/app` in a container); an odd `$HOME` can add a root
+  but never shadow a fixed one. Found while probing the fix: `.` and `..`
+  ahead of the root (`/home/./luna/.netrc`, `/./home/luna/.netrc`,
+  `/home/../home/luna/.netrc`) also escaped every root and were allowed.
+  So did a quote splitting a root's name (`"/home"/luna/.netrc`,
+  `/var/services/'homes'/luna/.netrc`), a backslash-escaped redirect target
+  (`echo x > \/etc/passwd`, which reached no core.filesystem keyword),
+  macOS's firmlinked `/System/Volumes/Data/Users/<u>`, Linux's
+  `/proc/<pid>/root/…`, and root's macOS home `/private/var/root`.
+  A second review found more spellings of the same roots, all allowed:
+  ANSI-C numeric escapes (`$'\x2fetc/sudoers'`, kept as the literal text
+  `\x2f`); a glob, brace list, extglob/zsh alternation or expansion in a
+  root's own name (`/e?c/sudoers`, `/{home,tmp}/luna/.netrc`,
+  `/(etc|x)/sudoers`, `/et${x}c/sudoers`), now read as every root the
+  pattern can become; `/proc/<pid>/task/<tid>/root`, macOS's `/.nofollow`
+  and `/Volumes/Macintosh HD`; a base nothing can read — a relative path
+  climbing out of the working directory (`../../../../etc/sudoers`, whose
+  `> ..` target selected no pack), `/proc/<pid>/cwd`, `$x/etc/sudoers`,
+  `` `printf /`etc/sudoers `` — judged by the file it can reach; and a
+  Windows profile mounted by WSL, Git Bash or Cygwin (`/mnt/c/Users/<u>`,
+  `/c/Users/<u>`, `/cygdrive/c/Users/<u>`).
+  A third review found a bracket expression opening with `]` (`/e[]t]c`) and
+  a brace list spanning a `/` (`tee -a /{tmp/x,etc/sudoers}`) still allowed,
+  and two ways to stall the hook for over a minute: a long run of rewritable
+  components (`/*/*/…`, `/$x/$x/…`, 5,000 deep) and a source glob of many
+  `*?` pairs (`cp ./*?*?… ~/.config/gcloud/`), whose matcher was exponential.
+  Brace lists across a `/` are now expanded, glob matching is linear, and a
+  rewritable path past 64 components fails closed.
+
+- **`rm $'-rf' /` was allowed** while `rm '-rf' /` denied: Bash ANSI-C
+  (`$'…'`) and locale (`$"…"`) quoting in an `rm` option read as the `$-`
+  parameter, so `rm $'-rf' /`, `rm $'-\x72f' /` and `rm -$'\x72'f ./build`
+  matched no rule. Both quotings are decoded there now, and an overlong octal
+  escape keeps its low byte as bash and zsh do (`$'\562'` is `r`, not an
+  error that left the word undecoded).
+
+- **A command handed over as a string ran unjudged.** `watch 'rm -rf ./b'`,
+  `watch -n 1 'git reset --hard'`, `parallel ::: 'git reset --hard'`,
+  `env -S'git reset --hard'`, `su -c '…'`, `sg`/`runuser`/`script`/`flock -c`,
+  `nix-shell --run`, `npx -c`, `entr -s` and `hyperfine '…'` hand their
+  command to a shell, but quoted it was argv data to every rule. Those
+  payloads are now extracted and re-evaluated like `sh -c`'s. For git, the
+  unquoted forms behind wrappers whose options dcg does not model (`doas`,
+  `sudo --user=…`, `chronic`, `strace`, `flock`, `taskset`, `ssh host …`,
+  `docker exec`, `uv run`, `direnv exec`, …) and after an unknown
+  `watch`/`xargs`/`parallel` option (`parallel --retries 3 git …`) now put git
+  in executable position, as `rm -rf` in the same place always was.
+  A fourth review found the runner missed behind a reserved word, a leading
+  redirect or a wrapper's own value (`{ watch '…'; }`, `then su -c '…'`,
+  `sudo -u bob watch '…'`, `timeout 5s watch '…'`); words the runner joins
+  read with their local quotes (`watch 'git reset' --hard`,
+  `ssh host 'git reset' --hard`, `env -S'git reset' --hard`); and
+  `watch -tn 1 '…'`, `hyperfine --prepare='…'`, `entr -s -r '…'`,
+  `sg wheel '…'` and `ssh host -- '…'` misparsed. All now deny. A brace pair
+  with no comma hid the slash-spanning list inside it
+  (`tee /tmp/{{a/,b}}/../../etc/sudoers`), and the brace scan was quadratic
+  in unclosed `{`; both fixed.
+  A fifth review found the runner still missed behind `2>&1` (read as a
+  background `&` and a command `1`), inside `function f { …; }` and
+  `coproc NAME { …; }` bodies, behind a redirect before its payload
+  (`watch 2>/dev/null '…'`, `ssh host 2>/dev/null '…'`), under a quoted or
+  escaped name (`\watch`, `w\atch`, `'su'`, `\ssh`), inside a process
+  substitution (`cat <(watch '…')`), and behind `chrt`, `busybox`,
+  `eatmydata`, `fakeroot`, `cgexec`, `flatpak-spawn`, `pkexec` and `run0`
+  (which also let `eatmydata git reset --hard` through). All now deny.
+
+- **The filesystem-sink fallback could not express a call in receiver position**
+  (#468), so `require('fs').rmSync('/home/user', {recursive: true})` was
+  unmatchable by it while the bound `fs.rmSync(…)` spelling matched.
+
+  `JS_FS_SINK_LITERAL`'s receiver chain was identifier-dot only
+  (`(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*`), which `fs.rmSync(` fills and
+  `require("fs").rmSync(` cannot, because `require("fs")` is a call rather than
+  an identifier. It now admits one optional leading call. That is the same
+  omission #453 and #459 fixed on the AST side — the patterns took a
+  metavariable receiver precisely so the chained `require('fs')` spelling
+  matched, and the literal fallback never got the equivalent, so the two lists
+  disagreed about the shorter spelling a `node -e` one-liner actually writes.
+
+  The receiver call's argument is restricted to a single quoted string rather
+  than anything at all, so the new group stays unambiguous with the identifier
+  chain after it — one requires parentheses, the other forbids them. That is
+  deliberate rather than incidental: an ambiguous pattern here fails OPEN at the
+  backtrack limit, so it would be a bypass and not merely a slowdown.
+
+  `filesystem_fallback_reaches_a_call_receiver_issue_468` covers
+  `require('fs').rmSync`, `.rmdirSync`, `.unlinkSync`, `.promises.rm`,
+  `require('node:fs/promises').rm`, the `await` form, the whitespace-padded
+  `require ( 'fs' ) . rmSync (`, and the TypeScript side, which shares the
+  pattern. `filesystem_fallback_call_receiver_is_not_overbroad_issue_468` holds
+  the line the other way: a non-deleting method behind the same `require`, a
+  `/tmp` target, a non-recursive relative delete, `confirmSync` (an identifier
+  that merely ends in a sink name), and prose mentioning the call.
+
+  `JS_EXEC_SINK_LITERAL` was checked and is unaffected — it anchors on the sink
+  name with no receiver requirement at all.
+
+  Verified on the pure function, not end to end, and that limit is worth stating.
+  `scan_filesystem_sink_fallback` is consulted with an *extracted* body, so
+  reaching it while the AST pass has not already decided requires an AST timeout,
+  which is a function of host load rather than of the command. The size lever
+  cannot substitute: `MAX_AST_INPUT_BYTES` is 1 MiB while stdin is capped at
+  256 KiB, so a body can never exceed it. That is the same conclusion #452
+  reaches for the same reason, and why its test also asserts on the pure
+  function. So this closes a gap in the pattern; it does not come with an
+  end-to-end demonstration.
+
+  The *other* incomplete-analysis backstop — `check_fallback_patterns`, which
+  runs on the raw command when extraction itself is incomplete — is what decides
+  that path, and `92cebef` (#452) widened its JavaScript entries to the same
+  chained spelling.
+
+- **`require('fs').unlinkSync('/home/user/.ssh/id_rsa')` and the promise-API
+  deletions were still allowed when extraction was incomplete** (#468), after the
+  `rmSync`/`rmdirSync` names were fixed. Measured at a clean tree on a release
+  binary, 6/6 per row before and after, so the change is the only variable:
+
+  | body | before | after |
+  | --- | --- | --- |
+  | `require('fs').unlinkSync('/home/user/.ssh/id_rsa')` | allow | **deny** |
+  | `require('fs').promises.rm('/home/user', …)` | allow | **deny** |
+  | `require('node:fs/promises').rm('/home/user', …)` | allow | **deny** |
+  | `require('fs').mkdirSync` / `readFileSync` / `confirmSync` | allow | allow |
+
+  `unlinkSync` joins the existing alternation: same `fs` family, same call shape,
+  and it destroys an SSH private key rather than a tree. The promise `rm` gets two
+  **qualified** entries instead — the `.promises.` member and the `fs/promises`
+  specifier the chained form closes over — deliberately not a bare `\brm\s*\(`.
+  This backstop performs no target check, so an unqualified `rm(` would block a
+  project's own `rm('./build')` helper whenever analysis was incomplete; both that
+  and the destructured `const { rm } = require('fs/promises')` spelling are pinned
+  as negatives, and the destructured one is left to the extracted-body backstop,
+  which does check the target.
+
+  `fs.promises.rmdir` is excluded on purpose: it needs an already-empty directory,
+  the same reason `FileUtils.rmdir` and Perl's `rmdir` are outside #455's
+  recursive-delete family. The computed `require('fs')['rmSync'](…)` spelling also
+  remains — that is a different shape rather than a missing name, and the AST
+  patterns do not cover it either. Both noted on #468.
+
+- **Go's `os.Remove` had no bounded-fallback entry while `os.RemoveAll` did**
+  (#468), so `os.Remove('/home/user/.ssh/id_rsa')` in a Go body was allowed
+  whenever analysis was incomplete and the tree delete beside it denied. The entry
+  is now the prefix `os\.Remove`, covering both, exactly as the Ruby entry is a
+  prefix over the `FileUtils` deletion family. Go's patterns could not match
+  anything at all until #465, which is why the pair was never exercised.
+
+  Found by auditing the whole corpus rather than one language at a time, and that
+  audit is now a test. `every_blocking_ast_pattern_has_a_backstop_entry_issue_468`
+  instantiates every AST pattern registered at a blocking severity and asserts
+  `check_fallback_patterns` matches it, so adding a blocking pattern forces a
+  decision: give it a backstop entry, or exempt it with a reason. `ScriptLanguage::Bash`
+  is the one exemption — a Bash heredoc body *is* shell, so the ordinary pack rules
+  scan it in the raw command, verified rather than assumed (`rm -r /home/user` and
+  `git clean -fd` past `max_body_lines` both deny). The test carries its own
+  self-checks so a green result is meaningful: that the instantiation unwraps a
+  contextual pattern to its call and resolves a metavariable receiver, and that
+  the backstop does *not* match an arbitrary sink.
+
+  This pair had silently disagreed three times before the test existed — Ruby
+  absent entirely (#452), JavaScript's `unlinkSync` and promise `rm` missing, and
+  now Go — each found by hand.
+
+### Fixed
+
+- **A redirect or an option around a shell's `-c` hid the command string.**
+  `sh 2>/dev/null -c '…'`, `bash &>log -c '…'`, `sh -c 2>/dev/null '…'`,
+  `sh -c -- '…'`, `bash -c -e '…'` and `bash +e -c '…'` all run `…`, but the
+  inline-script reader expected the options before `-c` and the command
+  string right after it, so the payload ran unjudged (since before v0.14.4;
+  `python3 2>/dev/null -c '…'` too). The same `&>`, `>|` and `{fd}>`
+  redirects, `wat$'c'h`, and a process substitution inside a word
+  (`--x=<(watch '…')`) still hid a command-string runner's payload. So did
+  a here-string before `-c` (`sh <<<x -c '…'`), and a redirect between a
+  Windows wrapper and its flag (`powershell 2>&1 -EncodedCommand …`,
+  `cmd 2>nul /c …`).
+
+- **A pipeline of thousands of stages, or a run of unclosed `[`, held the hook
+  past its deadline.** tree-sitter-bash parses one long pipeline in
+  superlinear time, so `x | env | … | env -S 'ls'` (60 KB) answered `ask`
+  after 6–9 s; a pipeline of more than 1,024 stages is no longer parsed and
+  fails closed at once (`heredoc.shell:analysis-bounds`). The git expansion
+  check and the PowerShell `[scriptblock]` search rescanned the rest of the
+  command at every `[`/`{`; both are one pass now.
+
+- **The PowerShell profile check warned "Hook missing" although the hook was
+  installed** (#503). A profile keeps the check block from whichever
+  `install.ps1` last ran, and `dcg update` replaces only the binary, so an old
+  block that could not parse the `& 'C:\…\dcg.exe'` hook command warned in
+  every session. `dcg install` (which the warning tells you to run) now
+  rewrites a stale marker-guarded block in place, and the block reads the
+  single-quoted path as a PowerShell literal, so a `''` in it
+  (`C:\Users\O''Brien\…`) no longer ends the path early.
+
+- **Allowlisting the rule id dcg reports did not always allow the command**
+  (#467). `dcg explain` on a `fsPromises.rm('/home/user', { recursive: true })`
+  heredoc reported `heredoc.javascript:fs_rm.catastrophic`; allowlisting exactly
+  that left the command denied under `heredoc.javascript:fspromises_rm`, an id
+  that had never appeared in any output, so there was nothing to tell the user
+  what to allowlist next. The `fs.rm` spelling allowlisted correctly, which is
+  what showed the allowlist mechanism was fine and the duplicate rule was not.
+
+  Two patterns matched the same call, and `find_matches_ast` collects a hit for
+  every pattern, so granting the reported rule simply promoted the shadowed one
+  to winner. The duplication was leftover scaffolding: #453 added
+  `$FS.promises.rm($$$)` for the member spelling and kept `fsPromises.rm($$$)`
+  for the `require('fs/promises')` binding, "where there is no `.promises` member
+  to match", and generalising the receiver to a metavariable in #459 made both
+  redundant — a metavariable matches the whole receiver node whatever its shape.
+  Measured against one file holding all four spellings, `$FS.rm($$$)` matches
+  `fs.rm`, `fs.promises.rm`, `fsPromises.rm` and `require('fs').promises.rm`,
+  while each removed pattern matched a strict subset, so no coverage was lost.
+
+  All four promise-specific patterns are gone (eight `CompiledPattern` entries,
+  since each rule id was registered twice), along with the now-dead
+  `fspromises_` arms in `refine_javascript_match`, `refine_typescript_match` and
+  `is_recursive_delete_rule`. Severity, the `.catastrophic` suffix and #455's
+  temp policy are unchanged, because `fs_rm` and `fspromises_rm` were already in
+  the same refinement sets. `one_deletion_call_yields_one_deletion_rule_issue_467`
+  asserts one deletion rule per call across all four receivers × `rm`/`rmdir` ×
+  both languages. `docs/patterns.md` was stale in the same area and is corrected:
+  the `fs_rm`/`fs_rmdir`/`fs_unlink` rows still showed the pre-#459 `fs.rm($$$)`
+  spelling.
+
+### Security
+
+- **Every Go pattern was incapable of matching anything, including
+  `os.RemoveAll` at Critical** (#465). A Go heredoc that recursively deleted a
+  home directory was allowed, while the Python and Ruby spellings of the same
+  operation denied.
+
+  Go's grammar has no top-level expression statement, so `os.RemoveAll($$$)` is
+  not a parseable Go fragment: it compiles to an ERROR-rooted tree
+  (`[[os, ., RemoveAll], (, Multiple, )]`) that can never equal a real
+  `call_expression`. All six Go patterns were built this way. The same pattern
+  shape works in Python precisely because Python permits a bare expression
+  statement, and that asymmetry is the whole bug — it reproduces in the pinned
+  `ast-grep 0.45.3` CLI on its own, independently of dcg. Go's patterns are now
+  stated inside the smallest enclosing construct that parses
+  (`func f() { os.RemoveAll($$$) }`) with `call_expression` as the selector,
+  which binds to the outermost call so the chained `.Run()`/`.Output()`/
+  `.CombinedOutput()` shapes keep their spans instead of collapsing into the
+  bare `exec.Command` pattern.
+
+  Why it stayed hidden: three things that look like they should have caught it
+  do not. `Pattern::try_new` returns `Ok`, so the fail-open skip for invalid
+  patterns never fired. `default_patterns_all_precompile` asserted that every
+  pattern compiles and passed throughout — compiling is not matching. And
+  `Pattern::has_error()` returns `false` for these patterns, because ast-grep's
+  `are_kinds_matching` treats an ERROR *goal* kind as a wildcard and cannot tell
+  a broken pattern from a deliberately permissive one. No structural predicate
+  available to us can see this, so the new guards are behavioural:
+  `every_language_corpus_matches_its_fixture_issue_465` requires each language's
+  corpus to match its own fixture and fails a language that registers patterns
+  without one, and `go_corpus_matches_every_registered_rule_issue_465` pins all
+  six Go rule ids with their severities and exact spans.
+
+  Turning six patterns from never-matching to always-matching exposed the benign
+  half of `os.RemoveAll`, so `heredoc.go.os_removeall` also joins #455's single
+  recursive-delete policy. Each shape was measured against its Python twin
+  first, and only one disagreed: a literal target under `/tmp` or `/var/tmp`
+  denied in Go while Python and plain `rm -rf /tmp/build` allowed it. That is now
+  carved out as `heredoc.go.os_removeall.temp` at Medium, in both Go string
+  spellings (`"/tmp/build"` and the raw `` `/tmp/build` ``). The shapes that keep
+  blocking already agreed with Python and are unchanged: the two-statement
+  `dir, _ := os.MkdirTemp(…)` / `defer os.RemoveAll(dir)` idiom (the producer is
+  not in the matched call, and proving `dir` still holds that value needs taint
+  analysis this scanner does not do — Python denies its own two-statement
+  spelling for the same reason), the temp *root* `os.RemoveAll(os.TempDir())`,
+  and any `..` escaping `/tmp`.
+
+- **`subprocess.run(['/bin/rm','-rf','/home/user'])` was allowed** while the bare
+  `['rm',…]` spelling and the plain shell `/bin/rm -rf /home/user` were both
+  denied (#459). Every path spelling bypassed the argv reconstruction that the
+  bare one did not: `/bin/rm`, `/usr/bin/rm`, `./rm`, `../bin/rm` and `rm.exe`,
+  across `subprocess.run`, `call` and `Popen`.
+
+  The reconstruction itself was working — `detect_destructive_in_args` joins the
+  argv literals back into one command line (#136), so the text reaching
+  `detect_shell_payload` was correct. The miss was one step later:
+  `next_shell_command` unwraps `sudo`/`command`/`env` frontends but returns the
+  command word verbatim, and the match compares it against the bare literals
+  `"git"` and `"rm"`, which a path spelling can never equal. Now compared on the
+  basename, with the same stripping the shell path already applies and the same
+  idiom as `normalize.rs`.
+
+  Why it stayed hidden: the nested shape `['sh','-c','/bin/rm -rf /home/user']`
+  denies regardless, because bodies are no longer masked from the raw-shell
+  rescan and the pack rules do strip paths. Only argv split lacks contiguous
+  `rm -rf` text for that layer to catch, so only it depended on this comparison.
+
+  This is the Python half of #459. The JavaScript half is receiver anchoring
+  (`cp.spawnSync` vs `child_process.spawnSync`) and the Ruby half is a
+  first-string-only payload extraction; both are untouched.
+
+- **Perl and PHP deletions were unguarded whenever embedded-code analysis was
+  incomplete** (#452), completing the fallback coverage started for Ruby. Five
+  sinks were covered when analysis succeeded and allowed when it did not:
+  `rmtree`, `remove_tree`, `File::Path::rmtree`, PHP `unlink` and PHP `rmdir`.
+  Measured deterministically with a heredoc body one line past
+  `max_body_lines`, with the already-covered Ruby and Python rows denying in
+  both columns to show the lever was sound.
+
+  Every pre-existing `FALLBACK_PATTERNS` entry anchors on a module receiver
+  (`os.`, `shutil.`, `fs.`, `FileUtils.`). Perl and PHP have none — `File::Path`
+  is imported and called bare, and PHP's are builtins — so the call syntax does
+  that work: `\b(?:rmtree|remove_tree)\s*[('"$@]` accepts `rmtree('/x')`,
+  `rmtree '/x'` and `rmtree $dir` while a prose mention does not match, and
+  `\b(?:unlink|rmdir)\s*\(` uses the paren to separate the function call from
+  the shell command of the same name.
+
+  That paren also keeps the entry disjoint from `core.filesystem:unlink-general`
+  (`\bunlink\s+\S`), which requires whitespace and so never matched the no-space
+  paren form. That disjointness is why the gap existed, and it means shell
+  `unlink <file>` keeps being judged solely by its own rule, `/tmp` carve-out
+  included.
+
+- **`Remove-Item -Recurse /` was allowed under a PowerShell payload; the same
+  command with `$HOME` was blocked** (#451). No rule was missing:
+  `core.filesystem`'s `powershell-remove-item-recursive` already knows every
+  alias and already works on non-Windows builds. It was never reached.
+
+  `rm_semantic_scan_required`'s PowerShell arm returned false unless the command
+  contained a backtick, `@`, `&`, `$` or `(`, on the premise that anything
+  unobfuscated would already be selected by the bytewise pack keywords. True for
+  `rm`, which is a keyword; false for `Remove-Item`, `ri`, `del`, `rd` and
+  `erase`, which are not. So the plain spelling fell between the two mechanisms,
+  and the `$HOME` form blocked only because `$` satisfied the prefilter — the
+  spelling with a variable in it was caught while the plain literal target was
+  not.
+
+  `powershell_segment_requires_rm_semantic_scan` one level down already decodes
+  the command word against the alias list, so the prefilter was a pure
+  optimisation with a wrong correctness assumption. Removed, keeping the `&`
+  call-operator fast path. `windows.filesystem` already had the right shape:
+  `windows_filesystem_semantic_scan_required` pairs its escape-character test
+  with a case-insensitive protected-word check; `core.filesystem` had only the
+  escape-character half.
+
+  Ten of ten reported rows now deny, six of which were allowed. Fourteen
+  legitimate commands still allow, including the `-WhatIf` escape, all three
+  temp-path carve-outs, and a payload that names the cmdlet as data. Only the
+  PowerShell and Unknown dialects reach this arm, so the POSIX hot path is
+  untouched.
+
+  Unchanged and still open: `windows.filesystem`/`windows.system` remain gated on
+  `cfg!(windows)`, so on a non-Windows build with a PowerShell or cmd payload
+  `Clear-Content`, `Clear-RecycleBin`, `[System.IO.Directory]::Delete`,
+  `del /s`, `rd /s` and `format C:` are still allowed. That is the structural
+  half of #451 and needs a pack-selection decision.
+
+  **Allowlist note.** Making the guard reachable also moved which rule answers
+  some commands that already denied. `core.*` is tier 1 and `windows.*` is tier
+  11, so wherever `core.filesystem` can now match it claims attribution, and
+  `pwsh -c "Remove-Item -Recurse -Force <path>"` reports
+  `core.filesystem:powershell-remove-item-recursive` where it previously
+  reported `windows.filesystem:remove-item-recurse-force`. Nothing became
+  allowed — both rules deny — but allowlists key on `pack_id:pattern_name`, so
+  an existing `windows.filesystem:remove-item-recurse-force` exception no longer
+  covers the `pwsh -c` spelling and needs the `core.filesystem` id added
+  alongside it. The bare `Remove-Item -Recurse -Force <path>` spelling is
+  unaffected and still answers `windows.filesystem`; the launcher wrapper, not
+  the path, is what moves attribution. Both routes are now pinned in
+  `tests/repro_313_powershell_read_only_false_positives.rs`.
+
+- **Perl's documented way of calling `File::Path` was unguarded** (#453).
+  `PERL_FILE_PATH_RMTREE_LITERAL` required the fully qualified
+  `File::Path::rmtree`, but the module's own documentation imports the
+  functions — `use File::Path qw(rmtree); rmtree('/home/user')` — and calls
+  them bare. So the guard covered the rarer spelling and missed the idiomatic
+  one, at every target including catastrophic ones. The qualified form denied
+  throughout, which is how we know the coverage existed and only the
+  qualification was wrong.
+
+  It was also the odd convention out in its own file: `PERL_UNLINK_LITERAL` and
+  `PERL_RMDIR_LITERAL`, defined immediately below, match `unlink` and `rmdir`
+  with no qualification at all.
+
+  The prefix is now optional. A bare `rmtree`/`remove_tree` stays specific
+  enough to key on: neither is a Perl builtin, the scan only runs on an
+  extracted Perl body with comments masked, and a quoted string argument is
+  still required. Non-catastrophic targets still warn rather than block, a
+  commented-out mention does not match, and `rmtree($dir)` with no literal
+  target does not block.
+
+  Still advisory-only and unchanged here: `scan_perl_unlink_rmdir` assigns
+  `Severity::Low` unconditionally and never checks the target, so Perl
+  `rmdir('/')` and `unlink('/etc/shadow')` do not block. That is a posture
+  question rather than a pattern bug — see #455.
+
+- **`FileUtils.rm_r('/')` was allowed while `FileUtils.rm_rf('/')` was
+  blocked** (#454). Ruby's own docs define `rm_rf` as `rm_r` with
+  `force: true`; the only difference is that `rm_rf` swallows errors, so `rm_r`
+  is the spelling a script that checks for failure reaches for. Both the AST
+  rules and the literal pre-AST fallback were driven by the same four method
+  names (`rm_rf`, `remove_dir`, `rm`, `remove`), so there was no second layer
+  to catch the gap, and `check_fallback_patterns` has no Ruby entries at all.
+
+  The trailing `\b` in `RUBY_FILEUTILS_LITERAL` is why `rm_r` was unmatchable
+  rather than merely unmatched: `rm` matches the prefix, and `\b` then has to
+  hold between `m` and `_`, which is not a boundary. No ordering of the
+  alternation could have fixed it.
+
+  The inversion ran the wrong way round. `FileUtils.rm('/home/user')` was
+  **denied** even though `rm` is not recursive and raises `Errno::EISDIR` on a
+  directory, while `FileUtils.rm_r('/home/user')` was **allowed** and wipes the
+  tree. Verified allowed before the fix and denied after, at `/`, `/etc`,
+  `/usr`, `/var`, `~` and `/home/user/.ssh`, in both a heredoc body and a
+  `ruby -e` one-liner.
+
+  Now covered: `rm_r`, `remove_entry`, `remove_entry_secure` (recursive),
+  `rm_f`, `remove_file` (the force/alias siblings of the already-covered
+  `rm`/`remove`), and `rmdir` — the last because `Dir.rmdir`, which
+  `FileUtils.rmdir` delegates to, already blocked on a catastrophic target, so
+  covering one spelling and not the other was an inconsistency rather than a
+  carve-out. Non-deleting `FileUtils` calls (`mkdir_p`, `cp_r`, `mv`,
+  `chmod_R`, `touch`, `ln_s`) and non-catastrophic targets are asserted
+  unchanged in both directions.
+
+- **`tee ~/.SSH/id_rsa` was allowed, on the filesystems most of our users are
+  on.** `credential-file-write` compared path components case-sensitively, so
+  an upper- or mixed-case spelling read as a different path and switched the
+  whole classifier off. APFS and NTFS — the macOS and Windows defaults — are
+  case-insensitive, so those spellings open the real files; verified on this
+  host by reading `.ssh/id_rsa` back through `.SSH/id_rsa`.
+
+  Redirects happened to survive, because `redirect-truncate-root-home` catches
+  `> ~/.ANYTHING` that already exists without caring what it is named. Every
+  other writer did not, and neither did a redirect to a target that does not
+  exist yet (the #337/#390 creation carve-out). Confirmed allowed before the
+  fix, all of which write the real file:
+
+  ```
+  tee ~/.SSH/id_rsa              cp evil ~/.SSH/id_rsa
+  sed -i 's/a/b/' ~/.SSH/config  echo x > ~/.NETRC
+  echo x > /ETC/passwd
+  ```
+
+  Component comparison, the `/home|/Users|/root|/etc|/private` root detection,
+  the `known_hosts` and `*.pub` neighbours, the `reachable` partial check and
+  the relative anchors all fold ASCII case now, and the raw-text pre-gate folds
+  with them — a gate has to be at least as permissive as the matcher behind it.
+  The carve-outs fold too rather than getting stricter: `>> ~/.ssh/KNOWN_HOSTS`
+  still appends and `~/.SSH/id_rsa.PUB` is still public.
+
+  The cost is a false positive only on a case-sensitive filesystem that has a
+  genuinely distinct `~/.SSH` or `/ETC`, which is the conservative direction
+  and matches what the pack keyword index already did — quick-rejection has
+  been ASCII case-insensitive all along, so the command reached the pack and
+  then fell out of the classifier.
+
+- **Any argument containing the word `lsblk`, `blkid`, `df`, `stat`, `getfacl`,
+  `namei`, `journalctl`, `host` or `nslookup` switched off every rule in the
+  pack that owns it (#448).** Nine safe patterns across four packs were written
+  as a bare word. A safe match short-circuits its pack's destructive patterns,
+  so the evidence for "this is read-only" could be supplied by the destructive
+  command's own arguments. `system.disk` is one of the five packs a default
+  install enables, so three of the nine were a default-configuration bypass.
+
+  Each pair below differs only in argument data, measured against v0.14.4:
+
+  | command | decision |
+  |---|---|
+  | `dd if=/dev/zero of=/dev/sda 2>>/var/log/dd.log` | DENY `dd-device` |
+  | `dd if=/dev/zero of=/dev/sda 2>>/var/log/blkid.log` | **allowed** |
+  | `mkfs.ext4 -L data /dev/sdb1` | DENY `mkfs` |
+  | `mkfs.ext4 -L df /dev/sdb1` | **allowed** |
+  | `wipefs -a /dev/sdb -o /tmp/wipe.bak` | DENY `wipefs` |
+  | `wipefs -a /dev/sdb -o /tmp/df.bak` | **allowed** |
+  | `mdadm --stop /dev/md0 --config /etc/blkid.conf` | **allowed** |
+  | `tee /dev/sda < /tmp/blkid.img` | **allowed** |
+  | `chmod -R 777 /etc --reference=/tmp/stat` | **allowed** |
+  | `systemctl stop sshd --output=journalctl` | **allowed** |
+  | `dig axfr example.com @host` | **allowed** |
+
+  `tee /dev/sda` defeats the rule added for #444 in the same release. `df` is
+  two letters matched as a word anywhere, so this was as easy to trip by
+  accident as deliberately.
+
+  The obvious probe passes, which is why earlier audits of this shape did not
+  reach these: separator-crossing spellings were already denied, because
+  segments are judged separately — `wipefs -a /dev/sdb && lsblk`, `; lsblk`,
+  `lsblk && wipefs …` and `# lsblk` all block. The hole is one segment wide, so
+  the evidence has to sit inside the destructive command's arguments. That is
+  the #429 shape rather than a second command, and the #435 audit covered it in
+  `kubernetes.helm`, `database.supabase`, `kubernetes.kustomize` and
+  `database.mongodb`.
+
+  Each pattern now requires its tool to be what the segment runs, still
+  accepting the env-prefix, `sudo` and absolute-path spellings:
+
+  ```
+  ^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?lsblk\b
+  ```
+
+  Narrowing a safe pattern can only cost a false deny where a destructive
+  pattern matches the same command, and none match a read-only invocation of
+  these tools — `lsblk`, `blkid` and `df` are not even in `system.disk`'s
+  keyword list, so a bare `lsblk` never reaches that pack. A spelling the anchor
+  misses therefore falls through to allow rather than to a block. The allowed
+  direction is asserted per pack alongside the blocked one.
+
+  The other four default-enabled packs resist this already, checked with matched
+  pairs: `git clean -fdx -e status`, `git reset --hard -- log`,
+  `docker system prune -a -f --filter label=ps` and
+  `rm -rf /etc/nginx --exclude=ls` all still deny.
+
+  **Six more across two packs carried the defect and were not in that set of
+  nine.** Verifying the fix — all fourteen reported shapes deny, all twelve
+  read-only invocations still allowed — then sweeping every direct
+  `safe_pattern!` in every pack for the same shape turned up five in
+  `system.disk` — `fdisk-list` (`fdisk\s+-l`, unanchored), `mount-list`
+  (`\bmount\s*$`, anchored only at the *end*), and the three LVM exemptions —
+  plus `service-status` in `system.services`. `/` is a word boundary, so any
+  destructive command whose redirect target's last path component is `mount`
+  satisfied `mount-list`; and `lvs`/`vgs`/`pvs` are three letters matched as a
+  word anywhere, which makes them as easy to trip as the `df` case above.
+  Measured with no pack config, so `system.disk` is default-enabled:
+
+  ```
+  dd if=/dev/zero of=/dev/sda 2>>/var/log/mount        was ALLOW
+  wipefs -a /dev/sdb 2>/tmp/mount                      was ALLOW
+  mkfs.ext4 /dev/sdb1 2>>"/tmp/fdisk -l.log"           was ALLOW
+  mkfs.ext4 -L lvs /dev/sdb1                           was ALLOW
+  mkfs.ext4 -L vgs /dev/sdb1                           was ALLOW
+  mkfs.ext4 -L pvs /dev/sdb1                           was ALLOW
+  dd if=/dev/zero of=/dev/sda 2>>/var/log/vgs.log      was ALLOW
+  wipefs -a /dev/sdb 2>/tmp/pvs                        was ALLOW
+  mkfs.ext4 -L lvscan /dev/sdb1                        was ALLOW
+  dd if=/dev/zero of=/dev/sda 2>>/var/log/pvscan       was ALLOW
+  ```
+
+  All five are **dropped rather than anchored**, because none was load-bearing —
+  the call `ae0cf8d` made for the mdadm exemptions. `fdisk-edit` already excludes
+  the read-only form twice over: it requires `/dev/` directly after `fdisk`, so
+  `fdisk -l /dev/sda` never reaches it, and it carries `(?!.*-l)`, so
+  `fdisk /dev/sda -l` does not match either. No rule here matches a bare `mount`:
+  `mount-bind-root` needs `--bind` with a root target and `umount-force` needs the
+  literal `umount`. And every destructive LVM rule is word-anchored on a *remove*
+  or *reduce* tool — `\bpvremove\b`, `\bvgremove\b`, `\blvremove\b`,
+  `\bvgreduce\b`, `\blvreduce\b` — so no query tool was ever denied; `lvm-display`
+  is dropped alongside its two siblings for the same reason rather than left as
+  the one unanchored survivor. All of the pack's existing tests pass unchanged,
+  including `ordinary_mounts_stay_allowed_issue_441`, and the allowed direction is
+  asserted for every dropped exemption: `lvs`, `vgs -o vg_name`, `pvs /dev/sda`,
+  `lvs -a -o +devices`, `lvscan`, `vgscan`, `lvdisplay`, `vgdisplay /dev/sda`,
+  `pvdisplay`, `fdisk -l`, `fdisk -l /dev/sda`, `fdisk /dev/sda -l`, `mount` and
+  `mount /dev/sdb1 /mnt`.
+
+  `system.services`' `service-status` was the same end-anchored shape as
+  `mount-list`, and it executes for a reason worth noting: `systemctl` accepts
+  several unit names, so `systemctl stop nginx service foo status` stops nginx
+  while `service`, `foo` and `status` merely fail to resolve. That is what
+  separates it from shapes like `dd … of=/dev/sda mount`, where the tool rejects
+  the stray operand and nothing destructive happens. It is redundant too — the
+  only destructive rule there naming `service` requires a critical unit *and*
+  `stop` — so it is dropped rather than anchored, and `systemctl-status` beside it
+  needs no change, because its optional group consumes only `-`-prefixed tokens.
+  That pack is opt-in, so unlike the `system.disk` five it was not a
+  default-configuration bypass.
+
+  The sweep that found them is worth recording as a method: of 781 direct
+  `safe_pattern!` invocations, 52 are unanchored with a short literal, and the
+  three wrapper macros (`helm_safe_pattern!`, `kubectl_safe_pattern!`,
+  `supabase_safe_pattern!`) anchor their own prefix so their bare verbs are not
+  candidates. An earlier pass of this sweep reported 91 because it matched
+  `safe_pattern!` as a substring of those wrappers.
+
+  Bounded the same way the entry above bounds itself. Comments are not a way in
+  (`dd … # verify with fdisk -l afterwards` denies), segment splitting still
+  protects the destructive half (`dd … ; mount`, `mkfs … && mount` deny), and an
+  earlier pass of mine was discarded because half its shapes — `dd … of=/dev/sda
+  mount` — exempt but also fail on the stray operand, so they proved nothing.
+
+- **Every credential and login-startup file the guard protects was writable by
+  naming it relatively (#407).** `echo x > ~/.ssh/authorized_keys` denied;
+  `echo x > .ssh/authorized_keys` did not, and installs an SSH login for anyone
+  standing in a home directory. The same held for `.aws/credentials`,
+  `.kube/config`, `.docker/config.json`, `.gnupg/**`, `.bashrc`, `.zshrc`,
+  `.profile` and the rest — and for *every* writer the classifier understands,
+  not just redirects: `tee`, `cp`, `mv`, `install`, `ln`, `dd of=`, `sed -i`,
+  `perl -i`.
+
+  `resolve` only ever established a root from `~`, `$HOME`, `$VAR` or an
+  absolute `/home|/Users|/root|/etc` prefix, so a relative word returned `None`
+  and was never judged. It now also anchors on a path *component* that names a
+  credential directory (`.ssh/`, `.gnupg/`, `.aws/`, `.kube/`, `.docker/`,
+  `.bashrc.d/`, `.zshrc.d/`), or on a login-shell startup file that is the whole
+  relative path (`.bashrc`, `.zshrc`, `.profile`, …), and rebases onto the home
+  table from there — the argument
+  `redirect-truncate-git-internals-relative` already makes for `.git/`: the name
+  identifies the contents wherever the shell is standing. Because the rebase
+  hands off to the existing table, the relative spellings inherit every
+  decision the rooted ones already make, including the `*.pub` and
+  `known_hosts`-append carve-outs.
+
+  Two gates had to move with it. The cheap pre-gate reads the *raw* command, so
+  it also admits any command containing `\` — otherwise
+  `tee .ss\h/authorized_keys`, which opens the real file, never reached the
+  classifier. And the anchors are keywords in both the pack list and the
+  `PACK_ENTRIES` row (#441), because a bare redirect carries no other keyword
+  in that row; the non-redirect writers were already there under their own
+  names, which is why `tee`/`cp` needed no new entry.
+
+  An anchor now decides the path **wherever it sits, under any root**. The
+  first cut consulted the anchors only on the relative branch, which made the
+  repair stricter than the rule it was mirroring: `tee projects/app/.ssh/id_rsa`
+  denied while `tee ~/projects/app/.ssh/id_rsa` — the same file — did not.
+  Components are rebased at the anchor when the spelling as a whole names
+  nothing protected, so it can only widen a match, never narrow one; the
+  `*.pub` and `known_hosts` carve-outs still apply at the rebased path. The
+  same fallback covers a root the classifier does not model, which previously
+  stopped the word being judged at all: `$PWD/.ssh/id_rsa`, `$FOO/.ssh/id_rsa`,
+  `/opt/.ssh/id_rsa` and `/var/lib/.ssh/id_rsa` were all allowed and now deny.
+  A rebased denial names the path as written rather than the `~/…` form the
+  table matched it against.
+
+  Known limits, measured rather than assumed: an anchor the shell assembles
+  (`.ss${X}h/`) is not recognised, and `redirect-truncate-dynamic-path` does not
+  catch that shape either, because its quick-reject keywords want the `$`
+  directly after the `>`. `.netrc`, `.npmrc` and `.config/gh/hosts.yml` are
+  deliberately excluded; see **Known open**, which also records that this
+  denies a project-local `.ssh/id_rsa` that entry had called correctly allowed.
+
+- **`mount --bind /mnt /` was allowed, and `tee /dev/sda` before it: two rules
+  that could never run because the quick-reject filter dropped the command first
+  (#441, #444).** `system.disk` owns a rule for each — `mount-bind-root` and
+  `tee-device` — and both matched their command all along. Neither could be
+  reached: a pack is only consulted when the command carries a keyword from that
+  pack's `PACK_ENTRIES` row, and the row named `umount` but not `mount`, and no
+  spelling of `/dev/` at all.
+
+  The shape is stark once measured. Against v0.14.4, `mount --bind /mnt /` was
+  allowed, while `mount --bind /mnt/btrfs /` was denied by `mount-bind-root` — the
+  same rule, the same shape, differing only in whether an unrelated row keyword
+  happened to appear inside a path. A bind mount over `/` shadows the running root
+  filesystem for every path resolved afterwards; `tee /dev/sda` overwrites a disk
+  exactly as `dd` would.
+
+  `mount` is registered in place of `umount`, not alongside it: keyword matching is
+  substring-based, so it reaches every `umount -f /mnt/x` the older entry was added
+  for (#323) and the bind spelling besides. Sweeping all 44 of the pack's
+  destructive regexes, `mount-bind-root` was the only one carrying no other row
+  keyword, so it is the only rule the wider gate can newly reach — confirmed by
+  `mount -t ext4 /dev/sdb1 /mnt`, `mount -o remount,ro /`,
+  `mount --bind /proc /mnt/proc`, `mountpoint -q /mnt` and
+  `docker run --mount type=bind,…`, which all still run.
+
+  `mount` had been recorded as a keyword no rule needed, on the evidence that
+  `mount -o remount,ro /` matches nothing. That is true, and it was the wrong
+  command to check. The probe has to come from the pack's rule list rather than
+  from what the keyword looks like it is for, and the exemption list now says so.
+
+  A second test covers the reason all of these shipped green:
+  `registry_gate_admits_every_command_its_rules_must_decide` builds the real
+  `EnabledKeywordIndex` and asserts the pack is a candidate *before* asserting the
+  rule fires, for `cat > .git/config` (#407), `umount -f /mnt/data` (#323),
+  `tee /dev/sda` (#444) and `mount --bind /mnt /` (#441). Pack-level tests call
+  `Pack::check` directly and never see the registry gate, so each of these four had
+  a passing test while the shipped binary allowed the command.
+
+  Sweeping every destructive rule in every pack for the same property — a regex
+  carrying no keyword from its own row — flagged 93 of 1116. 56 are `\b\B`
+  sentinels for rules decided by semantic classifiers, 12 were artifacts of
+  matching against regex source, and probing the rest against the real binary left
+  only the two above plus the `featureflags.flipt` and `featureflags.unleash` REST
+  rules, which need the vendor's name in the URL (#447, opt-in packs).
+
+- **`printf -v` could rebind a proven variable without the guard noticing, and
+  `p=/tmp/safe; printf -v p /; rm -rf "$p"` reached `rm -rf /`.** Narrowing the
+  variable-mutator list so a plain `printf` no longer blocks an ordinary write
+  left three holes, each confirmed against real bash and each blocked by the
+  previous release. The rm proof was handed the argument-masked view, in which
+  every `printf` argument is already blanked, so the `-v` was invisible and
+  every printf was judged inert; bash strips quotes and backslashes before the
+  builtin sees its argv, so `printf "-v"`, `printf '-v'`, `printf -"v"` and
+  `printf \-v` all bind exactly as the bare spelling does; and a `\` line
+  continuation ended the argument scan before it reached the flag. The scan is
+  also linear again — 8000 repetitions of `printf ` took 3.8s against a 1000ms
+  hook budget, and now take 235ms.
+
+- **A `/` after an awk regex literal is division, and reading it as a new regex
+  hid the sink behind it.** A regex literal is a value, so the slash following
+  one divides. The scanner's value set had no `/`, so in `n = /a/ / 2` the second
+  slash opened a phantom regex and the scan ran forward to the next `/` in the
+  program — usually the one inside the payload's own path. That ended the bogus
+  span before any sink keyword, so the span-carries-a-sink veto never fired.
+  Nine variants were allowed, and gawk, mawk and busybox awk all execute them.
+
+  Deciding that from the previous byte alone was itself wrong in the other
+  direction, and a follow-up review caught it: a `/` is a regex CLOSE (a value,
+  so the next one divides) or the division OPERATOR (after which a regex may
+  legally open), and `x = 4 / /^"|/ ; system(…)` needs the second reading.
+  Treating every preceding `/` as a value scanned that regex body as code, where
+  an odd `"` desynced the literal walk and hid the sink — 64 awk-valid variants.
+  The scanner now records the offset where it actually proved a literal closed,
+  and only that offset counts as a value.
+
+  A second clause was added to that veto at the same time, firing whenever a
+  candidate regex body held both a pipe and a quote, to reach the third sink
+  (`print … | "cmd"`) which names no keyword. It was removed again: real awk
+  regexes carry both — `/["|]/`, `/[|"]/` and `/"|,/` are ordinary and gawk runs
+  all three — so it vetoed genuine regexes, refused the skip, and let the body be
+  scanned as code, where its quote paired with a later string quote and restored
+  the exact desync regex tracking exists to prevent. Three confirmed
+  under-blocks, against zero cases it saved once the value set was corrected.
+
+- **A padded SQL comment could silently switch the TRUNCATE rule off.** The
+  comment-skip group added to the statement-position opener was written with a
+  lazy body that merges across `*/`, so M adjacent `/**/` units gave the
+  backtracking engine 2^(M-1) ways to tile the prefix. `RegexEngine::is_match`
+  reports `false` when fancy-regex hits its backtrack limit, so from 13 units
+  onward `mysql -e "/**/…/**/Q; TRUNCATE TABLE users;"` was allowed — a
+  fail-open an attacker steers with 52 bytes of padding. The expression is now
+  the unambiguous non-merging form, verified to 2000 units. A guard must not be
+  able to reach a resource limit it fails open on.
+
+- **One stray byte no longer skips evaluation.** Invalid UTF-8 in a hook payload
+  is attacker-controlled content, not a transient read error, so it now blocks
+  under `DCG_FAIL_CLOSED=1` *and* carries its lossy decoding into the same
+  best-effort scanner oversized input uses. Appending `0xFF` to an otherwise
+  ordinary destructive payload is far cheaper than padding past the size limit,
+  and until now it worked in the default posture.
+
+- **One stray byte also truncated a whole `dcg hook --batch` run, and the run
+  still reported success (#430).** The parallel path read stdin with
+  `map_while(Result::ok)`, which stops at the first line stdin cannot decode and
+  discards every line after it. No result was emitted for the discarded lines, so
+  nothing set `any_blocked`: a three-line batch with one `0xFF` byte on line two
+  returned a single result and exit 0, with the `rm -rf /Users/x/Documents` on
+  line three neither evaluated nor reported. Both batch paths now emit an `error`
+  result for an undecodable line, keep evaluating the rest under
+  `--continue-on-error`, upgrade it to `deny` under `DCG_FAIL_CLOSED=1`, and exit
+  non-zero. The sequential path shared half the defect: it built that result by
+  hand, so it skipped the fail-closed upgrade and left the exit code at 0, and
+  without `--continue-on-error` it returned a bare error with no result line
+  naming the failing index.
+
+  Keeping *every* read error would have traded that bug for a worse one: on a
+  persistent I/O error `Lines` hands back the same failure forever, so an
+  unconditional keep-and-continue is an unbounded loop. Only `InvalidData` is
+  resumable — `read_line` reports it *after* `read_until` has consumed the
+  offending bytes — so any other error is reported and then stops the run with the
+  parse-halt exit code, which tells the caller the batch is short of its input.
+
+- **Plain `dcg hook` was not the hook mode its `--help` promised (#430).** It read
+  stdin through the batch reader, so it missed the bounded byte reader, the
+  invalid-UTF-8 classification, the oversized-payload salvage scan and the
+  fail-open/fail-closed policy that bare `dcg` applies — and it answered in JSONL
+  with exit 1, which an agent expecting the `PreToolUse` protocol does not read as
+  a denial. It now routes into the same path as bare `dcg`; any batch option keeps
+  the JSONL contract.
+
+- **Six further escapes from the awk and osascript extractors**, each verified
+  against the real interpreter: a glued flag value kept its shell quoting so
+  `awk -e"BEGIN{…}"` read the whole program as one string; the scanner did not
+  know the escaped `\"` spelling, hiding the `"cmd" | getline` sink whenever the
+  program arrived in shell double quotes; a `/` after `y++`, `y--` or a trailing
+  decimal point is division, and misreading it as a regex skipped forward to the
+  next `/` — usually the one inside the payload path — stepping over the sink;
+  quoting spliced into the middle of an executable name (`a"wk"`, `aw\k`,
+  `$'awk'`, `osa"script"`) was rejected by the cheap pre-gate before the matcher
+  that understands it ever ran; the glued long progfile flags are a GNU
+  extension, so an awk that does not implement them leaves the following operand
+  as its program; and `original-awk`, `goawk` and `frawk` were not recognised at
+  all.
+
+### Fixed
+
+- **`e2e_destructive_equivalents.sh` was red with 99 failures, so a real
+  regression landing in it would not have stood out (#450).** Now 540 passed,
+  0 failed, 44 scenarios, none skipped.
+
+  The issue reported 16 failures and attributed them to `eafd36a` / #407. Both
+  turned out to be wrong, and the second one matters because it pointed at a
+  security fix as the culprit. Dated from git rather than assumed:
+  `credential-file-write` and its `/etc` table arrived in **`00ffdb6`,
+  2026-09-09** — the commit that created `credential_files.rs` — while the
+  `redirect-truncate-root-home` assertions here were last touched in
+  **`213d387`, 2026-04-29**. The assertions predate the rule that now answers
+  by over four months; #407 extended credential coverage to *relative*
+  spellings and every failing case was an absolute path.
+
+  Three shapes, none of them an under-block:
+
+  - **79 rule-id mismatches** where `credential-file-write` answers instead of
+    the older generic rule (`redirect-truncate-root-home`,
+    `dd-overwrite-root-home`). It should: it is more specific and its reason
+    names the file. The rules compose rather than shadow — where the
+    classifier declines, the generic rule still denies, which is why
+    `echo x > /usr/bin/sudo`, `make &> /etc/log` and `dd … of=/boot/vmlinuz`
+    keep the old id and are now the controls that hold that split honest.
+  - **`echo line >> /etc/passwd` and `>> ~/.bashrc` are blocked**, and
+    `scenario_redirect_append_safe` asserted they were allowed. Appending does
+    not truncate, which is why the *redirect* rule ignores `>>`; it is not why
+    the *file* is safe, since an appended line to `/etc/passwd` adds an account
+    and one to `~/.bashrc` is code execution at the next shell. They moved to
+    their own scenario, with the single documented exception —
+    `ssh-keyscan h >> ~/.ssh/known_hosts` — pinned beside them.
+  - **`$TMPDIR` is reviewed, not treated as temp**, for `find`, `unlink`,
+    `truncate`, `shred`, `tar`, `dd`, `mv` and redirects. Verified to be
+    independent of the environment: identical verdict with the ambient macOS
+    `/var/folders/…` and with `TMPDIR=/tmp`, because dcg judges the literal
+    text. The shipped deny text already says so — "Variable-rooted paths such
+    as `$TMPDIR`: Reviewed because the environment may point anywhere" — so
+    the `*_temp_safe` scenarios were contradicting documented behaviour. They
+    are collected in one scenario that states the rule for each tool, with the
+    literal-path controls repeated in it.
+
+  Assertion count went **up**, 535 to 540, which is the check that matters for
+  a change that turns a red suite green: nothing was deleted to get there. `34ecad1` / `7a23b48` emit one file carrying both
+  shapes: v1's named `DcgGuard` export returning a `"tool.execute.before"` hook
+  map called as `(input, output)`, and v2's default export `{ id, setup(ctx) }`
+  registering through `ctx.tool.hook("execute.before", cb)` with the command in
+  `event.input.command`. A single `node:child_process` spawn path serves both
+  runtimes, since v2 migrated Bun → Node while Bun implements the `node:`
+  modules — so the plugin needs no runtime detection, which matters because
+  `dcg update` regenerates it and the installed OpenCode may have changed major
+  version since `dcg install` ran.
+
+  Verified by executing the artifact, not by reading it: installed into a
+  throwaway `HOME`, imported as an ES module, and driven against the real dcg
+  binary under **node v26.0.0 and bun 1.4.2**. Both contracts deny `rm -rf /`
+  with dcg's reason, allow `git status`, ignore non-`bash` tools, tolerate
+  missing `args`/`input`/`event`, and fail **open** with a stderr notice when the
+  binary cannot be run — an unrunnable dcg is an infrastructure failure, and
+  treating it as a verdict would block every command in the session. `ask` fails
+  closed, deliberately, because OpenCode has no operator-review state.
+
+  The test that shipped with the fix asserts substrings of the generated source,
+  which cannot catch this issue's own failure mode. Measured against four broken
+  copies: it correctly fails when either export is removed, but **passes** both
+  when `dcgDenyReason` is neutered to always allow and when an unbalanced brace
+  makes the module unparseable. Those are the two that leave OpenCode unguarded
+  while saying nothing. `tests/repro_419_opencode_plugin_executes.rs` catches all
+  four, and `SKIP`s with a printed reason when neither `node` nor `bun` is on
+  `PATH`. OpenCode is not covered by `scripts/e2e_harness_matrix.sh`, so this is
+  currently the only execution-level coverage of that bridge.
+
+- **Swept the rest of the suite for tests that assert host speed, and found two
+  more — where a timeout also made the negative assertions pass for the wrong
+  reason.** After the third instance of this class (#433, #443, #446), auditing
+  one file at a time stopped being sensible. Every test touching
+  `ExtractionLimits::default()`, `HOOK_EVALUATION_BUDGET_MS`, `AST_TIMEOUT_MS` or
+  a fixed `Duration` deadline was classified, then the candidates were run
+  repeatedly under load rather than edited on suspicion.
+
+  Most turned out to be fine, and two categories deserve credit rather than
+  changes: the deliberate timing tests (`locked_history_database_never_delays_writer_drop_past_hook_budget`,
+  the deny-latency gate) and the places that already relax explicitly
+  (`repro_windows_exe` and `repro_252` set 5000ms, `codex_hook_protocol` uses
+  `DCG_AST_TIMEOUT_MS`, `common/history.rs` retries inside a 30s window).
+  `tests/repro_heredoc_indent.rs` looked like a match on paper — three content
+  assertions on the default 50ms budget — but survived 8/8 runs at load 91, so it
+  was left alone.
+
+  The real finding was `heredoc::tests::ssh_remote_payload_extraction`: **2 of 8
+  runs failed at load 91**, in `double_dash_ends_option_parsing` and
+  `multi_word_payload_keeps_raw_per_word_quoting`. Its helper collapsed every
+  non-`Extracted` result into an empty vector, so the wall clock decided these
+  tests twice over — the positive assertions flaked, and the negative ones passed
+  for the wrong reason, because `unmodeled_options_bail_without_extraction` could
+  not distinguish "ssh refused the unknown option" from "extraction ran out of
+  time" when both yield no payloads. The helper now relaxes only the clock and
+  panics on an incomplete read instead of reporting it as "nothing found". After
+  the fix: **8 of 8 clean runs at load 102.9**, above the load that produced the
+  failures.
+
+  One note on how that was measured, since it bears on trusting the numbers. The
+  first sweep harness later reported 10 of 10 failures for a target that passed
+  273/273 when run directly — its exit-status accounting was unreliable, so the
+  post-fix figure above comes from a simpler harness that prints each run's exit
+  code and summary line. The original 2-of-8 result stands because that harness
+  also printed the two failing test names, which it could only have parsed out of
+  a real `failures:` block; a miscounted exit status cannot invent them.
+
+  A broader fix was tried and rejected: giving `ExtractionLimits::default()` a
+  `#[cfg(test)]` timeout, mirroring `AST_TIMEOUT_MS`, would have covered all ~50
+  inline call sites at once. But it breaks
+  `structural_scan_limits_relax_only_the_wall_clock_443`, which asserts
+  `structural.timeout_ms > default.timeout_ms`, and more importantly it makes the
+  shipped relationship unobservable from any test — relaxing a public API value is
+  not equivalent to relaxing a private constant. The narrow, test-local relaxation
+  keeps that invariant checkable.
+
+- **The #427 extraction-budget tests asserted host speed, not the budget they
+  were written for.** `an_untruncated_extraction_is_still_reported_as_complete`
+  and `a_truncated_extraction_reports_itself_as_partial` both ran through
+  `ExtractionLimits::default()`, which carries `timeout_ms: 50` alongside the size
+  and slot caps. Both tests are about `max_heredocs` — whether a payload list
+  that fits reports `Extracted` and an over-long one reports `Partial` with the
+  slot budget filled — so the wall clock was incidental, and when it fired on a
+  loaded machine a complete extraction was downgraded to `Partial` and the test
+  failed with "a complete extraction must not be downgraded to partial", naming
+  the extractor rather than the host.
+
+  Load-matched A/B with one binary: **0/10 failures at load 34.6 and 2/10 at load
+  74.1** before; **0/14 at loads 102–115** after, so the fix was verified above
+  the load that broke it rather than at a quieter moment. The tests now relax
+  only the wall clock, keeping `max_heredocs` and the byte/line caps at their
+  shipped values so the boundary under test is unchanged — the same trade
+  `ExtractionLimits::structural_scan()` made for the structural helpers (#443).
+  The shared `payloads()` helper, which 45 call sites in that file use, got the
+  same treatment, and the surviving failure message now distinguishes a timeout
+  from a slot limit so a slow host cannot be mistaken for a wrong extractor
+  again.
+
+- **A busy host no longer fails the history suite and blames the writer for it
+  (#433).** Four tests asserted a fixed two-second flush deadline, so a loaded
+  machine turned "telemetry is best-effort and dropped an entry because the
+  database was busy" into "history writer did not acknowledge allow entry" — and
+  under a stash-and-rerun A/B that misattribution convicted an unrelated pattern
+  change. `20734cc` replaced the deadline with an outcome-based wait under a
+  generous watchdog (`finish_history_writer`), whose failure text now names the
+  host and reports actual elapsed time, and kept
+  `locked_history_database_never_delays_writer_drop_past_hook_budget` as the
+  separate timing assertion it always was.
+
+  Confirmed at the load that broke it: **11 consecutive clean runs, 42 tests
+  each, 0 failures, at 1-minute load averages from 34 to 106** on a 128-core
+  host. The report's four failures occurred at load 88; runs here at 79.9–106.3
+  took 4.8–6.4s, matching its 4.55s observation, so the slow condition was
+  reproduced rather than avoided. One run at load 47 took 11.1s, five times the
+  old deadline.
+
+- **The #442 scanner regressions never ran, and the CI step asserting them
+  passed while testing nothing.** `src/scanner_regression_tests.rs` had no `mod`
+  declaration on `main` — the declaration lived only in
+  `vendor/patches/dcg-bash-scanner-wiring.patch`, which is applied when the
+  vendored repair is prepared. Rust does not auto-discover modules, so on `main`
+  the file was not compiled, not linted, and its tests never executed. That went
+  unnoticed because `cargo test --lib <filter>` exits 0 when the filter matches
+  nothing: `cargo test --locked --lib scanner_regression_tests` printed
+  `running 0 tests`, reported `ok`, and exited 0. Every later step in the
+  `scanner-safety` job is gated on `steps.focused.outcome == 'success'`, so all
+  of them inherited that vacuous pass.
+
+  Declaring the module immediately produced two `clippy::unreadable_literal`
+  errors under the repository's `-D warnings`: the file had never been linted, so
+  wiring it in was always going to break CI on the first attempt. That is exactly
+  what happened — `89da0e2` declared the module while landing the vendored
+  scanner and left the literals untouched, so `clippy --all-targets -- -D
+  warnings` failed on `main` until this commit separated them.
+
+  The declaration stays on `main` so the cases run with or without the vendored
+  repair, and `vendor/patches/dcg-bash-scanner-wiring.patch` no longer carries a
+  `src/lib.rs` hunk — re-applying it would have added a *second* declaration,
+  which `git apply` accepts and `rustc` then rejects as a duplicate module.
+  `publish-tree` correspondingly stops requiring `src/lib.rs` among a candidate's
+  changed paths, since the file is now committed rather than patched. The
+  workflow step asserts how many tests were discovered instead of trusting a
+  zero-test exit code, and `src/lib.rs` joins the job's path filter, because
+  undeclaring the module is precisely when the job needs to run.
+
+  Reviewing the repair itself found nothing to change and bounded its scope:
+  **bash is the only one of dcg's seven grammars affected.** Its scanner calls
+  the wide, domain-safe `iswspace`/`iswalpha`/`iswalnum`/`iswdigit` 52 times and
+  the narrow `isdigit` exactly twice — the two brace-range loops the patch fixes
+  — and no other vendored grammar's scanner calls a narrow ctype function at all.
+  The `iswdigit` the same file already uses elsewhere would have been equivalent
+  in behaviour — POSIX constrains the `digit` class to `0`–`9` in every locale,
+  and glibc agrees for U+0660, U+06F0, U+FF10 and U+1D7D8 under `C`, `C.UTF-8`
+  and `en_US.UTF-8` — so the choice between them is not about what they classify.
+  The explicit comparison is still the better repair because it removes the
+  domain question at the call site instead of relying on a wider domain to
+  contain it, and a reader can check a range comparison without knowing anything
+  about ctype domains. Probing dcg itself found no reachable fault: 42 hook invocations
+  across seven code points (U+0100 to U+10FFFF) and six command shapes all
+  decided correctly, and a trigger paired with a destructive command was still
+  denied as `core.filesystem:rm-rf-root-home`. The reason to land the repair is
+  therefore the shape of the failure rather than a reproduction — a hook that
+  dies writes nothing to stdout, and the protocol reads empty stdout as *allow*,
+  so a fault in the guard's own parser fails open.
+
+  `tests/repro_442_source_modules_are_declared.rs` guards the invariant for
+  every top-level `src/*.rs`. It lives under `tests/`, which Cargo discovers
+  automatically, so the guard cannot be orphaned the way the thing it guards
+  was, and its own detection is covered by negative controls rather than only by
+  passing.
+
+- **The whole #442 gate could go green while linking the unpatched scanner.**
+  The repair is selected by the root `[patch.crates-io]`, and a Cargo patch is
+  silent when it stops applying: let the dependency graph ask for a
+  `tree-sitter-bash` the vendored copy does not satisfy — an `ast-grep-language`
+  bump is the likely way, since it requires `^0.25.0` today — and Cargo prints
+  `patch ... was not used in the crate graph` as a *warning*, links the registry
+  crate, and the build succeeds. Nothing in the tree noticed.
+  `scripts/check_scanner_safety.py` compiles
+  `vendor/tree-sitter-bash/src/scanner.c` with `cc`, so it validates the file on
+  disk rather than the one Cargo linked, and `src/scanner_regression_tests.rs`
+  asserts properties — source bytes preserved, the destructive command still
+  matched — that hold on an unpatched build too, because the out-of-domain read
+  usually returns a value the loop discards and faults only when process memory
+  layout puts libc's classification table beside an unmapped page. A green suite
+  was therefore not evidence that the patched scanner was in the binary.
+
+  `tests/repro_442_vendored_scanner_is_linked.rs` asserts the wiring instead of
+  a symptom: `Cargo.lock` must resolve `tree-sitter-bash` to the path package (a
+  registry fallback is visible as a `source` field) and record no
+  `[[patch.unused]]`, the locked and vendored versions must agree, and the
+  vendored scanner must call no narrow ctype function on a value that can be a
+  code point while keeping both ASCII digit loops. It lives under `tests/` for
+  the same reason as the module guard, and its detectors are proved against the
+  actual unpatched upstream scanner and against a lockfile with the patch
+  dropped, not only against inputs that pass.
+
+- **#412 is now fully closed.** The v0.14.4 notes below record it as partially
+  fixed because the reported command was still denied. `stdin_data_sink_may_be_overridden`
+  no longer lets the *bytes of a quoted heredoc body* decide whether a data sink
+  could have been overridden: the body is blanked before the retry, so an
+  unbalanced `"` inside a commit message can no longer defeat the scanner behind
+  the mask. The reported command is allowed, and the security controls that
+  depend on detecting a real override are unchanged.
+
+- **awk and osascript shell sinks are extracted (#399, #398).** `awk`'s
+  `system(…)`, `print … | "cmd"` and `"cmd" | getline`, and `osascript`'s
+  AppleScript `do shell script "…"` and JXA `$.system(…)` / `.doShellScript(…)`
+  all hand a string to `/bin/sh`, so their payloads are now evaluated as the
+  inline shell commands they are. Keyed on the sink shapes rather than the
+  interpreter, so an ordinary `awk '{print $1}' file.txt` extracts nothing.
+
+  The option grammar is modeled rather than abandoned at the first unfamiliar
+  flag: `-F`, `-v`, `-i`, `-l` and `-W` take a value that is not program text,
+  `-e`/`--source` supplies the program *as the flag value*, `-f`/`-E` read it
+  from a file dcg will not open (and turn every remaining operand into data),
+  and anything else is assumed to take no separate value so the walk continues.
+  The awk program scanner also tracks regex literals, so the everyday
+  `gsub(/"/, "")` no longer desynchronizes the string walk, and only a `#` that
+  opens a line is treated as a comment.
+
+- **Dashed git builtins are treated as git (#400).** `git-reset --hard`,
+  `git-clean -fdx` and the rest of the `git-<subcommand>` spellings — the form
+  `/usr/libexec/git-core/` ships — now enter `core.git` instead of bypassing it.
+
+- **A continuation line opens a TRUNCATE statement when `TABLE` is explicit
+  (#394 follow-up).** `mysql -e "-- comment\nTRUNCATE TABLE users"` has no `;`
+  before the statement and is not at text start, so the statement-position rule
+  missed it. A newline now counts as an opener when the explicit `TRUNCATE
+  TABLE` spelling follows, which is evidence no Tailwind class list carries.
+
+- **Writing a script that uses its own language's `eval` is no longer denied
+  (#440).** `cat > script.rb <<'OUTER' … eval <<~'SCRIPT' … SCRIPT … OUTER` denied as
+  `heredoc.posix:eval-dynamic` although nothing executes: the delimiter is quoted,
+  `cat >` does not execute its stdin, and the `eval` is Ruby's. It is the standard
+  way to drive a `pry`/IRB console non-interactively, so the natural spelling was
+  the blocked one.
+
+  Two sibling checks read different views of the same bytes. The pattern path and
+  the launcher check scan the *masked* view, where a proven data-sink body is blank
+  — which is why `rm -rf /` and `$(rm -rf /)` in that position were always allowed.
+  The executable-text-sink scan read the raw command, found an `eval` whose source
+  it could not resolve, and failed closed. `<<~` was incidental:
+  `eval "$(cat foo)"` and `eval $CMD` denied identically.
+
+  The fix is scoped to one collector, because masking the whole sink scan is
+  unsound and was tried first. `mask_non_expanding_data_heredocs` reads a target
+  from what precedes the operator on its own line, so it blanks the body of
+  `cat <<'EOF' | bash`, where the pipe hands that body to a shell — and the
+  pipeline collector is precisely the component that models that, so blanking its
+  input turned `rm -rf ./src` into an allow. The collectors ask different
+  questions and now get different views: the pipeline and process-substitution
+  collectors ask *does this body become a shell's source* and keep the raw command,
+  while the eval collector asks *is there an eval whose source I cannot resolve*
+  and reads the masked view, because an eval inside a body nothing executes is not
+  one.
+
+  An eval that is real stays visible either way — outside a heredoc it is
+  untouched, and inside a body a pipeline feeds to a shell the pipeline collector
+  recursively evaluates that body. Verified in both directions: the reported
+  command and the whole `eval "$(cat foo)"` / `eval $CMD` class now allow, while
+  `cat <<'EOF' | bash`, `| sh`, `| bash -s`, bodies fed to `bash`/`sh` directly,
+  unquoted delimiters, and real top-level evals all still deny.
+
+  Two diagnoses were wrong on the way here and are worth recording, since each
+  sent the fix to the wrong file: the report inferred the nested heredoc made the
+  scanner lose the outer body's boundary, and I inferred Ruby's `<<~` broke the
+  bash parse so masking was skipped fail-closed. Instrumenting it showed the parse
+  succeeds and the body is masked byte-identically to the variant that allows.
+
+- **The registry-covers-pack invariant is now enforced for every pack (#441).** All
+  29 packs that declare a keyword their `PACK_ENTRIES` row omits are audited, so a
+  *new* omission fails `registry_keywords_cover_every_pack_declared_keyword`
+  rather than joining 125 existing ones unnoticed. Each pack's headline rules were
+  run with only that pack enabled, and every one still denies.
+
+  The test reached that name the hard way. It first ran over an allowlist of
+  audited packs, which made the heading above true of 32 rows and not of the other
+  71 — a new omission in any of those 71 still passed. Re-measuring found the
+  backlog the allowlist existed to work through was already empty: 6 rows share one
+  `KEYWORDS` const with their pack and cannot drift, 68 already carry every keyword
+  their pack declares, and all remaining drift belonged to packs already audited.
+  The allowlist was removed; the only thing it could still do was exempt the next
+  pack to acquire an omission.
+
+  The exemptions record *why* each keyword is dead without being a bypass, and the
+  distinction matters: most are structural — a subcommand or service name of a CLI
+  whose own name the row carries, so no command can present the keyword without the
+  gate — and the `windows.*` upper-case spellings are reached through their
+  lower-case twins because the automaton is ASCII case-insensitive. A smaller group
+  is covered only because **no rule currently needs them** (`database.postgresql`'s
+  and `database.snowflake`'s bare SQL verbs, `system.permissions`' `chgrp`,
+  `infrastructure.ansible`'s `playbook`), which is a weaker guarantee: adding a
+  matching rule without also adding the keyword silently reintroduces the defect,
+  and the test cannot catch that. Those are called out as such.
+
+  `system.disk`'s `mount` and `/dev/` were in that group and should not have been.
+  Both had a rule: `/dev/` was corrected first, `mount` below.
+
+  `database.sqlite`'s `sqlite` is left out deliberately rather than as an oversight.
+  The row carries `sqlite3`, the binary modern systems ship; admitting `sqlite`
+  would make the pack a candidate for any command merely containing that substring,
+  a path like `/var/lib/sqlite/` included, and the rule it reaches is
+  `(?i)\bDROP\s+TABLE\b` with no client requirement — so
+  `echo "DROP TABLE" >> /var/lib/sqlite/notes` would begin to deny.
+
+  Hot-path cost of the 19 keywords added across all of this: worst net p95 of
+  38.7 ms against the 1000 ms budget.
+
+- **Mongo shell methods and `kubectl delete -k` were unreachable, which is why two
+  `option_evidence` audits were red (#441).** `database.mongodb`'s registry row
+  carried client binaries and `dropDatabase`/`dropCollection`, so a mongosh snippet
+  that names no client — `db.users.drop()`, `db.users.remove({})`,
+  `db.users.deleteMany({})` — was quick-rejected before the pack was a candidate.
+  `kubernetes.kustomize`'s row carried only `kustomize`, so `kubectl delete -k
+  ./prod` and `kubectl delete --force -k./prod` never reached the
+  `kubectl-delete-k` rule written for them.
+
+  Those two gaps were the whole cause of the `#435` audit assertions
+  `mongodb_read_exemptions_cannot_shadow_any_current_destructive_rule` and
+  `kustomize_pipeline_argument_data_cannot_exempt_a_delete` failing — the rules and
+  their exemption logic were already correct. The rules stay narrow, so admitting
+  the keywords widens which commands the pack is *asked* about and not what it
+  denies: `df.drop(columns=['a'])` and `items.remove(x)` are still allowed, as is
+  `kubectl apply -k`, while `db.users.drop({writeConcern: …})` denies because
+  Mongo's `drop()` takes an options document and still drops the collection.
+
+- **Three test suites were reading batch mode's `decision` field while invoking
+  plain `dcg hook`**, which #430 made the agent-protocol path. It reports
+  `permissionDecision` and stays silent on an allow, so every command looked
+  allowed. `false_positive_corpus` caught it through its own `MUST_DENY` controls;
+  `repro_330_hook_subcommand_policy_parity` (9 tests) and
+  `repro_402_external_pack_keyword_gating` were simply red, and `cargo test`'s
+  fail-fast had been stopping at an earlier failure before reaching them. The
+  policy-parity suite now names the JSONL contract it pins with `--batch`; the
+  other two read the protocol field.
+
+- **A structural heredoc question no longer depends on how busy the machine is
+  (#443, partial).** Two helpers answer *where a heredoc body begins and ends* —
+  the #393 parse recovery, which exists because tree-sitter-bash rejects Ruby's
+  `<<~`, and the #412 quoted-body blanking. Both called extraction with the
+  hardcoded 50ms default budget. Under parallel load that expired, the helper
+  answered "no content", the recovery declined, and a data-sink heredoc body that
+  masks on an idle machine was re-scanned as live shell instead. The failing
+  direction is over-blocking, so it was fail-safe, but the question is a property
+  of the command.
+
+  Both now use size caps identical to the default with a far larger wall clock:
+  the caps are what bound the work — a 256 KiB input limit plus 1 MiB / 10k lines
+  / 10 heredocs — and the clock contributed only nondeterminism. It stays finite so
+  a pathological input still terminates. Measured on the previously load-flaky
+  `masks_indent_stripped_heredoc_body_with_space_indented_terminator`: 2/12
+  failures at loadavg 89 before, **0/25 at loadavg 129** after, and 0/16 rather
+  than ~2/14 across full `--lib` runs.
+
+  The wider half of #443 is untouched: six production helpers hardcode
+  `ExtractionLimits::default()` instead of the configured `HeredocSettings.limits`,
+  so `DCG_HEREDOC_TIMEOUT_MS` is inert for them. Only the two above were audited.
+  No end-to-end verdict was ever observed to flip — `cat > notes.md <<~ 'EOF'` with
+  `rm -rf /` in the body returned `allow` 40/40 idle and 40/40 at loadavg 66 — so
+  this is a determinism and config-correctness fix, not a reported misbehaviour.
+
+- **The AST budget is reachable from the environment (#438).** Of the three
+  budgets a subprocess test can hit, it could raise two: `DCG_HOOK_TIMEOUT_MS` and
+  `DCG_HEREDOC_TIMEOUT_MS`. AST matching sat on a hard 20ms release constant with
+  no knob, so a protocol suite could not insulate itself from it — on a loaded host
+  a worker is descheduled, the embedded-code analysis reports itself incomplete,
+  and the bounded fallback answers correctly but *without a rule id*, failing any
+  assertion about which rule fired while the product behaves exactly as designed. A
+  semantic test should not double as a deadline test. `DCG_AST_TIMEOUT_MS` now
+  raises it, and the three protocol suites set all three budgets.
+
+  The knob can only raise, never lower, and that asymmetry is the point: a smaller
+  window pushes the matcher into its bounded fallback more often, so an operator
+  shrinking it from the environment would degrade analysis while believing they had
+  tightened it — the same `DCG_*`-in-`settings.json` footgun as #245. Lower bounds
+  stay with the hook and heredoc budgets, which are measured against real work.
+
+- **`system.services` and `package_managers` were almost entirely non-functional
+  (#441).** Auditing outward from the `.git/` case below found the same dead-keyword
+  shape in two more packs, and there it took out their headline rules. With the
+  pack enabled, `shutdown -h now`, `shutdown -r +1`, `reboot`, `reboot -f`,
+  `init 0`, `apt purge --autoremove`, `apt-get purge`, `yum remove -y`,
+  `dnf remove -y`, `brew uninstall --force`, `poetry publish`, `mvn deploy`,
+  `./mvnw deploy`, `gradle publish` and `./gradlew publish` were every one of them
+  allowed — fifteen commands whose rules existed and could never run, because the
+  registry row for `system.services` carried only `systemctl` and `service` (and
+  not `shutdown`, `reboot`, `init`) while `package_managers` named eight managers
+  but not `apt`, `yum`, `dnf`, `brew`, `poetry`, `mvn` or `gradle`. Anyone who
+  enabled these opt-in packs was unprotected for exactly the commands they enabled
+  them for.
+
+  Each was confirmed twice: before the fix, prefixing a benign command that
+  carries a keyword the row did have flipped the verdict to deny, proving the rule
+  existed and only the gate hid it; after the fix, each denies on its own. That
+  double check matters — for `initctl stop ssh` the same prefix trick reported a
+  gate bug that was not one, because `systemctl-stop-critical` requires the literal
+  `systemctl` and matched across the `;` into the probe's own prefix. `initctl` has
+  no rule at all, which is a coverage gap rather than a gate problem, and is
+  recorded as such.
+
+- **A truncating redirect into `.git` named relatively reached no rule at all
+  (#407, second half).** `cat > .git/config` was allowed while
+  `cat > /repo/.git/config` denied. The rule and its regex were both already
+  correct — the regex matches `> .git/` — but the rule could never run. There are
+  two live keyword lists per pack, gating in sequence: `PACK_ENTRIES` builds the
+  `EnabledKeywordIndex` that decides whether a pack is a candidate at all, and only
+  then does `Pack::might_match` consult the pack's own `keywords`. The `.git/`
+  keyword had been added to the pack's list and not to its registry row, so the
+  quick-reject dropped the command before the pack was ever considered. Every other
+  redirect keyword in that row requires the target to begin with `/`, `~`, `$` or a
+  quote, which is exactly what a relative target does not do — so adding any
+  unrelated pack keyword to the same command (`tee`, `rm`, `sed`) made it deny,
+  and pack-level unit tests could not see the gap because they call the pack
+  directly and never pass through the registry gate.
+
+  A new invariant test enforces that an audited pack's declared keywords all appear
+  in its registry row, since a keyword only in the pack's list is dead. Running it
+  across the whole registry turns up the same drift in a dozen other packs; those
+  omissions look harmless (a CLI subcommand cannot appear without the CLI's own
+  name, which those rows do carry) but have not been checked against the binary, so
+  they are tracked in #441 rather than assumed. `core.filesystem` is audited: its
+  six cmd redirect spellings are confirmed already denied without their keywords,
+  and the exemption list has its own staleness test.
+
+- **A `$VAR` on a heredoc's line no longer hides its target command (#439).**
+  `tokenize_backwards` treated a bare `$` as a command boundary, so the backward
+  walk over the heredoc's own line stopped before the program word and resolved no
+  target at all. With no proven data sink the quoted — therefore inert — body
+  stayed visible to the raw-shell rescan, where a line-leading backtick read as a
+  dynamically assembled launcher: `S=/tmp/s && cat > $S/d.md <<'EOF'` with a
+  `` `symbol` `` in the body denied as `heredoc.shell:launcher-unverified`. That is
+  the ordinary shape for an agent writing Markdown to a scratch directory held in a
+  variable. A `$` introduces an expansion *inside* a word; `$(…)` is still bounded
+  by its own parentheses.
+
+  What located it: the *better-quoted* `cat > "$S/d.md"` was already allowed,
+  because the tokenizer's quoted-string arm runs before the boundary check and
+  consumes that token whole. Quoting a path cannot change whether a body is
+  executable, and the report's own gating table — which blamed the redirect target
+  — turned out to be one case of a wider rule: any `$VAR` on that line did it,
+  including one that is only an operand.
+
+  The same truncation was silently suppressing three other stdin-data proofs that
+  resolve their program word through the same walk, so `git -C $D commit -F -`,
+  `gh issue comment $N -F -` and `spx session handoff $A` were all denied for
+  bodies that merely mentioned a destructive command. A differential sweep over 960
+  heredoc shapes found zero new denials, and every shape that moved had been
+  blocked by that one advisory rule: shells still deny every body, an unquoted body
+  containing `$(…)` still denies because the shell expands it before the sink sees
+  it, and `heredoc.python:os_system.rm_rf_catastrophic` and friends are untouched.
+
+- **The plain explanation renderer was corrupting the commands it tells you to
+  run (#418 follow-up).** `strip_markdown_inline` deleted every `` ` ``, `*`, `_`
+  and `~` byte it saw, regardless of whether the character was markup or content —
+  and it is the shipped renderer, since `rich-output` is not a default feature. So
+  the `rm -rf` denial offered `mv /path/to/directory /.Trash/` as its recoverable
+  alternative, a path at the filesystem root rather than the user's trash; the
+  shell-startup-file denial named the SSH trust store `/.ssh/knownhosts`, wrong
+  twice over; `~/.ssh/*.pub` printed as `/.ssh/.pub`; and the find-delete guidance
+  the issue asked about listed its protected roots as ``/`, `, `$HOME`` with an
+  empty entry where `~` had been. 362 distinct backtick-quoted tokens in the pack
+  text contain one of those characters.
+
+  A marker is now removed only where it delimits a span, a code span is emitted
+  verbatim, and the two CommonMark rules this text depends on hold: strikethrough
+  needs `~~`, so a lone `~` is a home directory, and `_` does not emphasize inside
+  a word, so `os_system` survives.
+
+- **`find … -delete` explains itself honestly (#418).** The rule text claimed
+  the decision was made on the search root and that the scoped form was
+  "bytewise-equivalent to `rm -rf`". Neither was true. It now says what it does:
+  it gates on the paths the command names, and a denial is not a measurement of
+  the command's blast radius.
+
+- **Only a dollar the shell would actually expand is resolved (#396).**
+
+### Known open
+
+- **PowerShell `Remove-Item` is guarded by its alias and not by its own name
+  (#451).** Under `tool_name: "powershell"`, `rm -Recurse ./tree` denies and
+  `Remove-Item -Recurse ./tree` does not, nor does
+  `Remove-Item -Recurse -Force /etc`. `rm` is in `core.filesystem`'s keyword row
+  for POSIX reasons, so the alias selects the pack and the PowerShell parser
+  then reads `-Recurse`; the canonical cmdlet is in no row.
+  `powershell-remove-item-recursive` itself is fine — the existing unit test
+  asserts the parser denies exactly these — so this is reachability, the #441
+  shape. Adding `remove-item` to both keyword lists was tried and reverted: it
+  changes no verdict, because selecting the pack is not sufficient and the
+  PowerShell branch of `rm_semantic_scan_required` only asks for the scan when
+  the command contains one of `` ` @ & $ ( ``. That is also why
+  `Remove-Item -Recurse -Force $HOME` denies while the same command without a
+  variable does not — the obfuscated spelling is caught and the plain one is
+  not. `windows.filesystem:remove-item-recurse` covers all of them, but
+  `windows.*` is default-enabled from `requested_pack_ids(cfg!(windows))`, so it
+  turns on for a Windows *build* rather than for a PowerShell *payload*: a Linux
+  or macOS dcg gating a PowerShell tool has neither layer. Native Windows builds
+  are covered.
+
+  Noted with it: `dcg test --help` promises "the conservative union of the
+  POSIX, PowerShell and Cmd views, which can deny where the hook allows", and
+  `rm -Recurse ./tree` goes the other way — the hook denies, `dcg test` allows.
+  The same help points at `dcg test` for validating an override (#402).
+
+- **The vendored bash scanner diverges from upstream until #442 is reported
+  there.** The repair is two lines in a crates.io release we now carry in-tree,
+  so every future `tree-sitter-bash` bump has to re-apply it until upstream takes
+  the fix. Upstream's own convention in the same file is already the wide,
+  domain-safe `iswdigit` (lines 612 and 631), so the report is small and the
+  divergence should be short-lived.
+
+  The report itself is written and checked in at
+  [`vendor/upstream-report.md`](vendor/upstream-report.md) — filing it is a
+  copy-paste. Confirmed 2026-09-19 that it is not a duplicate: upstream's
+  latest release is still `v0.25.1` (2025-12-02) and its issue tracker has
+  nothing matching `isdigit` or `lookahead`. Delete that file once the issue
+  exists and put its URL here instead.
+
+- **The test suite's environment mutation is unsound, independently of #442
+  (#445).**
+  Three separate `ENV_LOCK` mutexes (`agent.rs`, `interactive.rs`, `hook.rs`)
+  each serialise only against themselves, and readers take no lock at all — 108
+  `env::var` sites against 21 `EnvVarGuard` uses, plus native readers such as
+  bundled SQLite consulting `TMPDIR`, which cannot take a Rust lock. The real
+  invariant is "writers in the same module exclude each other" while thousands of
+  other tests read `environ` concurrently. This was investigated as a candidate
+  cause of #442's segfault and is not that cause, but it remains a genuine
+  unsoundness rather than a tidy-up.
+
+- **A credential file named relatively is writable — now only for the three
+  targets deliberately left out (#407).** Mostly closed; what follows records
+  what is left and one decision that deserves review.
+
+  Seven of the ten protected targets now deny in both spellings
+  (`.ssh/id_rsa`, `.ssh/id_ed25519`, `.ssh/authorized_keys`, `.aws/credentials`,
+  `.bashrc`, `.profile`, `.gnupg/trustdb.gpg`), as do every reachable spelling
+  this entry listed: `../../.ssh/id_rsa`, `./../../.ssh/id_rsa`,
+  `../app/../../.ssh/id_rsa`, `cd ~ && …`, `cd $HOME && …`, `pushd ~ && …`, and
+  `mv secrets ../../.ssh/id_rsa`. The intended allowances still hold in both
+  spellings: `ssh-keyscan h >> .ssh/known_hosts` appends, `*.pub` writes, and
+  reads are untouched.
+
+  **Still open, by choice:** `.netrc`, `.npmrc` and `.config/gh/hosts.yml`.
+  Writing a project-local `.npmrc` or `.netrc` is a routine CI idiom, and
+  anchoring `.config/` — whose only protected entry is `gh/hosts.yml` — would
+  widen the always-on keyword index for very little. The rooted spellings of
+  all three still deny.
+
+  **A decision to revisit:** the repair anchors on the *name*, the way
+  `redirect-truncate-git-internals-relative` does, so it needs no working
+  directory — and therefore it also denies a genuinely project-local
+  `echo x > .ssh/id_rsa`, which this entry previously called correctly allowed.
+  That is a real behaviour change, in the conservative direction: the file it
+  refuses is still a private key, and `dcg allow-once` covers the case. The
+  precise alternative is below and is not blocked by anything.
+
+  Scope, from auditing all fifteen root/home rules: **eleven already resolve a
+  relative operand** — `rm -rf projects`, `rm *`, `unlink .bashrc`,
+  `truncate -s 0 .bashrc`, `shred -u .ssh/id_rsa`, `dd of=.bashrc`,
+  `find . -delete`, `tar --remove-files docs` all deny — so the irreversible-delete
+  family is not affected. The gap was four rules, and they share a shape: rules
+  gating on a *path operand* resolve it, rules gating on a *redirect target* or a
+  *move/copy source* do not. `credential-file-write` is now handled by name
+  anchoring; the remaining three are `redirect-truncate-root-home` (any existing
+  file under `$HOME`, not just a protected one — `echo x > README.md` is still
+  allowed where the absolute spelling denies),
+  `mv-sensitive-source-root-home`, and `cp-sensitive-then-delete`
+  (`cp ../../.ssh/id_rsa /tmp/x` is still allowed, because the sensitive path is
+  the *source*).
+
+  `rebase_recovery::resolve_effective_cwd` (#387) already answers which directory a
+  command runs in, applying leading static `cd`/`pushd` and failing closed when the
+  answer is not statically knowable, and it is already computed for every command
+  as the allowlist scope. What is missing is only that it feeds allowlist scoping
+  and not operand resolution, which would be a new step in matching rather than a
+  pattern change. The `cd ~ && …` spellings need no resolution at all — the command
+  states its own directory — so they are separable from the bare-relative form.
+
+- **A `core.git` safe pattern can still match starting at a later argv token**
+  (#429), so `git clean -fdx -- . clean -n` is allowed and real git removes every
+  untracked and ignored file under `.`. A grammar-accurate executable prefix
+  closes all seven shapes, but was tried and reverted: these patterns run against
+  a synthesized view, not a command line, and for a variable-spliced executable
+  that view carries a token between `git` and the subcommand which is neither a
+  global option, a redirect, nor an assignment — so narrowing the intermediate
+  group re-opened a proven escape-sequence bypass. A real fix has to
+  constrain where a safe pattern may anchor rather than what the tokens between
+  `git` and its subcommand look like. The *dashed* spelling of the same shape is
+  fixed.
+
+### Documentation
+
+- The README's core-pack relaxation recipe was wrong. A broad `warn`/`log` set
+  through `[policy.packs]` or `[policy] default_mode` is silently raised back to
+  `deny` for `critical` rules, which is most of what `core.filesystem` and
+  `core.git` exist to stop. Only a `[policy.rules]` entry relaxes one. The
+  explain-schema table also omitted `indeterminate`, the one outcome that means
+  "do not run this".
+
+- `dcg hook --help` claimed that without `--batch` it "behaves identically to
+  running `dcg` with no subcommand". `--parallel`, `--workers`,
+  `--continue-on-error` and `--with-packs` each route to the JSONL batch contract
+  on their own, so the text now names the actual condition and the exit-code
+  difference between the two contracts.
+
+---
+
 ## [v0.14.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.4) -- 2026-09-16 [Release]
 
 Seven reported defects, six of them false positives or negatives in the same

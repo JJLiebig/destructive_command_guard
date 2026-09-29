@@ -147,8 +147,9 @@ assert_case() {
 
   $VERBOSE && { echo "    payload: ${payload:0:120}"; echo "    rc=$rc stdout=${#stdout_data}B stderr=${#stderr_data}B"; }
 
-  # Every shipped protocol exits 0: a non-zero exit is interpreted as a hook
-  # *failure* (fail-open) by Codex/Hermes/agy rather than as a block.
+  # Every protocol asserted through here exits 0: a non-zero exit is
+  # interpreted as a hook *failure* (fail-open) by Codex/Hermes/agy rather
+  # than as a block. Reasonix is the exception and has its own assertion.
   if [[ "$rc" -ne 0 ]]; then
     report fail "$harness" "$case_name" "exit code $rc (must be 0; non-zero reads as hook failure)"
     return
@@ -275,22 +276,23 @@ CLAUDE_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" '{tool_name:"Bash",tool_input:{comman
 assert_case claude-code deny "$CLAUDE_DENY" deny \
   '.hookSpecificOutput.permissionDecision' deny
 assert_case claude-code allow "$CLAUDE_ALLOW" allow '.' ''
-# The PowerShell shell tool is platform-sensitive by design: windows.filesystem
-# is default-ON on Windows and opt-in elsewhere. Assert the behavior for the
-# host we are actually running on rather than assuming Unix.
-case "$(uname -s 2>/dev/null || echo unknown)" in
-  MINGW*|MSYS*|CYGWIN*|Windows_NT) WIN_PACK_EXPECT=deny ;;
-  *) WIN_PACK_EXPECT=allow ;;
-esac
-if [[ "$WIN_PACK_EXPECT" == deny ]]; then
-  assert_case claude-code powershell-tool-windows-default-packs \
-    "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
-    deny '.hookSpecificOutput.permissionDecision' deny
-else
-  assert_case claude-code powershell-tool-optin-on-unix \
-    "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
-    allow '.' ''
-fi
+# A PowerShell payload is judged as PowerShell on every host. This used to be
+# host-conditional, on the theory that the coverage lived in windows.filesystem
+# (default-ON on Windows, opt-in elsewhere) and so a Unix host must allow. #451
+# moved it: `Remove-Item -Recurse` is now decided by core.filesystem's PowerShell
+# semantic classifier, which is always on and keys on the payload's dialect rather
+# than the host's configuration — which was the whole complaint in #451, since an
+# agent on Unix can still drive a Windows shell. So the verdict no longer depends
+# on `uname`, and asserting per-host would re-encode the bug.
+#
+# Only the decision is asserted. dcg classifies an explicit `PowerShell` tool name
+# as a Codex-style payload (see `detect_protocol`: Claude Code's shell tool is
+# always `Bash`/`launch-process`), and the Codex protocol deliberately omits
+# ruleId/severity/remediation for its stricter parser, so those fields are absent
+# here by design.
+assert_case claude-code powershell-tool-denies-on-any-host \
+  "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
+  deny '.hookSpecificOutput.permissionDecision' deny
 # The agent-facing metadata contract other tools key on:
 for field in ruleId packId severity; do
   got="$(printf '%s' "$CLAUDE_DENY" | run_dcg 2>/dev/null | jq -r ".hookSpecificOutput.$field // empty")"
@@ -329,13 +331,47 @@ assert_case gemini deny "$GEMINI_DENY" deny '.decision' deny
 assert_case gemini allow "$GEMINI_ALLOW" allow '.' ''
 
 # --- GitHub Copilot CLI -----------------------------------------------------
+# The native preToolUse input per the Copilot hooks reference:
+# {sessionId, timestamp, cwd, toolName, toolArgs} -- camelCase, no `event`
+# field. `toolArgs` is an object from Copilot CLI 1.0.83 and was a
+# JSON-encoded string up to 1.0.77, so both shapes are pinned. (This fixture
+# used to send `event:"preToolUse"`, which Copilot never does and which is
+# indistinguishable from Reasonix's `"PreToolUse"` envelope below.)
 $JSON_OUTPUT || echo "GitHub Copilot CLI"
 COPILOT_DENY=$(jq -nc --arg c "$DENY_CMD" \
-  '{event:"preToolUse",tool_name:"bash",tool_args:{command:$c}}')
+  '{sessionId:"s",timestamp:1,cwd:"/tmp",toolName:"bash",toolArgs:{command:$c}}')
 COPILOT_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
-  '{event:"preToolUse",tool_name:"bash",tool_args:{command:$c}}')
+  '{sessionId:"s",timestamp:1,cwd:"/tmp",toolName:"bash",toolArgs:{command:$c}}')
+COPILOT_DENY_LEGACY=$(jq -nc --arg c "$DENY_CMD" \
+  '{sessionId:"s",timestamp:1,cwd:"/tmp",toolName:"bash",toolArgs:({command:$c}|tojson)}')
 assert_case copilot deny "$COPILOT_DENY" deny '.permissionDecision' deny
 assert_case copilot allow "$COPILOT_ALLOW" allow '.' ''
+assert_case copilot deny-string-toolargs "$COPILOT_DENY_LEGACY" deny '.permissionDecision' deny
+
+# --- Reasonix (#358): exit status is the ONLY blocking channel --------------
+# Reasonix never reads stdout for PreToolUse, so the one protocol here that
+# must NOT exit 0 on a deny: exit 2 with the reason on stderr and nothing on
+# stdout. `assert_case` requires exit 0 for every other protocol, so this
+# case is asserted directly.
+$JSON_OUTPUT || echo "Reasonix"
+REASONIX_DENY=$(jq -nc --arg c "$DENY_CMD" \
+  '{event:"PreToolUse",cwd:"/tmp",toolName:"bash",toolArgs:{command:$c}}')
+REASONIX_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
+  '{event:"PreToolUse",cwd:"/tmp",toolName:"bash",toolArgs:{command:$c}}')
+reasonix_out="$(mktemp "$SANDBOX/out.XXXXXX")"
+reasonix_err="$(mktemp "$SANDBOX/err.XXXXXX")"
+printf '%s' "$REASONIX_DENY" | run_dcg >"$reasonix_out" 2>"$reasonix_err"
+reasonix_rc=$?
+if [[ "$reasonix_rc" -ne 2 ]]; then
+  report fail reasonix deny "exit code $reasonix_rc (Reasonix blocks only on exit 2; anything else runs the command)"
+elif [[ -s "$reasonix_out" ]]; then
+  report fail reasonix deny "deny wrote to stdout, which Reasonix never reads: $(head -c 160 "$reasonix_out")"
+elif [[ ! -s "$reasonix_err" ]]; then
+  report fail reasonix deny "deny produced no stderr reason (Reasonix shows stderr to the user)"
+else
+  report pass reasonix deny
+fi
+assert_case reasonix allow "$REASONIX_ALLOW" allow '.' ''
 
 # --- Hermes Agent (decision:"block") ---------------------------------------
 $JSON_OUTPUT || echo "Hermes Agent"
