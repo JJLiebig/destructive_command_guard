@@ -11,6 +11,546 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **Audit universal allowlist globs as unrestricted (#545).** Doctor now
+  recognizes composite patterns such as `**/`, `**/*`, and `**/**` that match
+  every working directory, including equivalent normalized root paths.
+  Permanent grants using these patterns receive the existing actionable
+  rule and provenance warnings in project, user, and system layers. Bounded
+  patterns and temporary or inactive entries retain their classifications;
+  the audit does not change matching or rewrite grants in `--fix` mode.
+- **Inspect complete inline programs inside compound shell commands (#544).**
+  Python and JavaScript literals carried through variables remain checked
+  when the invocation has another statement, a pipeline, redirection, an
+  environment assignment, or supported trailing operands. Exact source ownership
+  is proved separately from eligibility for the documentation exemption, so
+  another shell consumer cannot suppress inspection. Static argument arrays
+  remain data, and recovered commands keep their own rule and allowlist
+  ownership. Later Node options that can replace its program cannot establish
+  executable-source ownership for the earlier argument.
+- **Follow literal execution dependencies without scanning argument data (#544).**
+  A bounded proof now follows a static string into a direct literal Python
+  `exec`/`eval` or JavaScript `eval` program that passes it to a known shell sink.
+  The recovered command retains its own rule and allowlist identity. Static
+  argv and option literals owned by named execution checks keep their data
+  roles, while callbacks, nested calls, dynamic options, and shell source
+  remain visible. Unreferenced strings and evaluated print calls are not
+  promoted to executable shell commands. Hoisted JavaScript declarations and
+  ambiguous identifier spellings withdraw the optional binding proof. The
+  POSIX eval collector respects proven interpreter stdin ownership while
+  language analysis and shell consumers retain the original source.
+- **Accept literal numeric ports in data-transfer proofs (#543).** Static
+  decimal SSH and SCP port arguments retain the existing file-data treatment.
+  Variable ports, substitutions, and unproved transport options remain visible
+  to execution checks.
+- **Review Python source selected by shell expansion (#538).** A Python `-c`
+  program supplied entirely by an unresolved shell expansion receives the
+  existing inline-launcher denial rule. The check follows Python option
+  ownership and outer shell quoting, preserving literal or escaped dollar
+  signs, statically resolved source, and `-c` text passed as script arguments.
+- **Inspect the arguments produced by executable variables (#540).** Literal
+  assignments such as `X='git reset --hard'; $X` now reach the Git rule for
+  the expanded command instead of being mistaken for one quoted executable
+  name. Quoted variable references preserve one argument, while supported
+  unquoted expansion splits fields without reinterpreting their contents as
+  shell syntax. Unknown splitting, globbing, and interpreter flags introduced
+  by expansion require review. Rule-specific grants and original source spans
+  remain attached to the command that actually needs them.
+- **Keep quoted flowctl receipt text as data (#538, #540).** Complete static
+  `gate check` and `gate receipt` command operands can contain quoted shell
+  punctuation without triggering destructive-command rules. Live expansions,
+  incomplete words, unknown options, redirects, and later commands retain
+  their execution checks. Regression cases exercise both `dcg test` and the
+  actual hook protocol. The inline extractor shares the complete receipt
+  grammar, so a dynamic `FLOWCTL` executable no longer causes static receipt
+  values to be inspected as speculative shell programs.
+- **Keep interpreter callbacks independent of outer execution grants (#544).**
+  Literal command evidence inside callbacks, assignments, and argument side
+  effects can no longer inherit an enclosing call's already-checked status.
+  Destructive commands carried through variables retain their own rule and
+  cannot be hidden by an allowlist entry for the outer execution sink. Static
+  argument arrays and option values preserve their existing data treatment.
+- **Check substitutions carried by interpreter variables (#544).** Python and
+  JavaScript literal values passed through variables or opaque calls now reach
+  the existing command evaluator, including encoded substitution markers.
+  Bounded analysis preserves source spans, language escape semantics, named
+  execution rules, and their allowlist ownership. Proven documentation in an
+  isolated inline invocation or quoted heredoc remains data; unverified or
+  incomplete analysis cannot silently approve a command.
+- **Read complete quoted heredoc delimiters (#544).** Backslash quoting and
+  adjacent quoted fragments, such as `<<D\OC` and `<<D'OC'`, now retain the
+  exact interpreter source boundary in both the extractor and bundled Bash
+  parser. Any quoted fragment correctly suppresses outer-shell expansion in
+  the body. This prevents false denials of literal documentation and keeps
+  subsequent commands visible. Unsupported delimiter syntax cannot select a
+  shorter, misleading terminator.
+- **Inspect GNU tar helpers inside shell groups (#540).** Helper discovery now
+  reaches actual tar invocations inside parentheses and brace groups, preserving
+  their original command context. Enclosing file writes or earlier state changes
+  prevent a helper from relying on stale local-file evidence, including a
+  PostgreSQL checkpoint helper whose input is overwritten by the caller's
+  redirect. Read-only groups retain the existing helper checks.
+- **Analyze scripts written by tee before execution (#540).** A quoted heredoc
+  written to literal files by `tee` and immediately run by a supported
+  interpreter now receives the same language-aware safety checks as a script
+  written by `cat`. This catches destructive Python and JavaScript filesystem
+  calls while recognizing genuine language literals and arrow operators.
+  Source identity requires an unambiguous overwrite and interpreter handoff;
+  append mode, dynamic paths, extra consumers, and outputs that replace an
+  interpreter retain conservative analysis. Ordinary data writes and the
+  existing cat-based transfer-data checks keep their behavior.
+- **Doctor audits unrestricted allowlist exceptions (#545).** Active whole-rule
+  grants with no working-directory restriction or expiration now produce
+  actionable warnings naming the rule, source layer/file, reason, and available
+  author/timestamp metadata. Destructive filesystem and Git exceptions are
+  marked high risk. The audit covers trusted project, user, and system layers,
+  preserves warnings alongside parse errors, and distinguishes scoped,
+  temporary, expired, and inactive entries using runtime semantics. Doctor
+  leaves allowlist files and matching behavior unchanged, including in `--fix`
+  mode; its JSON v1 schema and warning-only exit behavior are preserved.
+
+## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
+
+This release closes commands that ran unguarded (Claude Code's `Monitor`
+tool, wrapper and remote-shell redirects, GNU tar helper programs, archive
+extraction into credential or `.git` paths) and a long list of false
+positives reported against 0.15.2.
+
+**Claude Code users: refresh the hook after upgrading.** The hook matcher is
+now `Bash|PowerShell|Monitor`. Run `dcg install` (or `dcg doctor --fix`);
+hook self-healing does the same on its next run. Existing `Bash` or
+`Bash|PowerShell` dcg entries are migrated in place, and unrelated hooks keep
+their matchers.
+
+### Behaviour changes you may notice
+
+- **A temporary-path variable proof stops at an unmodelled assignment.**
+  0.15.2 proved `> $SP/out.txt` safe from an earlier `SP=/tmp/...` even when
+  a later assignment took its value from a command dcg does not model
+  (`N=$(python3 -c ...)`, `N=$(basename "$BIN" | cut -c1-16)`). Such
+  redirects are now denied as `core.filesystem:redirect-truncate-dynamic-path`.
+  Redirect before that assignment, or write the literal path. In a replay of
+  6,000 real agent commands this changed three verdicts from allow to deny;
+  the #536 fixes below changed one from deny to allow.
+- **GNU tar helper programs are judged.** `--checkpoint-action=exec=`,
+  `--to-command`, `--use-compress-program`/`-I`, `--info-script`/`-F`,
+  `--new-volume-script` and `--rmt-command` run code. Their payloads now go
+  through the packs; a helper dcg cannot verify is denied as
+  `core.filesystem:tar-exec-unverified`.
+- **`rm` of a path inside `.git` names the real risk.**
+  `rm .git/index.lock` is still denied under `core.filesystem:rm-protected-file`,
+  but the reason now says it deletes repository state, not a credential or
+  login-startup file, and how to clear a stale `index.lock` safely. A command
+  that also removes a credential keeps the credential reason (#533).
+- `git branch -d` is reported as `core.git:branch-delete`; see Git branch
+  rules below (#509).
+
+### Agent integrations
+
+- **Claude Code: `Monitor` scripts are judged (#529).** Claude Code's
+  `Monitor` tool runs its `command` as a POSIX shell script. The hook matcher
+  did not include it, so those scripts never reached dcg. `dcg install`, the
+  installers, `dcg doctor --fix` and hook self-healing now write
+  `Bash|PowerShell|Monitor`.
+- **Codex: exact-command review for denials (#537).** A Codex denial now
+  carries its allow-once code in `permissionDecisionReason`, keeping Codex's
+  three-field denial JSON. The grant matches only the exact original request,
+  is single-use, and cannot be consumed by a nested payload or an altered
+  wrapper, substitution or whitespace.
+- **pi: the recipe evaluates with `--dialect posix` (#532).** Without it,
+  pi's commands were read with zsh-only rules and some were denied falsely.
+- **OpenCode: the plugin loads again (#516).** OpenCode 1.3.4 and later read
+  a default export that has an `id` as a plugin module and refuse it without
+  `server()`. The plugin generated by 0.15.0 through 0.15.2 exported
+  `{ id, setup }` for OpenCode v2, so current OpenCode (1.18.33 in the report)
+  refused the whole file at startup and ran every bash command unguarded. The
+  default export now also carries `server()`, which returns the same hook map
+  as the named `DcgGuard` export; v2 ignores the extra key. Verified against a
+  real OpenCode 1.18.33 run. **Regenerate the plugin**
+  (`dcg install --opencode --force`, or `dcg update`) and restart OpenCode;
+  `dcg doctor` reports an old plugin as outdated.
+- **Cursor: the bridge fails closed (#517).** The `beforeShellExecution`
+  bridge allowed every command it could not check. On Windows that was every
+  command: cursor-agent sends a UTF-8 BOM, Windows PowerShell 5.1 decoded it
+  with the OEM code page, the JSON parse failed, and the bridge allowed. Both
+  bridges (PowerShell and the Unix Python one) now read stdin as bytes and
+  drop a BOM, send dcg UTF-8, and ask dcg for an explicit allow, so an
+  unreadable payload or a dcg that ran without a verdict (killed, timed out,
+  non-zero exit, no answer) is denied. `DCG_BRIDGE_CRASH_DECISION=allow`
+  restores fail-open for those; a dcg that cannot be started at all is still
+  allowed, with a notice on stderr. Re-run the installer to regenerate the
+  bridge.
+- **Cursor: Claude Code hooks see `Shell` (#518).** Cursor runs the
+  `PreToolUse` hooks in `~/.claude/settings.json` and renames Claude Code's
+  `Bash` tool to `Shell`. dcg did not know the name and allowed every such
+  command; it now judges them and answers in the Claude shape Cursor reads.
+  The other supported agents' tool names were audited and needed no change.
+
+### Command history
+
+- `dcg history analyze` on an empty history now says there is nothing to
+  analyze and how to enable `[history]`, instead of green "no coverage gaps"
+  checks and advice to disable packs, `core` first, drawn from zero commands.
+  The JSON output gains `has_data`. With data, a pack that never matched is
+  still listed but is no longer recommended for removal: a guard pack that
+  stays quiet is working (#513).
+- History rows now record the machine's `hostname`; it was always NULL (#514).
+- The docs and `dcg history analyze --help` now state that `exit_code` is NULL
+  on every row the hook writes, because the hook runs before the command and
+  cannot know how it ended. NULL means unknown, not success (#515).
+
+### Commands that ran unguarded
+
+- **A wrapper no longer swallows a redirect (#531, #521).**
+  `nice -n > ~/.bashrc` was allowed because the wrapper parser read `>` as
+  the value of `-n`; it is now judged as the credential-file write it is. A
+  wrapper option with no operand (`nice -n >~/x`) panicked; it is now
+  rejected without a panic.
+- **A redirect in an `ssh` script is judged for the remote host (#534).** A
+  literal script piped or fed to `ssh` or to an interactive container exec
+  shell was judged against the local disk, so a local file's absence could
+  prove a remote overwrite safe. Such scripts are now judged in the receiving
+  environment's filesystem scope; an unknown producer or unbounded nested
+  dispatch fails closed.
+- **Local files are not evidence after a wrapper changes context.** Input
+  files opened after a recognised wrapper changes directory, user, home or
+  environment (`sudo -u`, `env -C`, remote and container shells) were checked
+  against the caller's files. Those inputs are now treated as unverified.
+- **Archive extraction into credentials or `.git`.** GNU/BSD `tar`, `unzip`
+  and `7z` extracting into an explicit credential or `.git` destination
+  (including bundled `C` options such as `tar xfC` and unknown member
+  lists) is denied; list, create and stdout modes are unaffected.
+- **Complete `chmod`/`chown`/`chgrp` parsing in the permissions pack.** The
+  prefix-only exemption could hide a later recursive flag, a protected
+  target, or a different operation whose option value contained safe-looking
+  text. Every option and target is now checked.
+- **Windows Git redirects keep their own rules (#492).** Allowlisting
+  `redirect-truncate-dynamic-path`, or one Git redirect, could conceal a
+  separate Git or credential write spelled with Windows separators in the
+  same command. Every truncate/append hit is now kept and judged under its
+  own rule.
+- An executable whose argument count cannot be bounded now fails closed
+  instead of having its arguments shifted.
+
+### False positives fixed
+
+- A JavaScript arrow function (`=> !x`) in a quoted heredoc is not read as a
+  redirect (#519).
+- A Python heredoc containing a regex no longer switches macOS commands to
+  Windows parsing (#520), and `^` in a `python3 -` heredoc no longer widens
+  the dialect into a PowerShell scan (#523).
+- A quoted heredoc piped to `python3`, `node`, `ruby` or `perl` is analysed
+  as that language, not as POSIX shell (#522).
+- A multi-line `for` loop with a quoted `|^` in `sed` (#524), and a quoted
+  heredoc appended to a file after `sed` read it (#525), are no longer denied
+  as `heredoc.shell:launcher-unverified`.
+- A provable loop variable after a literal path prefix (#526), and provable
+  `/tmp` values from an `&&` assignment, a chained variable, `$$`, or
+  `mktemp -d` with a `/tmp` template (#536), satisfy
+  `redirect-truncate-dynamic-path`. Resolution is bounded (eight binding
+  levels, 4096 expanded bytes, 256 segments) and still denies traversal,
+  protected names and mutated bindings.
+- An embedded process call with a non-literal argument keeps its words in
+  place; dropping it shifted the rest and produced false
+  `core.git:git-alias-semantic-unverified` denials (#527).
+- `--command "<string>"` after a variable-path `flowctl gate check`/`gate
+  receipt` is treated as receipt data, not an inline launcher. Only the
+  fixed `flowctl` gate grammar is exempt; unknown executables with
+  `--command` stay denied (#538).
+
+### Embedded code and heredocs
+
+- An inline-shell launcher quoted as prose inside another command's argument
+  (`tracker comment 1 "example: bash -c 'git reset --hard' is refused"`) is no
+  longer judged as if it ran. A launcher that opens the quoted text, follows a
+  separator or wrapper inside it, sits in a substitution, or is in a string
+  that eval/ssh/watch run is still judged (#510).
+- awk printing into a shell that reads its stdin (`print "git reset --hard" |
+  "sh"`) now has the printed text judged as the command it is, including
+  through a variable the program assigns one literal. A computed print into
+  such a shell is denied as `heredoc.posix:pipeline-consumer`, like the
+  shell-level `awk '…' | sh` (#511).
+- A single string given to a shell sink is now judged by every pack, not only
+  the few `rm`/`git` payloads the per-language catalogue knows:
+  `perl -e 'system("git push --force origin main")'` and `system("find .
+  -delete")` are denied, as are the same strings through Python `os.system`,
+  Ruby `system`, PHP `system`/`shell_exec` and Node `child_process.execSync`.
+  Perl backtick commands go the same way, and `qx` is recognised with any
+  delimiter (`qx{…}`, `qx(…)`, `qx[…]`, …), not only `qx/…/`. Payloads the
+  catalogue already reports keep their `heredoc.*` rule ids (#512).
+
+### CLI
+
+- `dcg config` (text and `--format json`) now reports every effective
+  `[general]` setting, including `unverified_decision`, `update_pin`,
+  `check_updates`, `max_hook_input_bytes`, `max_command_bytes` and
+  `max_findings_per_command`, with environment overrides applied (#530).
+- `dcg doctor` judges the Claude hook only on the keys dcg owns (`type`,
+  `command`, `shell`). A hook entry with an extra key Claude Code supports,
+  such as `timeout`, is no longer reported as misconfigured, and
+  `dcg install --force` keeps it. An `async` hook is still an error, because
+  Claude Code would not wait for its verdict (#528).
+
+### Git branch rules
+
+- `git branch -d` / `--delete` without force is now reported as
+  `core.git:branch-delete`. `-D`, `--delete --force`, `-df`, `-f`, `-M` and
+  `-C` stay on `core.git:branch-force-delete`. Both are still denied by
+  default. Setting `[policy.rules] "core.git:branch-delete" = "ask"` lets an
+  agent propose merged-branch cleanup for approval while forced deletion stays
+  denied, which no configuration could express before (#509).
+- Existing configuration keeps its meaning: a `[policy.rules]` or allowlist
+  entry for `core.git:branch-force-delete` still covers `-d` unless
+  `core.git:branch-delete` has an entry of its own, which then wins. Tools that
+  read `ruleId` from deny output or history will see the new id for `-d`.
+
+## [v0.15.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.2) -- 2026-10-01 [Release]
+
+**This is a security fix release. v0.15.1 can fail open under load: upgrade.**
+On a busy machine the v0.15.1 hook could exit without printing a verdict for
+some destructive commands, and every agent reads a hook that exits silently
+as "allow". With about sixteen hook processes running at once, 3-9% of
+requests for commands such as `watch 'git reset' --hard` ran this way. Run
+one at a time, the same commands were always denied. v0.15.2 answers ask or
+deny whenever its analysis is cut short, and a panic in the hook now
+produces an answer instead of a silent exit.
+
+**OpenCode and Oh My Pi users: refresh the plugin or bridge after
+upgrading.** Both now block a command when dcg crashes, is killed or exits
+without a verdict. That change lives in the generated plugin and bridge
+files, so an existing file keeps the old fail-open behaviour until it is
+rewritten. Run `dcg install --opencode --force` or `dcg install --omp
+--force`, or let `dcg update` do it (it does when its installer detects the
+agent, unless you pass `--no-configure`). Set
+`DCG_BRIDGE_CRASH_DECISION=allow` to keep the old fail-open behaviour for
+crashes.
+
+This release also changes how dcg reads heredocs, catches more disguised
+spellings of dangerous commands and fixes a crash on very deeply nested
+input. Apart from the plugin and bridge refresh above, no configuration
+changes are needed.
+
+### Behaviour changes you may notice
+
+- **Commands are no longer allowed because the machine was busy.** When
+  dcg's time budget for reading an embedded script or matching a pattern
+  runs out, it now reads the command again with the time the hook has left.
+  If that still cannot finish, the answer is the unverified-command
+  response (ask, or deny under `unverified_decision = "deny"`), not allow.
+
+- **Command text that looks binary is denied.** A command with a NUL byte,
+  or made up mostly of control characters, skipped embedded-code checks and
+  was allowed. It is now denied under the incomplete-analysis rule, which
+  can be allowlisted after review.
+
+- **The OpenCode plugin and the Oh My Pi bridge block when dcg gives no
+  verdict** (after the refresh described above). A dcg that cannot be
+  started at all still fails open, and `DCG_UNVERIFIED_DECISION=deny` still
+  blocks that case.
+
+- **Fewer false denials on notes and documentation written through a
+  heredoc.** If an agent writes text to a file or to the screen with an
+  unquoted heredoc (`<<EOF` rather than `<<'EOF'`), dcg no longer treats the
+  prose in the body as commands when it can prove that the output only lands
+  in a plain file, on the terminal, or in read-only text tools. Only the
+  parts the shell actually runs while reading the body (command
+  substitutions, backquotes and arithmetic) are still checked. A note that
+  mentions a dangerous command used to be denied with an unquoted delimiter
+  and allowed with a quoted one. It is now allowed either way.
+
+- **New denials for text that is fed to something that runs it.** If a
+  heredoc body is piped or redirected into a shell, a remote shell, a
+  privileged shell, a container shell, a job scheduler or an `eval` loop,
+  dcg now judges the body as commands. This applies with either delimiter.
+  The same is true when the body is written to a file that the same command
+  then runs, or when the command reading the body can run part of it itself
+  (for example, editors' execute commands or a program's preprocessor
+  hook). These were allowed before, whatever the body contained.
+
+- **New denials for disguised commands.** dcg now sees through several
+  more ways of hiding a dangerous command, all of which were allowed on
+  v0.15.1. These include commands assembled by brace expansion and commands
+  the shell is told to run later, such as exit traps and prompt hooks. They
+  also include program names spelled with escape codes, built from
+  variables or printed by a command substitution, and options that are
+  quoted or split so they no longer look like options. dcg now follows
+  relative file writes after changing to the root directory, Git commands
+  run through helpers that launch other programs, and `eval` inside a loop.
+  It also decodes Windows cmd.exe caret escapes inside a command name even
+  when the rest of the line contains unrelated keywords (#499, #500). Each
+  of these is now judged exactly like the plain command it stands for. A
+  workflow that relied on one of these spellings to get past dcg will now
+  be denied.
+
+- **No more silent pass on very deeply nested commands.** A very long chain
+  of `&&` or deeply nested braces before a heredoc could crash the hook.
+  When the hook crashes, the agent treats it as a non-blocking error and runs
+  the command anyway. Such input now gets a normal verdict.
+
+### Fixed
+
+- **Under load, the hook allowed some destructive commands silently.** The
+  embedded-code extractor has a 50 ms budget. On a busy machine it ran out,
+  the bounded fallback found nothing, and the unread script was then treated
+  as quoted data, so the hook exited 0 with nothing on stdout. A timed-out
+  extraction is now read again with the time the hook has left, so the
+  verdict depends on the command and not on the load; if even that cannot
+  finish, the answer is the unverified-command response, never a silent
+  allow. The 20 ms AST matcher gets the same second reading when it times
+  out or its worker thread cannot start, and a body it still cannot read is
+  unverified rather than clean. (18be8e9)
+
+- **A panic in hook mode let the command through.** Release builds abort on
+  panic, and a crashed hook is a non-blocking error to every host. In hook
+  mode a panic, on the main thread or a worker thread, now publishes the
+  unverified-command response for the request's protocol before exiting.
+  (18be8e9)
+
+- **Control characters could hide an embedded command.** Binary-looking
+  input skipped embedded-code extraction, and the skip read as "nothing
+  embedded": `watch 'git reset' --hard` followed by a comment of control
+  characters was allowed. It is now denied under the incomplete-analysis
+  rule. (18be8e9)
+
+- **`[confidence] enabled = true` crashed the hook on some wrapped
+  commands.** The confidence scorer cut the command with a match span
+  measured on the unwrapped inner command (`env --split-string='rm -rf
+  ./build'`, a `curl … | bash` install line) and panicked, so the command
+  ran. A span that does not address the command now leaves the confidence
+  high and the deny in place. (18be8e9)
+
+- **`[confidence]` scored some matches against the wrong text.** A match
+  found on the raw command was scored at the same offsets of the normalized
+  command (quotes and wrappers such as `time` removed), and a match inside
+  an unwrapped inner command carried the inner command's offsets. Either
+  way the score described unrelated text and could downgrade a deny to a
+  warning. A span is now checked against the matched text first. One
+  measured on the raw command is moved onto the normalized command only
+  when normalizing stripped a leading wrapper (`time`, `sudo`); any other
+  span keeps the deny. The hook's reported `confidence` is omitted when the
+  span does not address the command. (42414a6)
+
+- **The OpenCode plugin and the Oh My Pi bridge let a command through when
+  dcg crashed or gave no verdict.** The OpenCode plugin read dcg's empty
+  stdout as "allow", so a dcg killed by a signal (including the plugin's own
+  timeout), one that exited non-zero, or one that exited 0 without
+  answering, allowed the command. The plugin now asks dcg for an explicit
+  `{"dcg_verdict":"allow"}` line and blocks, with the reason, when there is
+  none. The Oh My Pi bridge treated a signal (including its own timeout
+  kill) or an exit status dcg never uses for a verdict as an infrastructure
+  failure and let the command run; it now blocks unless a deny was already
+  written. In both, `DCG_BRIDGE_CRASH_DECISION=allow` restores fail-open
+  for crashes. Regenerate the files with `dcg install --opencode --force`,
+  `dcg install --omp --force` or `dcg update`. (8fa6aeb)
+
+- **Data heredocs with an unquoted delimiter were judged as live
+  commands.** dcg now works out from the parse tree where the heredoc's
+  output goes. It masks the body only when that output provably stays
+  contained and the command reading the body only passes it along as text.
+  Every other unquoted body is judged as a whole, as in v0.15.1. (6158ee7,
+  6976885, 7c9a032)
+
+- **Heredoc bodies whose output reaches a program that runs it were judged
+  as data**, with either delimiter. They are now judged as commands.
+  (6976885)
+
+- **More obfuscated spellings that hid a command**: quoted shell options,
+  escaped or assembled program names, substitution-made command words,
+  quoted `find` actions, relative writes after `cd /`, dashed Git built-ins
+  behind `xargs`/`find -exec`, and `eval` after a reserved word. (6158ee7)
+
+- **Brace-list command words, and commands the shell runs later**
+  (`trap` handlers, `PROMPT_COMMAND`, substitutions in the prompt
+  variables, `BASH_ENV`). These are judged even when the `trap` sits behind
+  `builtin`/`command`, inside a group, a subshell or a function body.
+  (e15a560, 03c5121)
+
+- **cmd.exe caret obfuscation (#499, #500).** dcg used to replay a command
+  under its caret-decoded form only when decoding exposed a pack keyword
+  that was missing from the raw text. Any unrelated keyword in the raw text
+  could therefore suppress the replay, so `g^it reset --hard` was allowed
+  by the hook while `dcg explain` denied it, and `d^d`/`mkf^s` were allowed
+  everywhere. Each decoded keyword is now compared on its own. (f1c32fe)
+
+- **The hook aborted on deeply nested input.** Two parse-tree walks used
+  recursion and overflowed the stack at about 13,500 list elements before
+  a heredoc. Both now use an explicit stack. (929cce8)
+
+- **A long run of option-like words before a shell's `-c` took several
+  seconds** to evaluate. It now runs in linear time.
+
+- Test and lint fixes: the project-allowlist path tests are now limited to
+  their own temp directory, plus formatting, a clippy lint and a hook-stdin
+  race in an end-to-end test. Runtime behaviour is unchanged. (d4b0e44)
+
+### Added
+
+- `DCG_LOG=<filter>` sends hook-mode tracing to stderr (for example
+  `DCG_LOG=debug`), to see which path a request took. (18be8e9)
+
+### Windows build
+
+- The Windows binaries for this release were cross-compiled on macOS with
+  `cargo-xwin` (MSVC targets), because the native Windows build hosts were
+  unreachable. The native PowerShell end-to-end suite was not run for this
+  release.
+
+## [v0.15.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.1) -- 2026-09-29 [Release]
+
+Two fixes. One made the Oh My Pi bridge let a command through unjudged; the
+other made the installers skip signature checking with some distro builds of
+cosign.
+
+**Oh My Pi users: refresh the bridge after upgrading.** The fix for #504 is in
+the generated `dcg-guard.ts` file, not only in the dcg binary, so an existing
+bridge keeps the old behaviour until it is rewritten.
+
+- `dcg update` rewrites your user/profile bridge for you when `omp` is on your
+  `PATH` (it runs the new installer, which runs `dcg install --omp --force`).
+  It does not if you pass `--no-configure`.
+- If you upgraded any other way (package manager, manual download,
+  `dcg update --no-configure`), run `dcg install --omp --force`. Without
+  `--force` the command sees the existing bridge and leaves it alone.
+- A project-scoped bridge (`dcg install --omp --project`) is never touched by
+  `dcg update`. Run `dcg install --omp --force --project` in that project, or
+  `dcg doctor --fix` there, which refreshes every stale dcg-owned bridge OMP
+  loads.
+- `dcg doctor` reports an old bridge as "OUTDATED OR DAMAGED".
+
+Restart omp afterwards so it loads the new file.
+
+### Fixed
+
+- **The OMP bridge judged nothing when the command's working directory did not
+  exist (#504).** The bridge started dcg inside the command's working
+  directory. When that directory was missing (a removed scratch directory, or
+  one the command itself would create), starting dcg failed with an `ENOENT`
+  error that named the dcg binary, and the bridge logged it and let the
+  command run with no verdict and no audit record, even with
+  `DCG_UNVERIFIED_DECISION=deny`. The bridge now starts dcg from the nearest
+  existing parent directory, so the same project config, allowlists and Git
+  branch apply, and tells dcg the real working directory. Allowlist entries
+  scoped to a directory are not applied when the reported directory does not
+  exist, so a grant for the parent is never borrowed. If dcg still cannot be
+  started, the log names the binary and both directories, and
+  `DCG_UNVERIFIED_DECISION=deny` now blocks the command; without that setting
+  the behaviour is unchanged (the command is allowed, as documented in #346).
+  (38de715)
+
+- **The installers skipped signature verification with cosign builds that add
+  a version suffix (#505).** `install.sh` and `install.ps1` refuse cosign
+  releases older than the CVE-2026-22703 fixes, but their version check could
+  not read a version with anything after the patch number. Arch's cosign
+  reports `v3.1.3+dirty`, so it was treated as unpatched and the Sigstore
+  bundle check was skipped with a warning. Both installers now read the
+  version as SemVer: build metadata such as `+dirty` is ignored, and a
+  pre-release such as `v3.0.4-rc.1` still counts as older than `v3.0.4`.
+  Versions that cannot be read are still refused, and the warning now shows
+  what cosign reported. (6ba4a76)
+
 ## [v0.15.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.0) -- 2026-09-29 [Release]
 
 A safety release. Most of what follows is commands that v0.14.4 allowed and

@@ -269,6 +269,7 @@ impl ContextClassifier {
         // Track inline code flags (e.g. -c)
         let mut pending_inline_code = false;
         let mut last_word_start = 0;
+        let mut flag_context = InlineFlagContext::default();
 
         // Track whether we're in "command position" - where the next word would be an executable.
         // This is true at the start of a command, or right after a command separator (|, ||, &&, ;).
@@ -325,6 +326,7 @@ impl ContextClassifier {
                                 let word = &command[last_word_start..i];
                                 is_inline_code_flag(word)
                                     && self.check_inline_code_context(
+                                        &mut flag_context,
                                         command,
                                         last_word_start,
                                         word,
@@ -357,6 +359,7 @@ impl ContextClassifier {
                                 let word = &command[last_word_start..i];
                                 is_inline_code_flag(word)
                                     && self.check_inline_code_context(
+                                        &mut flag_context,
                                         command,
                                         last_word_start,
                                         word,
@@ -454,6 +457,7 @@ impl ContextClassifier {
                                 let word = &command[last_word_start..i];
                                 if is_inline_code_flag(word) {
                                     pending_inline_code = self.check_inline_code_context(
+                                        &mut flag_context,
                                         command,
                                         last_word_start,
                                         word,
@@ -652,89 +656,117 @@ impl ContextClassifier {
     }
 
     /// Check if the word before a -c/-e flag is an inline-code command.
-    fn check_inline_code_context(&self, command: &str, flag_start: usize, flag: &str) -> bool {
-        // Special case for env -S: scan the whole segment for 'env'
+    fn check_inline_code_context(
+        &self,
+        context: &mut InlineFlagContext,
+        command: &str,
+        flag_start: usize,
+        flag: &str,
+    ) -> bool {
+        context.advance(command, flag_start, |token| self.names_interpreter(token));
         if flag == "-S" {
             // env -S "script" treats the argument as a script/command line.
             // Be conservative: treat as inline code if the current segment
             // contains an env invocation anywhere before the flag.
-            return env_split_string_context(command, flag_start);
+            context.env_seen
+        } else {
+            // For standard interpreters (python -c, bash -c): some word of the
+            // segment before the flag names one. Flags, assignments and the
+            // wrappers that may precede an interpreter are skipped, and a
+            // word that names none may be a flag's value, so every word counts.
+            context.interpreter_seen
         }
+    }
 
-        // For standard interpreters (python -c, bash -c), scan backwards skipping flags
-        let before = &command[..flag_start];
-
-        // Limit search to reasonable lookback (e.g. 20 tokens or start of segment)
-        // to avoid performance cliffs on massive commands.
-        // We use segment_start_before_flag to respect pipe boundaries.
-        let segment_start = segment_start_before_flag(command, flag_start);
-        let segment = &before[segment_start..];
-
-        // Tokenize in reverse to find the command word
-        for token in segment.split_whitespace().rev() {
-            // Skip flags (heuristic: starts with -)
-            if token.starts_with('-') && token.len() > 1 {
-                continue;
-            }
-
-            // Skip env assignments (VAR=VAL)
-            if token.contains('=') {
-                continue;
-            }
-
-            // Strip quotes if present (handle "python", "/usr/bin/python", etc.)
-            let token_unquoted = if (token.starts_with('"') && token.ends_with('"'))
-                || (token.starts_with('\'') && token.ends_with('\''))
-            {
-                if token.len() >= 2 {
-                    &token[1..token.len() - 1]
-                } else {
-                    token
-                }
-            } else {
-                token
-            };
-
-            // Found a potential command word
-            // Handle both Unix (/) and Windows (\) path separators
-            let base_name = token_unquoted
-                .rsplit(&['/', '\\'][..])
-                .next()
-                .unwrap_or(token_unquoted);
-            // Strip Windows .exe extension if present
-            let base_name = base_name
-                .strip_suffix(".exe")
-                .or_else(|| base_name.strip_suffix(".EXE"))
-                .unwrap_or(base_name);
-
-            // Skip wrappers that might precede the interpreter
-            if matches!(base_name, "sudo" | "time" | "nohup" | "env" | "command") {
-                continue;
-            }
-
-            // Check for known interpreter, allowing for version suffixes
-            // e.g. "python3.11" matches "python", "node18" matches "node"
-            let is_interpreter = self.inline_code_commands.iter().any(|&known| {
-                if base_name == known {
-                    return true;
-                }
-                if let Some(suffix) = base_name.strip_prefix(known) {
-                    // Suffix must be non-empty and consist only of digits/dots
-                    return !suffix.is_empty()
-                        && suffix.chars().all(|c| c.is_ascii_digit() || c == '.');
-                }
-                false
-            });
-
-            if is_interpreter {
+    /// Whether a word, taken as a command word, names one of
+    /// `inline_code_commands`: quotes around it, directories and a `.exe`
+    /// suffix removed, and a version suffix allowed (`python3.11`, `node18`).
+    /// Flags (`-x`) and assignments (`VAR=VAL`) never do.
+    fn names_interpreter(&self, token: &str) -> bool {
+        if (token.starts_with('-') && token.len() > 1) || token.contains('=') {
+            return false;
+        }
+        let token_unquoted = if ((token.starts_with('"') && token.ends_with('"'))
+            || (token.starts_with('\'') && token.ends_with('\'')))
+            && token.len() >= 2
+        {
+            &token[1..token.len() - 1]
+        } else {
+            token
+        };
+        // Handle both Unix (/) and Windows (\) path separators
+        let base_name = token_unquoted
+            .rsplit(&['/', '\\'][..])
+            .next()
+            .unwrap_or(token_unquoted);
+        let base_name = base_name
+            .strip_suffix(".exe")
+            .or_else(|| base_name.strip_suffix(".EXE"))
+            .unwrap_or(base_name);
+        self.inline_code_commands.iter().any(|&known| {
+            if base_name == known {
                 return true;
             }
+            // Suffix must be non-empty and consist only of digits/dots
+            base_name.strip_prefix(known).is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.')
+            })
+        })
+    }
+}
 
-            // If it's not a known interpreter, it might be an argument to a previous flag.
-            // Continue searching backwards.
+/// What the words of the current segment before an inline-code flag hold,
+/// kept across the flags of one [`ContextClassifier::classify`] pass.
+///
+/// Each flag used to rescan its whole segment backwards, for the segment start
+/// and then for a command word, so a segment of `n` flags (`c -c -c … sh -c
+/// '…'`) cost `n²`: six seconds at 60 KB. Flags arrive in increasing order, so
+/// only the text since the previous flag is new; a flag out of order (never
+/// produced by `classify`) rescans from its segment start.
+#[derive(Debug, Default)]
+struct InlineFlagContext {
+    /// Where the words below were read up to (a word start).
+    scanned_to: usize,
+    /// Some word read so far in this segment names an interpreter.
+    interpreter_seen: bool,
+    /// Some word read so far in this segment is `env` or `…/env`.
+    env_seen: bool,
+}
+
+impl InlineFlagContext {
+    fn advance(
+        &mut self,
+        command: &str,
+        flag_start: usize,
+        names_interpreter: impl Fn(&str) -> bool,
+    ) {
+        let flag_start = flag_start.min(command.len());
+        let bytes = command.as_bytes();
+        let from = if flag_start < self.scanned_to {
+            // Out of order: start over from this flag's segment.
+            segment_start_before_flag(command, flag_start)
+        } else {
+            // A separator since the last flag starts a new segment.
+            bytes[self.scanned_to..flag_start]
+                .iter()
+                .rposition(|byte| matches!(byte, b'|' | b'&' | b';'))
+                .map_or(self.scanned_to, |at| self.scanned_to + at + 1)
+        };
+        if from != self.scanned_to || flag_start < self.scanned_to {
+            self.interpreter_seen = false;
+            self.env_seen = false;
         }
-
-        false
+        let Some(region) = command.get(from..flag_start) else {
+            // Not on a char boundary: read nothing new, keep what is known.
+            self.scanned_to = flag_start;
+            return;
+        };
+        for token in region.split_whitespace() {
+            let trimmed = token.trim_start_matches('\\');
+            self.env_seen |= trimmed == "env" || trimmed.ends_with("/env");
+            self.interpreter_seen |= names_interpreter(token);
+        }
+        self.scanned_to = flag_start;
     }
 }
 
@@ -1101,6 +1133,105 @@ pub fn is_argument_data(command: &str, preceding_flag: Option<&str>) -> bool {
     false
 }
 
+/// Decode one static POSIX word for the scoped flowctl data contract.
+fn flowctl_static_word(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    // Validate the raw word before quote removal. Separators, globs, and
+    // expansion spellings are data inside single quotes; double quotes keep
+    // separators literal but still execute dollar/backtick substitutions.
+    // Applying a byte blacklist after losing these roles rejected receipt
+    // text such as 'npm test; git reset --hard' (#540).
+    let bytes = raw.as_bytes();
+    let mut quote = None;
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match (quote, byte) {
+            (Some(b'\''), b'\'') | (Some(b'"'), b'"') => quote = None,
+            (Some(b'\''), _) => {}
+            (_, b'\\') => {
+                let &escaped = bytes.get(index + 1)?;
+                if quote.is_none() || matches!(escaped, b'$' | b'`' | b'"' | b'\\' | b'\n') {
+                    index += 1;
+                }
+            }
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (_, b'$' | b'`') => return None,
+            (
+                None,
+                b'*' | b'?' | b'[' | b'{' | b'~' | b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>'
+                | b'#',
+            ) => {
+                return None;
+            }
+            (None, byte) if byte.is_ascii_whitespace() => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    let mut words = shell_words::split(raw).ok()?.into_iter();
+    let value = words.next()?;
+    words.next().is_none().then_some(value)
+}
+
+/// Return static data operand indices for flowctl gate check/receipt (#538).
+#[must_use]
+pub(crate) fn flowctl_gate_data_values(words: &[&str]) -> Option<SmallVec<[usize; 4]>> {
+    if words.len() > 128 {
+        return None;
+    }
+    let raw_executable = *words.first()?;
+    let documented_handle = raw_executable == "\"$FLOWCTL\"";
+    let literal_flowctl = flowctl_static_word(raw_executable)
+        .is_some_and(|executable| executable.rsplit('/').next() == Some("flowctl"));
+    if !documented_handle && !literal_flowctl {
+        return None;
+    }
+    if words
+        .get(1)
+        .and_then(|word| flowctl_static_word(word))
+        .as_deref()
+        != Some("gate")
+        || !matches!(
+            words
+                .get(2)
+                .and_then(|word| flowctl_static_word(word))
+                .as_deref(),
+            Some("check" | "receipt")
+        )
+    {
+        return None;
+    }
+    let mut values = SmallVec::new();
+    let mut index = 3;
+    let mut command_seen = false;
+    while let Some(raw_flag) = words.get(index) {
+        let flag = flowctl_static_word(raw_flag)?;
+        if matches!(flag.as_str(), "--gate" | "--command") {
+            let value = flowctl_static_word(words.get(index + 1)?)?;
+            if value.starts_with('-') {
+                return None;
+            }
+            values.push(index + 1);
+            command_seen |= flag == "--command";
+            index += 2;
+        } else if flag.starts_with("--command=") || flag.starts_with("--gate=") {
+            values.push(index);
+            command_seen |= flag.starts_with("--command=");
+            index += 1;
+        } else if flag == "--json" {
+            index += 1;
+        } else {
+            return None;
+        }
+    }
+    command_seen.then_some(values)
+}
+
 #[derive(Clone, Copy)]
 struct PendingSafeFlag<'a> {
     flag: &'a str,
@@ -1147,7 +1278,8 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
     // Note: We must still process commands with `#` to mask comments, even if no safe
     // commands are present (e.g., `python -c '...' # rm -rf /` should mask the comment).
     let has_comment_char = command.contains('#');
-    if !SAFE_COMMANDS_MATCHER.is_match(command) && !has_comment_char {
+    let may_have_flowctl_data = command.contains("flowctl") || command.contains("FLOWCTL");
+    if !SAFE_COMMANDS_MATCHER.is_match(command) && !has_comment_char && !may_have_flowctl_data {
         return Cow::Borrowed(command);
     }
 
@@ -1182,7 +1314,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
     // returns to args-data masking.
     let mut next_token_is_redirect_target = false;
 
-    for token in &tokens {
+    for (token_index, token) in tokens.iter().enumerate() {
         if token.kind == SanitizeTokenKind::Separator {
             segment_cmd = None;
             segment_cmd_is_all_args_data = false;
@@ -1253,6 +1385,27 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             }
             if is_env_assignment(token_text) {
                 continue;
+            }
+
+            if may_have_flowctl_data {
+                let command_tokens: Vec<_> = tokens[token_index..]
+                    .iter()
+                    .take_while(|token| token.kind == SanitizeTokenKind::Word)
+                    .take(129)
+                    .collect();
+                if let Some(words) = command_tokens
+                    .iter()
+                    .map(|token| token.text(command))
+                    .collect::<Option<Vec<_>>>()
+                    && let Some(values) = flowctl_gate_data_values(&words)
+                {
+                    for index in values {
+                        let data_token = command_tokens[index];
+                        if !data_token.has_inline_code {
+                            mask_ranges.push(data_token.byte_range.clone());
+                        }
+                    }
+                }
             }
 
             segment_cmd = Some(token_text);
@@ -2767,17 +2920,6 @@ fn consume_backticks(command: &str, start: usize) -> usize {
     i
 }
 
-#[must_use]
-fn env_split_string_context(command: &str, flag_start: usize) -> bool {
-    let segment_start = segment_start_before_flag(command, flag_start);
-    let segment = &command[segment_start..flag_start];
-
-    segment.split_whitespace().any(|token| {
-        let token = token.trim_start_matches('\\');
-        token == "env" || token.ends_with("/env")
-    })
-}
-
 #[inline]
 #[must_use]
 fn is_inline_code_flag(word: &str) -> bool {
@@ -2863,6 +3005,26 @@ fn merge_ranges(ranges: &[Range<usize>]) -> SmallVec<[Range<usize>; 8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The interpreter search behind an inline-code flag reads each word of a
+    /// segment once, however many flags the segment holds, and still resets
+    /// at a segment boundary.
+    #[test]
+    fn inline_code_flags_are_found_in_linear_time_and_per_segment() {
+        let inline = |command: &str| {
+            classify_command(command)
+                .spans()
+                .iter()
+                .any(|span| span.kind == SpanKind::InlineCode)
+        };
+        assert!(inline("sh -c 'git status'"));
+        assert!(inline("env -S 'git status'"));
+        assert!(inline(&format!("{}sh -c 'x'", "c -c ".repeat(5_000))));
+        assert!(!inline(&format!("{}grep -c 'x' f", "c -c ".repeat(5_000))));
+        assert!(!inline("sh -x script; grep -c 'x' f"));
+        assert!(!inline("env A=1 true; grep -S 'x' f"));
+        assert!(inline("true; env -S 'x'"));
+    }
 
     #[test]
     fn test_simple_command() {
@@ -3762,6 +3924,92 @@ mod tests {
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("bd create"));
         assert!(sanitized.as_ref().contains("--description="));
+    }
+
+    #[test]
+    fn flowctl_static_words_preserve_quoted_and_escaped_data_540() {
+        for (raw, expected) in [
+            ("'npm test; git reset --hard'", "npm test; git reset --hard"),
+            (
+                "\"printf '(literal)' > result\"",
+                "printf '(literal)' > result",
+            ),
+            ("'grep $HOME *.rs | cat'", "grep $HOME *.rs | cat"),
+            ("'literal `git reset --hard`'", "literal `git reset --hard`"),
+            (
+                r"npm\ test\;\ git\ reset\ --hard",
+                "npm test; git reset --hard",
+            ),
+            (r#""\$(git reset --hard)""#, "$(git reset --hard)"),
+            ("'multiline\ndata; Ω'", "multiline\ndata; Ω"),
+            ("'npm 'test", "npm test"),
+            ("''", ""),
+        ] {
+            assert_eq!(
+                flowctl_static_word(raw).as_deref(),
+                Some(expected),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flowctl_static_words_reject_live_or_incomplete_syntax_540() {
+        for raw in [
+            "",
+            "$ARGS",
+            "\"$ARGS\"",
+            "$(git reset --hard)",
+            "\"$(git reset --hard)\"",
+            "`git reset --hard`",
+            r#""\\$(git reset --hard)""#,
+            "*.sh",
+            "a?b",
+            "[ab]",
+            "{a,b}",
+            "~/script",
+            "a;b",
+            "a|b",
+            "a&b",
+            "(a)",
+            "a>b",
+            "a<b",
+            "#comment",
+            "two words",
+            "'unterminated",
+            "\"unterminated",
+            "trailing\\",
+        ] {
+            assert!(flowctl_static_word(raw).is_none(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_flowctl_data_preserves_executable_boundaries_540() {
+        for source in [
+            r#""$FLOWCTL" gate check --command 'npm test; git reset --hard'"#,
+            r#"flowctl gate receipt --command="echo (git reset --hard)""#,
+            r#"flowctl gate check --command 'grep "$HOME" *.rs; git reset --hard'"#,
+            r"flowctl gate check --command npm\ test\;\ git\ reset\ --hard",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(source);
+            assert_eq!(sanitized.len(), source.len(), "{source:?}");
+            assert!(!sanitized.contains("git"), "{source:?}: {sanitized}");
+            assert!(sanitized.contains("gate"), "{source:?}: {sanitized}");
+        }
+        for source in [
+            r#""$FLOWCTL" gate check --command "$(git reset --hard)""#,
+            r#""$FLOWCTL" gate check --command 'npm test'; git reset --hard"#,
+            r#""$FLOWCTL" gate check --command 'npm test' > /etc/profile"#,
+            r#""$FLOWCTL" gate run --command 'git reset --hard'"#,
+            r#""$FLOWCTL" gate check --unknown --command 'git reset --hard'"#,
+        ] {
+            let sanitized = sanitize_for_pattern_matching(source);
+            assert!(
+                sanitized.contains("git reset --hard") || sanitized.contains("> /etc/profile"),
+                "live or unsupported syntax was hidden: {source:?}: {sanitized}"
+            );
+        }
     }
 
     #[test]

@@ -706,6 +706,11 @@ impl Pack {
         if self.destructive_match_vetoes_safe(cmd) {
             return false;
         }
+        if self.id == "system.permissions"
+            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
+        {
+            return true;
+        }
         if self.id == "kubernetes.kubectl"
             && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
         {
@@ -763,6 +768,11 @@ impl Pack {
         if self.destructive_match_vetoes_safe_with_deadline(cmd, deadline) {
             return false;
         }
+        if self.id == "system.permissions"
+            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
+        {
+            return true;
+        }
         if self.id == "kubernetes.kubectl"
             && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
         {
@@ -804,6 +814,22 @@ impl Pack {
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
+        if self.id == "system.permissions" {
+            match crate::packs::system::permissions::posix_permission_decision(
+                cmd,
+                crate::normalize::ShellDialect::Unknown,
+            ) {
+                crate::packs::system::permissions::PosixPermissionDecision::NonDestructive => {
+                    return None;
+                }
+                crate::packs::system::permissions::PosixPermissionDecision::Destructive(names) => {
+                    return names
+                        .iter()
+                        .find_map(|name| self.destructive_match_by_name(name, cmd));
+                }
+                crate::packs::system::permissions::PosixPermissionDecision::NoMatch => {}
+            }
+        }
         if self.id == "careful_company_running_windows.transfer" {
             match crate::packs::careful_company_running_windows::transfer::direct_scp_decision(cmd) {
                 crate::packs::careful_company_running_windows::transfer::DirectScpDecision::Safe
@@ -840,14 +866,12 @@ impl Pack {
         }
         if self.id == "core.git" {
             match crate::packs::core::git::branch_command_decision(cmd) {
-                crate::packs::core::git::BranchCommandDecision::Destructive => {
-                    return self.destructive_match_by_name("branch-force-delete", cmd);
-                }
-                crate::packs::core::git::BranchCommandDecision::DestructiveDynamic => {
-                    return self.destructive_match_by_name(
-                        crate::packs::core::git::BRANCH_DYNAMIC_RULE,
-                        cmd,
-                    );
+                decision @ (crate::packs::core::git::BranchCommandDecision::Destructive
+                | crate::packs::core::git::BranchCommandDecision::MergeCheckedDelete
+                | crate::packs::core::git::BranchCommandDecision::DestructiveDynamic) => {
+                    return decision
+                        .rule_name()
+                        .and_then(|name| self.destructive_match_by_name(name, cmd));
                 }
                 crate::packs::core::git::BranchCommandDecision::NonDestructive => return None,
                 crate::packs::core::git::BranchCommandDecision::NotBranch
@@ -862,15 +886,32 @@ impl Pack {
                     .matches_destructive_named_by(cmd, |name| name != Some("branch-force-delete"));
             }
         }
-        self.destructive_patterns
+        let found = self
+            .destructive_patterns
             .iter()
-            .find(|p| p.matches_command(cmd))
-            .map(|p| DestructiveMatch {
-                reason: p.reason,
-                name: p.name,
-                severity: p.severity,
-                explanation: p.explanation,
-            })
+            .find(|p| p.matches_command(cmd));
+        // #509: the `branch-force-delete` regex is the fallback for a branch
+        // command the parser could not read; a readable merge-checked
+        // deletion is reported as `branch-delete`, as the parser would.
+        let found = match found {
+            Some(p)
+                if self.id == "core.git"
+                    && p.name == Some(crate::packs::core::git::BRANCH_FORCE_DELETE_RULE) =>
+            {
+                let rule = crate::packs::core::git::branch_regex_fallback_rule(cmd);
+                self.destructive_patterns
+                    .iter()
+                    .find(|candidate| candidate.name == Some(rule))
+                    .or(found)
+            }
+            other => other,
+        };
+        found.map(|p| DestructiveMatch {
+            reason: p.reason,
+            name: p.name,
+            severity: p.severity,
+            explanation: p.explanation,
+        })
     }
 
     fn matches_destructive_named_by(
@@ -980,7 +1021,10 @@ impl Pack {
                     return Some(m);
                 }
             }
-            if matches!(self.id.as_str(), "core.git" | "remote.scp") {
+            if matches!(
+                self.id.as_str(),
+                "core.git" | "remote.scp" | "system.permissions"
+            ) {
                 return None;
             }
             // Also check the whole command so patterns that legitimately
@@ -1217,6 +1261,7 @@ impl PackEntry {
 
                 // Only build RegexSet if we have linear patterns
                 if !patterns.is_empty() {
+                    let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
                     pack.safe_regex_set = regex::RegexSet::new(patterns).ok();
                 }
             }
@@ -1369,6 +1414,65 @@ impl EnabledKeywordIndex {
 
         mask
     }
+
+    /// Whether `decoded` names an enabled-pack keyword that `baseline` does not.
+    ///
+    /// The unknown-dialect fan-out asks this to decide whether replaying a
+    /// command under a concrete dialect could reach a rule the POSIX view could
+    /// not (dcg#294): a cmd.exe caret or a PowerShell backtick can split an
+    /// executable word without adding a separator, so the decoded text names
+    /// something a pack protects while the POSIX text does not.
+    ///
+    /// The question has to be asked per keyword. A plain "does the baseline
+    /// name *any* keyword" test answers a different one, and answers it wrong
+    /// whenever the line carries an unrelated keyword: `/dev/` in
+    /// `crypt^setup luksErase /dev/sdb` belongs to a rule about device targets,
+    /// not to the command word the caret split, yet it made the replay look
+    /// redundant and the command was allowed while the same line without a
+    /// device path denied. The same test also made coverage *non-monotone* in
+    /// the enabled-pack set: enabling `windows.filesystem` contributes `erase`
+    /// and `rd`, which appear inside the unrelated words `luksErase` and
+    /// `card`, so turning that pack on silently un-shipped `system.disk`'s
+    /// `cryptsetup-erase` and `blkdiscard` rules for their caret spellings
+    /// (dcg#499, dcg#500).
+    ///
+    /// Pattern ids are compared rather than keyword text so the two sides use
+    /// one matcher and one notion of a match, including the overlapping
+    /// substring semantics `candidate_pack_mask` documents.
+    #[must_use]
+    pub fn exposes_keyword_absent_from(&self, decoded: &str, baseline: &str) -> bool {
+        // A pack with no keyword list is checked against every command, so it
+        // is checked against the decoded text too — and that text is exactly
+        // what it has not seen yet.
+        if self.always_check_mask != 0 {
+            return true;
+        }
+
+        if self.core_git_mask != 0
+            && crate::packs::core::git::contains_git_ascii_case_insensitive(decoded)
+            && !crate::packs::core::git::contains_git_ascii_case_insensitive(baseline)
+        {
+            return true;
+        }
+
+        if let Some(ac) = &self.keyword_matcher {
+            let baseline_hits: std::collections::BTreeSet<usize> = ac
+                .find_overlapping_iter(baseline)
+                .map(|m| m.pattern().as_usize())
+                .collect();
+            if ac
+                .find_overlapping_iter(decoded)
+                .any(|m| !baseline_hits.contains(&m.pattern().as_usize()))
+            {
+                return true;
+            }
+        }
+
+        self.whitespace_keywords.iter().any(|keyword| {
+            keyword_matches_substring(decoded, keyword)
+                && !keyword_matches_substring(baseline, keyword)
+        })
+    }
 }
 
 /// Packs the `careful_company_running_windows` preset pulls in beyond its own
@@ -1431,6 +1535,25 @@ const CAREFUL_COMPANY_PRESET_MEMBERS: &[&str] = &[
     "cloud.gcp",
     "cloud.azure",
 ];
+
+/// Pattern names (in the same pack) that `pattern_name` was split out of.
+///
+/// Rule ids are what `[policy.rules]` and allowlist `rule = "..."` entries key
+/// on, so splitting one rule into two would silently narrow every existing
+/// entry for the original id. Instead, an entry for a listed legacy name keeps
+/// covering the split-out rule, and an entry naming the split-out rule itself
+/// wins over it (the more specific id). This is the single table both the
+/// policy resolver and the allowlist matcher consult.
+///
+/// - `core.git:branch-delete` (merge-checked `git branch -d`) was reported as
+///   `core.git:branch-force-delete` until #509.
+#[must_use]
+pub fn legacy_rule_names(pack_id: &str, pattern_name: &str) -> &'static [&'static str] {
+    match (pack_id, pattern_name) {
+        ("core.git", "branch-delete") => &["branch-force-delete"],
+        _ => &[],
+    }
+}
 
 /// Return the curated membership for a preset ID, if `id` names one.
 ///
@@ -3363,10 +3486,31 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8], offset: usize) ->
     if needle.is_empty() || offset > haystack.len() || needle.len() > haystack.len() - offset {
         return None;
     }
-    haystack[offset..]
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle))
-        .map(|position| offset + position)
+
+    // Every complete match must start with the needle's first byte, allowing
+    // only the same ASCII case fold as the full comparison below. Search those
+    // candidate positions with memchr instead of comparing a window at every
+    // byte for every keyword. This matters especially after a large data
+    // heredoc has been masked to spaces: the unchanged keyword rules still
+    // inspect its complete source view, but almost no position is a candidate.
+    let first = needle[0];
+    let last_start = haystack.len() - needle.len();
+    let starts = &haystack[offset..=last_start];
+    let matches_at = |&position: &usize| {
+        let start = offset + position;
+        haystack[start..start + needle.len()].eq_ignore_ascii_case(needle)
+    };
+    let position = if first.is_ascii_alphabetic() {
+        memchr::memchr2_iter(
+            first.to_ascii_lowercase(),
+            first.to_ascii_uppercase(),
+            starts,
+        )
+        .find(matches_at)
+    } else {
+        memchr::memchr_iter(first, starts).find(matches_at)
+    };
+    position.map(|position| offset + position)
 }
 
 fn split_keyword_parts(keyword: &str) -> SmallVec<[&str; 4]> {
@@ -3730,6 +3874,7 @@ pub fn pack_aware_quick_reject(cmd: &str, enabled_keywords: &[&str]) -> bool {
 /// inner commands cannot be hidden behind a safe outer command.
 #[must_use]
 pub fn split_command_segments(cmd: &str) -> Vec<&str> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellSegmentation);
     let mut segments: Vec<&str> = Vec::new();
     collect_command_segments(cmd, 0, cmd.len(), 0, true, &mut segments);
 
@@ -3754,6 +3899,7 @@ pub(crate) fn split_command_segments_in_dialect(
     cmd: &str,
     dialect: crate::normalize::ShellDialect,
 ) -> Vec<&str> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellSegmentation);
     if matches!(
         dialect,
         crate::normalize::ShellDialect::Posix | crate::normalize::ShellDialect::Unknown
@@ -4306,6 +4452,191 @@ fn pack_aware_quick_reject_from_normalized_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_find_ascii_case_insensitive(
+        haystack: &[u8],
+        needle: &[u8],
+        offset: usize,
+    ) -> Option<usize> {
+        if needle.is_empty() || offset > haystack.len() || needle.len() > haystack.len() - offset {
+            return None;
+        }
+        haystack[offset..]
+            .windows(needle.len())
+            .position(|window| window.eq_ignore_ascii_case(needle))
+            .map(|position| offset + position)
+    }
+
+    #[test]
+    fn keyword_candidate_search_matches_every_byte_and_offset_issue_555() {
+        for byte in 0..=u8::MAX {
+            let haystack = [
+                byte ^ 0x20,
+                byte,
+                0,
+                u8::MAX,
+                byte.to_ascii_uppercase(),
+                byte.to_ascii_lowercase(),
+                0x80,
+                byte,
+                byte,
+                0,
+            ];
+            let needles: &[&[u8]] = &[
+                &[],
+                &[byte],
+                &[byte, 0],
+                &[byte, u8::MAX],
+                &[byte, 0x80],
+                &[byte, byte],
+                &[0x80, byte],
+                &[byte; 11],
+            ];
+            for needle in needles {
+                for offset in (0..=haystack.len() + 1).chain(std::iter::once(usize::MAX)) {
+                    assert_eq!(
+                        find_ascii_case_insensitive(&haystack, needle, offset),
+                        reference_find_ascii_case_insensitive(&haystack, needle, offset),
+                        "byte={byte}, needle={needle:?}, offset={offset}",
+                    );
+                }
+            }
+        }
+
+        for haystack in [
+            &b""[..],
+            &b"Git gIT giT GIT gitgit gix git"[..],
+            &b"aaAaAAAaAAaAAaAaab"[..],
+            &[0xff, 0x80, b'G', b'i', b't', 0, 0xc3, 0xa9, 0xc3, 0x89][..],
+        ] {
+            for needle in [
+                &b""[..],
+                &b"gIt"[..],
+                &b"GITGIT"[..],
+                &b"aAaB"[..],
+                &b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"[..],
+                &[0xff, 0x80][..],
+                &[0xc3, 0x89][..],
+                &[0][..],
+            ] {
+                for offset in 0..=haystack.len() + 1 {
+                    assert_eq!(
+                        find_ascii_case_insensitive(haystack, needle, offset),
+                        reference_find_ascii_case_insensitive(haystack, needle, offset),
+                        "haystack={haystack:?}, needle={needle:?}, offset={offset}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyword_candidate_search_preserves_large_masked_sources_issue_555() {
+        for lines in [40, 300] {
+            let line = " ".repeat(55) + "\n";
+            let command = format!("cat <<'TEXT'\n{}TEXT\ngIT status", line.repeat(lines));
+            let offsets = std::iter::once(0)
+                .chain(command.match_indices('\n').map(|(at, _)| at + 1))
+                .chain([
+                    command.len().saturating_sub(1),
+                    command.len(),
+                    command.len() + 1,
+                ]);
+            for offset in offsets {
+                for needle in [&b"rm"[..], &b"GIT"[..], &b"TEXT"[..], &b" "[..]] {
+                    assert_eq!(
+                        find_ascii_case_insensitive(command.as_bytes(), needle, offset),
+                        reference_find_ascii_case_insensitive(command.as_bytes(), needle, offset),
+                        "lines={lines}, needle={needle:?}, offset={offset}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "paired keyword-search timing; run in release mode with --nocapture"]
+    fn paired_keyword_search_benchmark_issue_555() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const REPEATS: usize = 32;
+        let needles: &[&[u8]] = &[
+            b"git",
+            b"rm",
+            b"truncate",
+            b".git",
+            b"> /",
+            b"aaab",
+            b"aaaa",
+            b"A",
+            &[0x80],
+        ];
+        for lines in [40, 300] {
+            for (shape, line) in [
+                (
+                    "masked",
+                    "                                                       \n",
+                ),
+                (
+                    "frequent",
+                    "aaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaa\n",
+                ),
+            ] {
+                let source = format!("cat <<'TEXT'\n{}TEXT", line.repeat(lines));
+                let expected: Vec<_> = needles
+                    .iter()
+                    .map(|needle| {
+                        reference_find_ascii_case_insensitive(source.as_bytes(), needle, 0)
+                    })
+                    .collect();
+                let expected = expected.repeat(REPEATS);
+                let run = |reference: bool| {
+                    let mut found = Vec::with_capacity(REPEATS * needles.len());
+                    let start = Instant::now();
+                    for _ in 0..REPEATS {
+                        for needle in needles {
+                            found.push(if reference {
+                                reference_find_ascii_case_insensitive(
+                                    black_box(source.as_bytes()),
+                                    black_box(needle),
+                                    0,
+                                )
+                            } else {
+                                find_ascii_case_insensitive(
+                                    black_box(source.as_bytes()),
+                                    black_box(needle),
+                                    0,
+                                )
+                            });
+                        }
+                    }
+                    (start.elapsed(), found)
+                };
+                let mut reference_times = Vec::new();
+                let mut candidate_times = Vec::new();
+                for sample in 0..11 {
+                    for reference in [sample % 2 == 0, sample % 2 != 0] {
+                        let (elapsed, found) = run(reference);
+                        assert_eq!(found, expected, "{shape}/{lines}/{sample}");
+                        if reference {
+                            reference_times.push(elapsed);
+                        } else {
+                            candidate_times.push(elapsed);
+                        }
+                    }
+                }
+                reference_times.sort_unstable();
+                candidate_times.sort_unstable();
+                eprintln!(
+                    "keyword_search/{shape}/{lines}: legacy_p50_us={:.3} candidate_p50_us={:.3} speedup={:.2}x",
+                    reference_times[5].as_secs_f64() * 1_000_000.0,
+                    candidate_times[5].as_secs_f64() * 1_000_000.0,
+                    reference_times[5].as_secs_f64() / candidate_times[5].as_secs_f64(),
+                );
+            }
+        }
+    }
 
     /// Pack-authored denial text (#416): a rule's text wins, the pack's is
     /// the fallback, an unknown pack has none, and invalid text is refused at
@@ -5348,6 +5679,42 @@ destructive_patterns:
         assert!(!index.has_any_keyword("cd /tmp"), "cd has no pack keywords");
     }
 
+    /// dcg#499/#500: the decode gate asks a per-keyword question, so an
+    /// unrelated keyword in the baseline cannot answer it.
+    #[test]
+    fn exposes_keyword_absent_from_is_per_keyword_not_any_keyword() {
+        let enabled: HashSet<String> = std::iter::once("system.disk".to_string()).collect();
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let index = REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("should build index");
+
+        // `cryptsetup` is new even though `/dev/` is on both sides; the device
+        // path belongs to a different rule and cannot stand in for the command
+        // word the caret split.
+        assert!(index.exposes_keyword_absent_from(
+            "cryptsetup luksErase /dev/sdb",
+            "crypt^setup luksErase /dev/sdb"
+        ));
+        assert!(index.exposes_keyword_absent_from(
+            "dd if=/dev/zero of=/dev/sda",
+            "d^d if=/dev/zero of=/dev/sda"
+        ));
+
+        // Same keywords on both sides: nothing new, so no replay is warranted.
+        assert!(!index.exposes_keyword_absent_from(
+            "dd if=/dev/zero of=/dev/sda",
+            "dd if=/dev/zero of=/dev/sda"
+        ));
+        assert!(!index.exposes_keyword_absent_from("echo hello", "echo he^llo"));
+
+        // Polarity is directional: dropping a keyword is not exposing one.
+        assert!(!index.exposes_keyword_absent_from(
+            "crypt^setup luksErase /dev/sdb",
+            "cryptsetup luksErase /dev/sdb"
+        ));
+    }
+
     #[test]
     fn has_any_keyword_returns_true_for_matching_command() {
         let enabled: HashSet<String> = REGISTRY
@@ -5378,20 +5745,41 @@ destructive_patterns:
         let pack = REGISTRY.get("core.git").expect("core.git pack");
         let enabled = HashSet::from(["core.git".to_string()]);
 
-        for command in [
-            "git branch -d feature",
-            "git branch --del feature",
-            "git branch -M old existing",
-            "git branch --no-format -d feature",
-            "gIt.ExE branch --delete feature",
+        // #509: both sides of the legacy-id link name real rules of the pack,
+        // so a rename cannot silently turn the compatibility table into a
+        // no-op.
+        let names: HashSet<_> = pack
+            .destructive_patterns
+            .iter()
+            .filter_map(|pattern| pattern.name)
+            .collect();
+        assert!(names.contains("branch-delete"));
+        for legacy in legacy_rule_names("core.git", "branch-delete") {
+            assert!(names.contains(legacy), "legacy id {legacy} must exist");
+        }
+        assert_eq!(
+            legacy_rule_names("core.git", "branch-delete"),
+            &["branch-force-delete"]
+        );
+        assert!(legacy_rule_names("core.git", "branch-force-delete").is_empty());
+
+        for (command, rule) in [
+            ("git branch -d feature", "branch-delete"),
+            ("git branch --del feature", "branch-delete"),
+            ("git branch -M old existing", "branch-force-delete"),
+            ("git branch -D feature", "branch-force-delete"),
+            ("git branch --delete --force feature", "branch-force-delete"),
+            ("git branch --no-format -d feature", "branch-delete"),
+            ("gIt.ExE branch --delete feature", "branch-delete"),
         ] {
             let pack_match = pack.check(command).expect("pack must deny");
             let registry_match = REGISTRY.check_command(command, &enabled);
             assert!(registry_match.blocked, "registry must deny {command:?}");
-            assert_eq!(pack_match.name, Some("branch-force-delete"));
+            assert_eq!(pack_match.name, Some(rule), "{command:?}");
             assert_eq!(
                 registry_match.pattern_name.as_deref(),
-                Some("branch-force-delete")
+                Some(rule),
+                "{command:?}"
             );
         }
 

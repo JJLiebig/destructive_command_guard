@@ -416,7 +416,7 @@ function Write-JsonFileNoBom {
   $dir = Split-Path -Parent $Path
   $tmp = Join-Path $dir (".dcg-tmp-" + [System.Guid]::NewGuid().ToString("N"))
   Write-Utf8NoBomText -Path $tmp -Text $json
-  Move-Item -Force -Path $tmp -Destination $Path
+  Move-Item -Force -LiteralPath $tmp -Destination $Path
 }
 
 # Shared create-or-merge for a Claude-Code-style hooks file. Ensures
@@ -438,7 +438,7 @@ function Merge-AgentHookFile {
     [string[]]$OwnedMatchers = @($Matcher)
   )
 
-  if (-not (Test-Path $HooksFile -PathType Leaf)) {
+  if (-not (Test-Path -LiteralPath $HooksFile -PathType Leaf)) {
     $innerHooks = [pscustomobject][ordered]@{}
     Set-ObjectPropertyValue $innerHooks $Event @(
       [pscustomobject][ordered]@{ matcher = $Matcher; hooks = @($DcgHook) }
@@ -449,7 +449,7 @@ function Merge-AgentHookFile {
   }
 
   try {
-    $config = Get-Content -Raw -Path $HooksFile | ConvertFrom-Json
+    $config = Get-Content -Raw -LiteralPath $HooksFile | ConvertFrom-Json
   } catch {
     throw "$Label is invalid JSON; leaving it unchanged: $HooksFile"
   }
@@ -569,22 +569,45 @@ function Configure-CodexHook {
   Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
 }
 
-# Configure Claude Code's PreToolUse hook for both native shell tools in
-# ~/.claude/settings.json. The hook itself runs in PowerShell so an absolute
+# Resolve only Claude Code's user configuration. Other agents' Claude-compatible
+# settings remain at their own locations, including Grok's ~/.claude fallback.
+# Empty means the default; whitespace and shell metacharacters are literal path
+# content. Do not evaluate the environment variable as PowerShell code.
+function Get-ClaudeConfigDir {
+  param([string]$HomeDir = $HOME)
+
+  $configDir = $env:CLAUDE_CONFIG_DIR
+  if ([string]::IsNullOrEmpty($configDir)) {
+    $configDir = Join-Path $HomeDir '.claude'
+  } elseif ($configDir -eq '~') {
+    $configDir = $HomeDir
+  } elseif ($configDir.StartsWith('~/') -or $configDir.StartsWith('~\')) {
+    $configDir = Join-Path $HomeDir $configDir.Substring(2)
+  }
+  if (-not (Split-Path -Path $configDir -IsAbsolute)) {
+    $configDir = Join-Path (Get-Location).ProviderPath $configDir
+  }
+  $configDir
+}
+
+# Configure Claude Code's PreToolUse hook for Bash, PowerShell, and Monitor in
+# the active configuration directory. The hook itself runs in PowerShell so an absolute
 # Windows path is not reinterpreted by Git Bash (#232).
-# Configures when ~/.claude exists or `claude` is on PATH (or always under -Force,
-# used by -EasyMode). Returns "created" | "already" | "merged" | "skipped".
+# Configures when CLAUDE_CONFIG_DIR is set, the active directory exists, or
+# `claude` is on PATH (or always under -Force, used by -EasyMode).
+# Returns "created" | "already" | "merged" | "skipped".
 function Configure-ClaudeHook {
   param([string]$DcgPath, [switch]$Force, [string]$HomeDir = $HOME)
 
-  $claudeDir = Join-Path $HomeDir ".claude"
+  $claudeDir = Get-ClaudeConfigDir -HomeDir $HomeDir
   $settingsFile = Join-Path $claudeDir "settings.json"
-  $claudeInstalled = (Test-Path $claudeDir -PathType Container) -or
+  $claudeInstalled = (-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or
+    (Test-Path -LiteralPath $claudeDir -PathType Container) -or
     ($null -ne (Get-Command claude -ErrorAction SilentlyContinue))
 
   if (-not $claudeInstalled -and -not $Force) { return "skipped" }
 
-  if (-not (Test-Path $claudeDir -PathType Container)) {
+  if (-not (Test-Path -LiteralPath $claudeDir -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $claudeDir | Out-Null
   }
 
@@ -594,7 +617,7 @@ function Configure-ClaudeHook {
     command = "& '$escapedDcgPath'"
     shell = "powershell"
   }
-  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash|PowerShell" -Label "Claude settings.json" -OwnedMatchers @("Bash", "Bash|PowerShell")
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash|PowerShell|Monitor" -Label "Claude settings.json" -OwnedMatchers @("Bash", "Bash|PowerShell", "Bash|PowerShell|Monitor")
 }
 
 # Configure Gemini CLI's BeforeTool / run_shell_command hook in
@@ -726,20 +749,20 @@ function Test-PredecessorHookCommand {
 }
 
 # Remove the legacy `git_safety_guard` Python predecessor: strip ONLY its hook
-# entries from ~/.claude/settings.json (preserving the modern dcg hook and any
-# coexisting hooks) and delete its script under ~/.claude/hooks. Returns $true if
+# entries from the active Claude settings (preserving the modern dcg hook and any
+# coexisting hooks) and delete its script under that directory's hooks. Returns $true if
 # anything was removed. Safe to call before Configure-ClaudeHook so a migrating
 # user never runs both the old and new hooks.
 function Remove-DcgPredecessor {
   param([string]$HomeDir = $HOME)
 
   $removed = $false
-  $claudeDir = Join-Path $HomeDir ".claude"
+  $claudeDir = Get-ClaudeConfigDir -HomeDir $HomeDir
   $settingsFile = Join-Path $claudeDir "settings.json"
 
-  if (Test-Path $settingsFile -PathType Leaf) {
+  if (Test-Path -LiteralPath $settingsFile -PathType Leaf) {
     $config = $null
-    try { $config = Get-Content -Raw -Path $settingsFile | ConvertFrom-Json } catch { $config = $null }
+    try { $config = Get-Content -Raw -LiteralPath $settingsFile | ConvertFrom-Json } catch { $config = $null }
     if ($null -ne $config) {
       $hooks = Get-ObjectPropertyValue $config "hooks"
       if ($null -ne $hooks) {
@@ -767,12 +790,12 @@ function Remove-DcgPredecessor {
   }
 
   $predScript = Join-Path (Join-Path $claudeDir "hooks") "git_safety_guard.py"
-  if (Test-Path $predScript -PathType Leaf) {
-    Remove-Item -Force $predScript -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $predScript -PathType Leaf) {
+    Remove-Item -Force -LiteralPath $predScript -ErrorAction SilentlyContinue
     $removed = $true
     $hookDir = Split-Path -Parent $predScript
-    if ((Test-Path $hookDir) -and -not (Get-ChildItem -Path $hookDir -Force)) {
-      Remove-Item -Force $hookDir -ErrorAction SilentlyContinue
+    if ((Test-Path -LiteralPath $hookDir) -and -not (Get-ChildItem -LiteralPath $hookDir -Force)) {
+      Remove-Item -Force -LiteralPath $hookDir -ErrorAction SilentlyContinue
     }
   }
 
@@ -791,9 +814,17 @@ function Remove-DcgPredecessor {
 # (DCG_PROFILE_CHECK_BLOCK) is pinned to this one by a test.
 $script:DcgProfileCheckMarker = "# dcg: warn if the Claude Code hook was silently removed"
 $script:DcgProfileCheckBlock = @'
-if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+if ((Get-Command dcg -ErrorAction SilentlyContinue) -and
+    ((-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or
+     (Test-Path -LiteralPath (Join-Path (Join-Path $HOME '.claude') 'settings.json') -PathType Leaf))) {
   try {
-    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgClaudeDir = $env:CLAUDE_CONFIG_DIR
+    if ([string]::IsNullOrEmpty($dcgClaudeDir)) { $dcgClaudeDir = Join-Path $HOME '.claude' }
+    elseif ($dcgClaudeDir -eq '~') { $dcgClaudeDir = $HOME }
+    elseif ($dcgClaudeDir.StartsWith('~/') -or $dcgClaudeDir.StartsWith('~\')) { $dcgClaudeDir = Join-Path $HOME $dcgClaudeDir.Substring(2) }
+    if (-not (Split-Path -Path $dcgClaudeDir -IsAbsolute)) { $dcgClaudeDir = Join-Path (Get-Location).ProviderPath $dcgClaudeDir }
+    $dcgSettings = Join-Path $dcgClaudeDir 'settings.json'
+    $dcgCfg = if (Test-Path -LiteralPath $dcgSettings -PathType Leaf) { Get-Content -Raw -LiteralPath $dcgSettings | ConvertFrom-Json } else { $null }
     $dcgHas = $false
     foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
       foreach ($dcgH in @($dcgE.hooks)) {
@@ -804,7 +835,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
       }
     }
-    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+    if (-not $dcgHas) { Write-Host "[dcg] Hook missing from $dcgSettings - run: dcg install" -ForegroundColor Yellow }
   } catch { }
 }
 '@
@@ -824,7 +855,7 @@ function Repair-DcgProfileCheckContent {
 }
 
 # Append a guarded check to the user's PowerShell profile that warns, on each new
-# session, if the dcg PreToolUse hook has gone missing from ~/.claude/settings.json
+# session, if the dcg PreToolUse hook has gone missing from the active Claude settings
 # (Claude Code can silently drop it when it rewrites settings). Idempotent
 # (marker-guarded), and self-repairing: a marker whose block text differs from
 # the current one (e.g. the pre-#282 naive path split that warned on every
@@ -1049,7 +1080,18 @@ function Get-CursorBridgeContent {
   # translates Cursor's {command, cwd} payload into dcg's Bash-hook shape, pipes
   # it to dcg.exe, and maps dcg's permissionDecision back to Cursor's
   # {permission, continue, userMessage, ...} response. Pure PowerShell — no Python
-  # bridge (which is fragile on Windows). Fail-open (allow) on any error.
+  # bridge (which is fragile on Windows).
+  #
+  # Fails CLOSED (#517): a payload it cannot read, and a dcg that ran but gave
+  # no verdict (killed, timed out, non-zero exit, no or unreadable answer), are
+  # answered with deny unless DCG_BRIDGE_CRASH_DECISION=allow. Only a dcg that
+  # cannot be started at all fails open, so a broken install does not block
+  # every command. Bytes are handled explicitly: stdin is read raw and decoded
+  # as UTF-8 after dropping a BOM (cursor-agent sends one, and Windows
+  # PowerShell 5.1 decodes [Console]::In with the OEM code page, so the BOM
+  # became junk that broke the JSON), dcg gets UTF-8 on its stdin rather than
+  # $OutputEncoding (ASCII under 5.1, which turned non-ASCII into '?'), and the
+  # answer to Cursor is written as UTF-8.
   param([string]$DcgPath)
   $escaped = $DcgPath.Replace("'", "''")
   $header = "# dcg-cursor-hook: generated by dcg installer (pure PowerShell bridge; no interpreter dependency)`n`$DcgBinFallback = '$escaped'`n"
@@ -1057,7 +1099,13 @@ function Get-CursorBridgeContent {
 $ErrorActionPreference = 'SilentlyContinue'
 $DcgBin = $env:DCG_BIN
 if ([string]::IsNullOrEmpty($DcgBin)) { $DcgBin = $DcgBinFallback }
-function Write-CursorOut($o) { [Console]::Out.Write(($o | ConvertTo-Json -Compress)) }
+$Utf8 = New-Object System.Text.UTF8Encoding $false
+function Write-CursorOut($o) {
+  $bytes = $Utf8.GetBytes(($o | ConvertTo-Json -Compress))
+  $stdout = [Console]::OpenStandardOutput()
+  $stdout.Write($bytes, 0, $bytes.Length)
+  $stdout.Flush()
+}
 function Send-Allow {
   Write-CursorOut @{ permission = 'allow'; continue = $true; userMessage = ''; agentMessage = ''; user_message = ''; agent_message = '' }
 }
@@ -1069,23 +1117,98 @@ function Send-Deny($r) {
 function Send-Ask($r) {
   Write-CursorOut @{ permission = 'ask'; continue = $true; userMessage = $r; agentMessage = $r; user_message = $r; agent_message = $r }
 }
-try { $raw = [Console]::In.ReadToEnd() } catch { Send-Allow; exit 0 }
-if ([string]::IsNullOrWhiteSpace($raw)) { Send-Allow; exit 0 }
-try { $payload = $raw | ConvertFrom-Json } catch { Send-Allow; exit 0 }
+# No verdict is not an allow: block, unless the operator opted out with
+# DCG_BRIDGE_CRASH_DECISION=allow.
+function Send-NoVerdict($detail) {
+  $setting = [string]$env:DCG_BRIDGE_CRASH_DECISION
+  if ($setting.Trim().ToLowerInvariant() -eq 'allow') {
+    [Console]::Error.WriteLine("[dcg] Cursor bridge got no verdict ($detail); allowed because DCG_BRIDGE_CRASH_DECISION=allow")
+    Send-Allow
+    return
+  }
+  Send-Deny "Blocked by dcg: the command could not be verified ($detail). Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails."
+}
+$bypass = [string]$env:DCG_BYPASS
+if (@('1', 'true', 'yes', 'y', 'on') -contains $bypass.Trim().ToLowerInvariant()) { Send-Allow; exit 0 }
+
+try {
+  $buffer = New-Object System.IO.MemoryStream
+  [Console]::OpenStandardInput().CopyTo($buffer)
+  $bytes = $buffer.ToArray()
+  if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+    $raw = $Utf8.GetString($bytes, 3, $bytes.Length - 3)
+  } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+    $raw = [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+  } else {
+    $raw = $Utf8.GetString($bytes)
+  }
+} catch { Send-NoVerdict 'the hook payload could not be read'; exit 0 }
+if ([string]::IsNullOrWhiteSpace($raw)) { Send-NoVerdict 'the hook payload was empty'; exit 0 }
+try { $payload = $raw | ConvertFrom-Json -ErrorAction Stop } catch { Send-NoVerdict 'the hook payload was not JSON'; exit 0 }
+if (-not ($payload -is [System.Management.Automation.PSCustomObject])) { Send-NoVerdict 'the hook payload was not a JSON object'; exit 0 }
 $command = [string]$payload.command
 if ([string]::IsNullOrEmpty($command)) { Send-Allow; exit 0 }
-if ($payload.cwd) { Set-Location -LiteralPath $payload.cwd -ErrorAction SilentlyContinue }
-$hookInput = @{ tool_name = 'Bash'; tool_input = @{ command = $command } } | ConvertTo-Json -Compress
+
+$app = Get-Command -Name $DcgBin -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $app) {
+  # Could not start dcg at all: fail open so a broken install does not block
+  # every command, and say so.
+  [Console]::Error.WriteLine("[dcg] Cursor bridge could not run dcg at '$DcgBin'; command allowed unchecked")
+  Send-Allow
+  exit 0
+}
+
+$hookInput = @{ tool_name = 'Bash'; tool_input = @{ command = $command }; dcg_explicit_verdict = $true } | ConvertTo-Json -Compress
 $env:CURSOR_IDE = '1'
-try { $out = ($hookInput | & $DcgBin 2>$null | Out-String).Trim() } catch { Send-Allow; exit 0 }
-if ([string]::IsNullOrEmpty($out)) { Send-Allow; exit 0 }
-try { $dcg = $out | ConvertFrom-Json } catch { Send-Allow; exit 0 }
-$decision = $dcg.hookSpecificOutput.permissionDecision
-$reason = $dcg.hookSpecificOutput.permissionDecisionReason
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $app.Path
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.StandardOutputEncoding = $Utf8
+$psi.StandardErrorEncoding = $Utf8
+$cwd = [string]$payload.cwd
+if ($cwd -and (Test-Path -LiteralPath $cwd -PathType Container)) { $psi.WorkingDirectory = $cwd }
+try { $proc = [System.Diagnostics.Process]::Start($psi) } catch {
+  [Console]::Error.WriteLine("[dcg] Cursor bridge could not run dcg at '$DcgBin'; command allowed unchecked")
+  Send-Allow
+  exit 0
+}
+$stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+$stderrTask = $proc.StandardError.ReadToEndAsync()
+try {
+  $inputBytes = $Utf8.GetBytes($hookInput)
+  $proc.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)
+  $proc.StandardInput.BaseStream.Flush()
+} catch {}
+try { $proc.StandardInput.Close() } catch {}
+if (-not $proc.WaitForExit(30000)) {
+  try { $proc.Kill() } catch {}
+  Send-NoVerdict 'dcg timed out'
+  exit 0
+}
+$proc.WaitForExit()
+$out = ([string]$stdoutTask.Result).Trim()
+$exitCode = $proc.ExitCode
+
+$dcg = $null
+if ($out) { try { $dcg = $out | ConvertFrom-Json -ErrorAction Stop } catch { $dcg = $null } }
+$decision = $null
+$reason = $null
+if ($null -ne $dcg -and $null -ne $dcg.hookSpecificOutput) {
+  $decision = $dcg.hookSpecificOutput.permissionDecision
+  $reason = $dcg.hookSpecificOutput.permissionDecisionReason
+}
 if ([string]::IsNullOrEmpty($reason)) { $reason = 'Blocked by dcg' }
-if ($decision -eq 'deny') { Send-Deny $reason }
-elseif ($decision -eq 'ask') { Send-Ask $reason }
-else { Send-Allow }
+# A blocking verdict stands whatever happened to the process afterwards.
+if ($decision -eq 'deny') { Send-Deny $reason; exit 0 }
+if ($decision -eq 'ask') { Send-Ask $reason; exit 0 }
+if ($exitCode -ne 0) { Send-NoVerdict "dcg exited $exitCode"; exit 0 }
+if ($null -ne $dcg -and $dcg.dcg_verdict -eq 'allow') { Send-Allow; exit 0 }
+if (-not $out) { Send-NoVerdict 'dcg exited 0 with nothing on stdout'; exit 0 }
+Send-NoVerdict 'dcg stdout was not a verdict'
 exit 0
 '@
   $header + $body
@@ -1307,7 +1430,7 @@ function Configure-HermesHook {
 #
 #   1. The matcher is lowercase "bash|powershell". A simple matcher string is
 #      an EXACT match (with "|"/"," separating alternatives) against the tool
-#      name, so Claude's "Bash|PowerShell" would match neither shell tool.
+#      name, so Claude's "Bash|PowerShell|Monitor" would match neither shell tool.
 #   2. Only documented handler fields are emitted: type, command, timeout. In
 #      particular there is NO `shell` field (which the Claude entry uses); the
 #      command path is quoted instead — shell-form hooks run through cmd.exe on
@@ -1436,26 +1559,54 @@ function Invoke-DcgMinisignVerification {
   Write-Ok "Signature verified (minisign key $minisignKeyId)"
 }
 
-function Test-DcgPatchedCosignVersion {
-  # CVE-2026-22703 is repaired in 2.6.2 and 3.0.4. Reject unknown/development
-  # version strings rather than trusting a potentially vulnerable verifier.
-  param([string]$VersionJson)
+function Get-DcgCosignReportedVersion {
+  # The version string cosign reports: `gitVersion` from `cosign version
+  # --json`, or the `GitVersion:` line of the plain-text output. $null when
+  # neither is present.
+  param([string]$VersionOutput)
 
-  if ($VersionJson -notmatch '"gitVersion"\s*:\s*"v([0-9]+)\.([0-9]+)\.([0-9]+)"') {
+  if ($VersionOutput -match '"gitVersion"\s*:\s*"([^"]*)"') {
+    return $Matches[1]
+  }
+  if ($VersionOutput -match '(?m)^\s*GitVersion:\s*(\S+)\s*$') {
+    return $Matches[1]
+  }
+  return $null
+}
+
+function Test-DcgPatchedCosignVersion {
+  # CVE-2026-22703 is repaired in 2.6.2 and 3.0.4. The reported version is
+  # read as SemVer: optional `v`, MAJOR.MINOR.PATCH, optional `-pre.release`,
+  # optional `+build`. Build metadata does not affect precedence (distro
+  # builds report e.g. `v3.1.3+dirty`, GH #505) and is ignored. A pre-release
+  # precedes its release, so it counts only when its core version is strictly
+  # above the floor. Unknown/development strings are rejected rather than
+  # trusting a potentially vulnerable verifier.
+  param([string]$VersionOutput)
+
+  $reported = Get-DcgCosignReportedVersion -VersionOutput $VersionOutput
+  if (-not $reported) { return $false }
+  if ($reported -cnotmatch '^v?([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
     return $false
   }
   $major = [int]$Matches[1]
   $minor = [int]$Matches[2]
   $patch = [int]$Matches[3]
+  $isPrerelease = [bool]$Matches[4]
 
   if ($major -gt 3) { return $true }
   if ($major -eq 3) {
-    return (($minor -gt 0) -or (($minor -eq 0) -and ($patch -ge 4)))
+    $floorMinor = 0
+    $floorPatch = 4
+  } elseif ($major -eq 2) {
+    $floorMinor = 6
+    $floorPatch = 2
+  } else {
+    return $false
   }
-  if ($major -eq 2) {
-    return (($minor -gt 6) -or (($minor -eq 6) -and ($patch -ge 2)))
-  }
-  return $false
+  if ($minor -ne $floorMinor) { return ($minor -gt $floorMinor) }
+  if ($isPrerelease) { return ($patch -gt $floorPatch) }
+  return ($patch -ge $floorPatch)
 }
 
 function Invoke-DcgSigstoreVerification {
@@ -1486,9 +1637,24 @@ function Invoke-DcgSigstoreVerification {
     return
   }
 
-  $versionJson = (& $cosign.Source version --json 2>&1 | Out-String)
-  if (($LASTEXITCODE -ne 0) -or (-not (Test-DcgPatchedCosignVersion -VersionJson $versionJson))) {
-    Write-Warn "cosign is missing required bundle-verification security fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
+  # Native stderr must not become a terminating error under Windows
+  # PowerShell 5.1; the exit code and the parsed version decide.
+  $savedErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $versionOutput = (& $cosign.Source version --json 2>&1 | Out-String)
+    if (($LASTEXITCODE -ne 0) -or (-not (Get-DcgCosignReportedVersion -VersionOutput $versionOutput))) {
+      # Builds without usable JSON still print a `GitVersion:` line.
+      $versionOutput = (& $cosign.Source version 2>&1 | Out-String)
+      if ($LASTEXITCODE -ne 0) { $versionOutput = "" }
+    }
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  if (-not (Test-DcgPatchedCosignVersion -VersionOutput $versionOutput)) {
+    $reportedVersion = Get-DcgCosignReportedVersion -VersionOutput $versionOutput
+    if (-not $reportedVersion) { $reportedVersion = "unknown" }
+    Write-Warn "cosign reports version '$reportedVersion', which is not a release known to carry the CVE-2026-22703 bundle-verification fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
     return
   }
 
@@ -1858,7 +2024,8 @@ function Detect-Agents {
     (Join-Path $HomeDir '.reasonix')
   ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
   [ordered]@{
-    'Claude'  = ((_dir '.claude')  -or (_has 'claude'))
+    'Claude'  = ((-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or
+      (Test-Path -LiteralPath (Get-ClaudeConfigDir -HomeDir $HomeDir) -PathType Container -ErrorAction SilentlyContinue) -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
     'Gemini'  = ((_dir '.gemini')  -or (_has 'gemini'))
     'Cursor'  = ((_dir '.cursor')  -or (_has 'cursor'))
@@ -1921,7 +2088,8 @@ Options:
   -Help             Print this help and exit
 
 Configured agents (when detected, or with -Force/-EasyMode):
-  Claude Code  (~/.claude/settings.json)      Codex CLI   (~/.codex/hooks.json)
+  Claude Code  (CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json)
+  Codex CLI    (~/.codex/hooks.json)
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (HERMES_HOME, else %LOCALAPPDATA%\hermes\config.yaml)
   Posit Assistant (~/.posit/assistant/settings.json)
@@ -2205,15 +2373,15 @@ try {
   Write-Warn "Could not remove legacy predecessor: $_"
 }
 
-# Configure Claude Code by merging into ~/.claude/settings.json. Under -EasyMode,
-# force-configure even if ~/.claude does not exist yet; otherwise only when Claude
-# Code is detected.
+# Configure Claude Code by merging into its active user settings. An explicit
+# CLAUDE_CONFIG_DIR also enables configuration when that directory is not created yet.
 try {
+  $claudeSettings = Join-Path (Get-ClaudeConfigDir) 'settings.json'
   $claudeStatus = Configure-ClaudeHook -DcgPath $dcgExe -Force:$forceConfig
   switch ($claudeStatus) {
-    "created" { Write-Ok "Created Claude Code hook at $HOME\.claude\settings.json" }
-    "merged" { Write-Ok "Added Claude Code hook to $HOME\.claude\settings.json" }
-    "already" { Write-Ok "Claude Code hook already configured" }
+    "created" { Write-Ok "Created Claude Code hook at $claudeSettings" }
+    "merged" { Write-Ok "Added Claude Code hook to $claudeSettings" }
+    "already" { Write-Ok "Claude Code hook already configured at $claudeSettings" }
     "skipped" { Write-Info "Claude Code not detected; re-run with -EasyMode to configure it anyway" }
     default { Write-Warn "Claude Code hook status: $claudeStatus" }
   }

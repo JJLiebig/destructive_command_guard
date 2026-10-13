@@ -62,6 +62,7 @@ These patterns match potentially destructive commands:
 | `push-force-long` | Force push can destroy remote history. Use --force-with-lease if necessary. | critical |
 | `push-force-short` | Force push (-f) can destroy remote history. Use --force-with-lease if necessary. | critical |
 | `push-force-refspec` | A '+' refspec force-pushes that ref and can destroy remote history. Use --force-with-lease if necessary. | critical |
+| `branch-delete` | git branch deletion requires explicit user approval. | high |
 | `branch-force-delete` | git branch deletion or forced ref updates require explicit user approval. | high |
 | `stash-drop` | git stash drop deletes a single stash. Recoverable via `git fsck` (unreachable objects). | medium |
 | `stash-clear` | git stash clear permanently deletes ALL stashed changes. | critical |
@@ -236,6 +237,7 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `sed-exec-unverified` | GNU sed executes shell input that dcg cannot statically verify. | high |
+| `tar-exec-unverified` | GNU tar executes a helper whose command or executable input dcg cannot statically verify. | high |
 | `cp-sensitive-then-delete` | archive copy of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS. | critical |
 | `ln-symlink-sensitive-then-delete` | symlink from a sensitive path into temp followed by forced recursive deletion can traverse and destroy the target. EXTREMELY DANGEROUS. | critical |
 | `rsync-sensitive-then-delete` | rsync archive of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS. | critical |

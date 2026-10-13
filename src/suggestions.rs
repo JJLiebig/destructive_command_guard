@@ -374,6 +374,26 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
     );
 
     m.insert(
+        "core.git:branch-delete",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Confirm Git considers the branch merged with `git branch --merged`",
+            )
+            .with_command("git branch --merged"),
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review branch tips and upstream tracking state with `git branch -vv`",
+            )
+            .with_command("git branch -vv"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Ask the user for explicit approval before deleting a branch",
+            ),
+        ],
+    );
+
+    m.insert(
         "core.git:branch-force-delete",
         vec![
             Suggestion::new(
@@ -741,6 +761,23 @@ const MOVED_PATH_SUGGESTION_RULES: &[&str] = &[
 
 /// Register suggestions for core.filesystem pack rules.
 fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) {
+    m.insert(
+        "core.filesystem:tar-exec-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List the archive with `tar -tvf archive.tar` and read the exact helper command tar would run before running it",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Drop the helper option (`--checkpoint-action=exec=`, `--to-command`, `-I`, `--info-script`, `--rmt-command`) and run any reviewed command as a separate step",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Use a literal, bounded helper command; archive bytes are not verified shell or database input",
+            ),
+        ],
+    );
     m.insert(
         "core.filesystem:sed-exec-unverified",
         vec![
@@ -2331,6 +2368,7 @@ mod tests {
             "core.git:push-force-short",
             "core.git:checkout-discard",
             "core.git:checkout-ref-discard",
+            "core.git:branch-delete",
             "core.git:branch-force-delete",
             "core.git:restore-worktree",
             "core.git:restore-worktree-explicit",
@@ -2352,6 +2390,7 @@ mod tests {
         // These must match actual pattern names from src/packs/core/filesystem.rs
         let expected_rules = [
             "core.filesystem:sed-exec-unverified",
+            "core.filesystem:tar-exec-unverified",
             "core.filesystem:rm-rf-root-home",
             "core.filesystem:rm-r-f-separate-root-home",
             "core.filesystem:rm-recursive-force-root-home",

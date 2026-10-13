@@ -22,6 +22,7 @@ fn dcg_binary() -> PathBuf {
 
 struct Lab {
     root: PathBuf,
+    packs: &'static str,
 }
 
 impl Lab {
@@ -38,7 +39,15 @@ impl Lab {
         std::fs::create_dir_all(root.join("home")).unwrap();
         std::fs::create_dir_all(root.join("xdg")).unwrap();
         std::fs::create_dir_all(root.join("work")).unwrap();
-        Self { root }
+        Self {
+            root,
+            packs: "core.git,core.filesystem",
+        }
+    }
+
+    fn with_database_packs(mut self) -> Self {
+        self.packs = "core.git,core.filesystem,database.postgresql,database.redis";
+        self
     }
 
     /// Bare `dcg` hook mode. Returns (stdout, stderr).
@@ -54,7 +63,7 @@ impl Lab {
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env("DCG_HOOK_TIMEOUT_MS", "5000")
-            .env("DCG_PACKS", "core.git,core.filesystem")
+            .env("DCG_PACKS", self.packs)
             .current_dir(self.root.join("work"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -66,6 +75,11 @@ impl Lab {
             serde_json::to_writer(stdin, &input).unwrap();
         }
         let output = child.wait_with_output().expect("wait dcg");
+        assert!(
+            output.status.success(),
+            "hook exit for {command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         (
             String::from_utf8_lossy(&output.stdout).to_string(),
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -90,6 +104,23 @@ impl Lab {
             stdout.trim().is_empty(),
             "expected ALLOW for:\n{command}\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}"
         );
+    }
+
+    fn assert_denial(&self, command: &str, expected_rule: Option<&str>) {
+        let (stdout, stderr) = self.hook(command);
+        let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+            panic!("expected hook denial for {command:?}: {error}: {stdout}\n{stderr}")
+        });
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{command:?}: {json}"
+        );
+        if let Some(rule) = expected_rule {
+            assert_eq!(
+                json["hookSpecificOutput"]["ruleId"], rule,
+                "{command:?}: {json}"
+            );
+        }
     }
 }
 
@@ -296,4 +327,196 @@ fn heredoc_piped_into_a_data_consumer_stays_data() {
     ] {
         lab.assert_allowed(command);
     }
+}
+
+#[test]
+fn heredoc_database_pipelines_attribute_plain_cat_source() {
+    let lab = Lab::new("database-heredoc-source").with_database_packs();
+    for command in [
+        "cat <<'SQL' | psql app\nSELECT 1;\nSQL",
+        "cat - <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+        "cat <<'SQL' | cat | psql -X app\nSELECT 1;\nSQL",
+        "cat <<'REDIS' | redis-cli\nPING\nREDIS",
+        "cat <<'REDIS' | cat | redis-cli\nGET example\nREDIS",
+        // The producer's AST ranges are relative to the original command,
+        // including harmless earlier statements, not to a sliced header.
+        "true; cat <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+        "printf ready >/dev/null; cat <<'REDIS' | cat | redis-cli\nPING\nREDIS",
+    ] {
+        lab.assert_allowed(command);
+    }
+}
+
+#[test]
+fn heredoc_database_pipelines_still_deny_destructive_source() {
+    let lab = Lab::new("database-heredoc-destructive").with_database_packs();
+    for (command, rule) in [
+        (
+            "cat <<'SQL' | psql -X app\nDROP TABLE users;\nSQL",
+            "database.postgresql:drop-table",
+        ),
+        (
+            "true; cat <<'SQL' | cat | psql -X app\nDROP TABLE users;\nSQL",
+            "database.postgresql:drop-table",
+        ),
+        (
+            "cat <<'REDIS' | redis-cli\nFLUSHALL\nREDIS",
+            "database.redis:flushall",
+        ),
+        (
+            "printf ready >/dev/null; cat <<'REDIS' | cat | redis-cli\nFLUSHALL\nREDIS",
+            "database.redis:flushall",
+        ),
+    ] {
+        lab.assert_denial(command, Some(rule));
+    }
+}
+
+#[test]
+fn heredoc_database_producers_require_one_unmodified_stdin_source() {
+    let lab = Lab::new("database-heredoc-provenance").with_database_packs();
+    for command in [
+        // Extra cat operands remain inputs on either side of the heredoc
+        // operator. A benign body must not hide the file's unknown bytes.
+        "cat extra.sql - <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+        "cat <<'SQL' extra.sql - | psql -X app\nSELECT 1;\nSQL",
+        // Neither a different producer nor a pipeline transform has the
+        // byte-for-byte proof that a plain cat stdin copy provides.
+        "sed 's/SELECT/DROP/' <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+        "cat <<'SQL' | sed 's/SELECT/DROP/' | psql -X app\nSELECT 1;\nSQL",
+        "(cat <<'SQL'\nSELECT 1;\nSQL\nprintf '%s\\n' 'DROP TABLE users;'\n) | psql -X app",
+        "cat <<'FIRST' <<'SECOND' | psql -X app\nSELECT 1;\nFIRST\nSELECT 2;\nSECOND",
+        // Inspect the original command when checking producer lookup; a
+        // sliced producer would lose this earlier function definition.
+        "cat() { printf '%s\\n' 'DROP TABLE users;'; }; cat <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+    ] {
+        lab.assert_denial(command, Some("database.postgresql:stdin-unverified"));
+    }
+    lab.assert_denial(
+        "cat extra.redis - <<'REDIS' | redis-cli\nPING\nREDIS",
+        Some("database.redis:stdin-unverified"),
+    );
+}
+
+#[test]
+fn quoted_heredoc_pipe_preserves_the_interpreters_source_language() {
+    let lab = Lab::new("quoted-interpreter-source");
+    for command in [
+        r#"cat <<'PY' | python3 -
+import re
+a = 'it\'s'
+b = '#'
+c = re.compile(r"^")
+message = '$(printf harmless)'
+print(message)
+PY"#,
+        r#"cat <<'JS' | node -
+const format = (value) => `# ${value} ^`;
+console.log(format("safe"));
+JS"#,
+        "cat <<'RB' | ruby\nputs '$(printf harmless)'\nRB",
+        "cat <<'PL' | perl\nprint '$(printf harmless)';\nPL",
+        "cat <<'PHP' | php\n<?php echo '$(printf harmless)'; ?>\nPHP",
+        // A literal -c program uses the pipe as data rather than program text.
+        "cat <<'PY' | python3 -c 'print(\"safe\")'\nrm -rf /home/alice/project\nPY",
+    ] {
+        lab.assert_allowed(command);
+    }
+}
+
+#[test]
+fn quoted_interpreter_pipes_still_evaluate_destructive_language_sinks() {
+    let lab = Lab::new("quoted-interpreter-sinks");
+    for (command, rule) in [
+        (
+            "cat <<'PY' | python3 -\nimport shutil\nshutil.rmtree(\"/home/alice/project\")\nPY",
+            "heredoc.python:shutil_rmtree",
+        ),
+        (
+            "cat <<'JS' | node -\nrequire(\"child_process\").execSync(\"git reset --hard\");\nJS",
+            "heredoc.javascript:exec_sink.git_reset_hard",
+        ),
+        (
+            "cat <<'RB' | ruby\nsystem(\"git reset --hard\")\nRB",
+            "heredoc.ruby:system.git_reset_hard",
+        ),
+        (
+            "cat <<'PL' | perl\nsystem(\"git reset --hard\");\nPL",
+            "heredoc.perl:system.git_reset_hard",
+        ),
+        (
+            "cat <<'PHP' | php\n<?php system(\"git reset --hard\"); ?>\nPHP",
+            "heredoc.php:system.git_reset_hard",
+        ),
+        (
+            "cat <<'PY' | python3 -\nfrom os import system as run\nrun(\"rm -rf /home/alice/project\")\nPY",
+            "heredoc.python:exec_sink.rm_rf_catastrophic",
+        ),
+    ] {
+        lab.assert_denial(command, Some(rule));
+    }
+}
+
+#[test]
+fn interpreter_pipe_proofs_require_one_unmodified_stdin_source() {
+    let lab = Lab::new("interpreter-source-provenance");
+    for (command, rule) in [
+        // The heredoc is only one of cat's inputs. The other file is unknown.
+        (
+            "cat - injected.py <<'PY' | python3 -\nprint(\"safe\")\nPY",
+            None,
+        ),
+        (
+            "cat <<'PY' | sed s/safe/danger/ | python3 -\nimport shutil\nshutil.rmtree(\"/home/alice/project\")\nPY",
+            Some("heredoc.posix:pipeline-consumer"),
+        ),
+        (
+            "cat <<'PY' | env python3 -\nimport shutil\nshutil.rmtree(\"/home/alice/project\")\nPY",
+            Some("heredoc.python:shutil_rmtree"),
+        ),
+        // A visible function can make a nominal Python receiver run shell text.
+        (
+            "python3() { bash; }; cat <<'PY' | python3 -\nrm -rf /home/alice/project\nPY",
+            Some("core.filesystem:rm-rf-root-home"),
+        ),
+        // Rebinding the producer can replace an innocent heredoc entirely.
+        (
+            r#"cat() { printf '%s\n' 'import shutil; shutil.rmtree("/home/alice/project")'; }; cat <<'PY' | python3 -
+print("safe")
+PY"#,
+            None,
+        ),
+        // A group can append program text that is absent from the heredoc.
+        (
+            r#"(cat <<'PY'
+print("safe")
+PY
+printf '%s\n' 'import shutil; shutil.rmtree("/home/alice/project")'
+) | python3 -"#,
+            None,
+        ),
+        (
+            r#"(cat <<'JS'
+console.log("safe");
+JS
+printf '%s\n' 'require("child_process").execSync("git reset --hard");'
+) | node -"#,
+            None,
+        ),
+    ] {
+        lab.assert_denial(command, rule);
+    }
+}
+
+#[test]
+fn interpreter_pipe_source_masking_preserves_other_shell_execution() {
+    let lab = Lab::new("interpreter-pipe-shell-boundaries");
+    for command in [
+        "cat <<'SH' | sh\ngit reset --hard\nSH",
+        "cat <<'SH' | ssh host sh\ngit reset --hard\nSH",
+        "cat <<'JS' | node -\nconsole.log(`safe ^`);\nJS\ngit reset --hard",
+    ] {
+        lab.assert_denial(command, Some("core.git:reset-hard"));
+    }
+    lab.assert_denial("cat <<PY | python3 -\n$(rm -rf /etc)\nPY", None);
 }

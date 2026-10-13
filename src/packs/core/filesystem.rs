@@ -395,6 +395,12 @@ const POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME: &str = "powershell-remove-item-recu
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON: &str = "PowerShell Remove-Item (or an alias) with -Recurse permanently deletes an entire item tree without using the Recycle Bin.";
 const RM_PROTECTED_FILE_NAME: &str = "rm-protected-file";
 const RM_PROTECTED_FILE_REASON: &str = "rm on a protected credential or login-startup file is one-shot data destruction with no recovery. EXTREMELY DANGEROUS.";
+/// The same rule's reason when every protected target is inside a `.git`
+/// directory (#533): that is repository state, not a credential, so saying
+/// "credential or login-startup file" sent users looking for the wrong thing.
+/// The rule id, severity and decision are unchanged, so existing allowlist
+/// entries for `rm-protected-file` keep working.
+const RM_PROTECTED_GIT_INTERNAL_REASON: &str = "rm inside a .git directory deletes the repository's own state (index, refs, HEAD, config, hooks or objects), which git cannot rebuild. Requires human approval; for a stale index.lock, first confirm no git process is running in this repository.";
 
 // ============================================================================
 // Guidance for classifier-only rules (#348)
@@ -508,12 +514,20 @@ const RM_BARE_GLOB_EXPLANATION: &str = "A bare * (or ./*) handed to rm is expand
      rm -i *                          # interactive; needs a terminal - with stdin closed it deletes nothing and exits 0\n  \
      mv ./file /tmp/delete-me-<literal-timestamp>   # move aside instead of deleting";
 
-const RM_PROTECTED_FILE_EXPLANATION: &str = "This deletes a protected credential or login-startup file: an SSH or GPG key, a \
-     cloud or container credential, a shell startup file, or a system account \
-     file such as /etc/shadow or /etc/sudoers. Losing one of these is not a file \
-     you can rebuild from the repository - it is a locked-out account, a revoked \
-     deploy key, or a machine that no longer authenticates.\n\n\
+const RM_PROTECTED_FILE_EXPLANATION: &str = "This deletes a protected file: an SSH or GPG key, a \
+     cloud or container credential, a shell startup file, a system account \
+     file such as /etc/shadow or /etc/sudoers, or a file inside a repository's \
+     .git directory. Losing a credential is not a file you can rebuild from the \
+     repository - it is a locked-out account, a revoked deploy key, or a machine \
+     that no longer authenticates. Inside .git the files are the repository's own \
+     state (the index, refs, HEAD, config with its remotes and credential \
+     helpers, hooks and the object store), and git cannot rebuild them either.\n\n\
      There is NO recovery without backups.\n\n\
+     A stale .git/index.lock left behind by a crashed git process is the common \
+     legitimate case. Removing it while a git command is still running can \
+     corrupt the index, so first confirm that no git process is using this \
+     repository (for example `pgrep -fl git`), and get explicit human approval \
+     for the removal.\n\n\
      dcg already blocks every other single-file spelling of this - unlink, \
      shred -u, truncate -s 0 - and every embedded-language spelling. Plain rm was \
      the one that got through, because the rm rules all require a recursive flag \
@@ -915,6 +929,7 @@ fn parse_rm_interactive_mode(value: &str) -> Option<RmInteractiveMode> {
 pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
     let segments = crate::packs::split_command_segments(command);
     if segments.len() > 1 {
+        let stdin_context = RmStdinContext::new(command);
         let mut saw_allow = false;
         for segment in segments {
             let command_start = command.as_ptr() as usize;
@@ -922,7 +937,7 @@ pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
             let automated_stdin = segment_start
                 .checked_sub(command_start)
                 .is_some_and(|offset| {
-                    rm_segment_receives_automated_stdin(command, offset, ShellDialect::Posix)
+                    stdin_context.segment_receives_automated_stdin(offset, ShellDialect::Posix)
                 });
             match parse_rm_command_segment(segment, automated_stdin) {
                 RmParseDecision::Deny(hit) => return RmParseDecision::Deny(hit),
@@ -956,20 +971,59 @@ pub(crate) fn rm_segment_receives_automated_stdin(
     segment_start: usize,
     dialect: ShellDialect,
 ) -> bool {
-    let Some(prefix) = command.get(..segment_start) else {
-        return false;
-    };
-    let prefix = prefix.trim_end();
-    if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
-        return true;
+    RmStdinContext::new(command).segment_receives_automated_stdin(segment_start, dialect)
+}
+
+/// Source-wide prerequisites for the existing stdin provenance parsers.
+///
+/// A multiline command can contribute hundreds of segment queries. Re-splitting
+/// and tokenizing every preceding segment for each query is quadratic even when
+/// the command cannot contain a pipeline or an `exec` redirect. These facts are
+/// computed once from the exact source and shared by all of its segment queries;
+/// they do not classify a command, choose packs, or change either parser.
+pub(crate) struct RmStdinContext<'a> {
+    command: &'a str,
+    has_pipe: bool,
+    has_exec_stdin_redirect: bool,
+}
+
+impl<'a> RmStdinContext<'a> {
+    pub(crate) fn new(command: &'a str) -> Self {
+        Self {
+            command,
+            has_pipe: command.contains('|'),
+            has_exec_stdin_redirect: command.contains("exec") && command.contains('<'),
+        }
     }
 
-    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
-        return false;
-    }
+    pub(crate) fn segment_receives_automated_stdin(
+        &self,
+        segment_start: usize,
+        dialect: ShellDialect,
+    ) -> bool {
+        let Some(prefix) = self.command.get(..segment_start) else {
+            return false;
+        };
+        let prefix = prefix.trim_end();
+        if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
+            return true;
+        }
 
-    posix_pipeline_group_is_active(command, segment_start)
-        || prior_posix_exec_redirects_stdin(command, segment_start)
+        if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            return false;
+        }
+
+        // A group can acquire automated stdin only from a literal `|` byte.
+        // The exec parser recognizes an exact raw token basename after outer
+        // quote removal, so every token it accepts contains contiguous `exec`.
+        // Its stdin redirect grammar also requires a literal `<` byte.
+        // Quoted data and escapes may make either fact a false positive; the
+        // complete existing parser still resolves those cases. Neither fact
+        // can exclude a positive result from its respective parser.
+        (self.has_pipe && posix_pipeline_group_is_active(self.command, segment_start))
+            || (self.has_exec_stdin_redirect
+                && prior_posix_exec_redirects_stdin(self.command, segment_start))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1451,6 +1505,32 @@ fn parse_windows_rm_segment(
 /// Everything else is left alone, so a target the classifier cannot prove
 /// literal still declines there rather than here.
 fn windows_target_is_protected(target: &str) -> bool {
+    let candidate = windows_protected_candidate(target);
+    crate::packs::core::credential_files::may_name_protected_path(&candidate)
+        && crate::packs::core::credential_files::names_protected_file(&candidate)
+}
+
+/// The `rm-protected-file` reason for the Windows targets this rule denies
+/// (#533), judged on the same normalized spelling as
+/// [`windows_target_is_protected`]: the git-internals wording only when every
+/// one of them is inside `.git`.
+fn windows_rm_protected_files_reason<S: AsRef<str>>(protected_targets: &[S]) -> &'static str {
+    let git_only = !protected_targets.is_empty()
+        && protected_targets.iter().all(|target| {
+            crate::packs::core::credential_files::names_protected_git_internal(
+                &windows_protected_candidate(target.as_ref()),
+            )
+        });
+    if git_only {
+        RM_PROTECTED_GIT_INTERNAL_REASON
+    } else {
+        RM_PROTECTED_FILE_REASON
+    }
+}
+
+/// A Windows target rewritten for the POSIX protected-file classifier:
+/// backslashes as slashes and a leading Windows home alias as `$HOME`.
+fn windows_protected_candidate(target: &str) -> String {
     /// Windows home anchors, longest first so `%HOMEDRIVE%%HOMEPATH%` is not
     /// half-consumed by the `%HOMEPATH%` entry.
     const HOME_ALIASES: &[&str] = &[
@@ -1471,8 +1551,7 @@ fn windows_target_is_protected(target: &str) -> bool {
             break;
         }
     }
-    crate::packs::core::credential_files::may_name_protected_path(&candidate)
-        && crate::packs::core::credential_files::names_protected_file(&candidate)
+    candidate
 }
 
 /// A plain `del`/`erase` of a protected file, in the cmd dialect (#451).
@@ -1502,6 +1581,10 @@ fn parse_cmd_protected_file_segment(command: &str) -> RmParseDecision {
         return RmParseDecision::NoMatch;
     }
 
+    // Every protected target is collected (the decision is unchanged: any one
+    // denies) so the reason can say "credential" whenever any target is one
+    // (#533).
+    let mut protected_targets: Vec<String> = Vec::new();
     for word in words {
         // cmd switches are `/f`, `/q`, `/s`, … — a leading slash is an option
         // here, never a POSIX root.
@@ -1515,14 +1598,17 @@ fn parse_cmd_protected_file_segment(command: &str) -> RmParseDecision {
         if target.is_empty() || !windows_target_is_protected(target) {
             continue;
         }
-        return RmParseDecision::Deny(RmParseMatch {
-            pattern_name: RM_PROTECTED_FILE_NAME,
-            reason: RM_PROTECTED_FILE_REASON,
-            severity: Severity::Critical,
-            span: None,
-        });
+        protected_targets.push(target.to_string());
     }
-    RmParseDecision::NoMatch
+    if protected_targets.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: RM_PROTECTED_FILE_NAME,
+        reason: windows_rm_protected_files_reason(&protected_targets),
+        severity: Severity::Critical,
+        span: None,
+    })
 }
 
 /// `str::strip_prefix` with an ASCII case-insensitive comparison, because
@@ -1703,11 +1789,20 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         // `cd ~/.ssh && echo k > authorized_keys` (#480): the redirect target
         // is relative, so no keyword spells the protected path; the `cd` does.
         // The evaluator anchors the target to that directory.
+        //
+        // A `cd` to `/` or another ancestor of a protected root leaves the
+        // protected part of the path to the relative target, which no needle
+        // spells: `cd / && echo x >> etc/sudoers`. The file writers the
+        // classifier knows write as `>` does (`cd / && tee -a etc/sudoers`).
         || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
-            && command.contains('>')
+            && (command.contains('>')
+                || ["tee", "cp", "mv", "install", "ln", "dd", "sed"]
+                    .iter()
+                    .any(|writer| contains_ascii_command_word(command, writer)))
             && (contains_ascii_command_word(command, "cd")
                 || contains_ascii_command_word(command, "pushd"))
-            && super::credential_files::may_name_protected_path(command))
+            && (super::credential_files::may_name_protected_path(command)
+                || cd_reaches_a_protected_ancestor(command)))
         // Fork-bomb reachability (issue #302): the `fork-bomb` rule matches a
         // shell function-definition shape (`name() { … }`). The paren pair is
         // pure syntax that keyword-based quick-reject cannot see, and POSIX
@@ -1716,6 +1811,73 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         // tolerant scan here forces core.filesystem to run whenever an empty
         // paren pair is present; the regex then does the precise matching.
         || command_contains_empty_paren_pair(command)
+}
+
+/// Roots under which [`super::credential_files`] protects files, as path
+/// components; `/private/etc` is macOS's real `/etc`.
+const PROTECTED_ROOT_COMPONENTS: &[&[&str]] = &[
+    &["etc"],
+    &["private", "etc"],
+    &["home"],
+    &["homes"],
+    &["Users"],
+    &["root"],
+    &["var", "home"],
+    &["usr", "home"],
+    &["export", "home"],
+    &["var", "services", "homes"],
+];
+
+/// Whether some `cd`/`pushd` in `command` moves to `/`, a protected root, or
+/// an ancestor of one (`/`, `//`, `/usr/..`, `/home`, `/var`, `/private`,
+/// `/volume1`), from where a relative path can reach protected files without
+/// spelling any root a needle knows. The target is read lexically, with `.`
+/// and `..` resolved; a quoted target counts. Linear.
+fn cd_reaches_a_protected_ancestor(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    ["cd", "pushd"].iter().any(|verb| {
+        command.match_indices(verb).any(|(at, _)| {
+            let starts_word = at == 0
+                || matches!(
+                    bytes[at - 1],
+                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'{'
+                );
+            let end = at + verb.len();
+            if !starts_word || !matches!(bytes.get(end), Some(b' ' | b'\t')) {
+                return false;
+            }
+            let target = command[end..]
+                .split_ascii_whitespace()
+                .find(|word| !matches!(*word, "-P" | "-L" | "-e" | "-@" | "--"))
+                .unwrap_or("")
+                .trim_matches(['\'', '"'])
+                .trim_end_matches([';', '&', '|', ')', '}']);
+            let Some(path) = target.strip_prefix('/') else {
+                return false;
+            };
+            let mut components: Vec<&str> = Vec::new();
+            for component in path.split('/') {
+                match component {
+                    "" | "." => {}
+                    ".." => {
+                        components.pop();
+                    }
+                    other => components.push(other),
+                }
+            }
+            let volume = |component: &str| {
+                component.strip_prefix("volume").is_some_and(|number| {
+                    !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+                })
+            };
+            components.is_empty()
+                || (components.len() == 1 && volume(components[0]))
+                || PROTECTED_ROOT_COMPONENTS.iter().any(|root| {
+                    components.len() <= root.len()
+                        && components.iter().zip(root.iter()).all(|(a, b)| a == b)
+                })
+        })
+    })
 }
 
 /// True when the command contains `(` followed by only ASCII whitespace and
@@ -2188,9 +2350,13 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
                 .iter()
                 .find(|target| windows_target_is_protected(target))
         {
+            let protected_targets: Vec<&String> = literal_targets
+                .iter()
+                .filter(|target| windows_target_is_protected(target))
+                .collect();
             return RmParseDecision::Deny(RmParseMatch {
                 pattern_name: RM_PROTECTED_FILE_NAME,
-                reason: RM_PROTECTED_FILE_REASON,
+                reason: windows_rm_protected_files_reason(&protected_targets),
                 severity: Severity::Critical,
                 span: command
                     .find(target.as_str())
@@ -3462,12 +3628,57 @@ fn parse_protected_file_rm(
         return RmParseDecision::NoMatch;
     }
 
+    // The git-internals wording only when every protected operand is inside
+    // `.git` (#533); one credential anywhere keeps the credential wording.
+    let git_only = paths
+        .iter()
+        .filter(|candidate| {
+            names_protected(candidate.raw)
+                || literal_brace_expansions(candidate.raw)
+                    .is_some_and(|expansions| expansions.iter().any(|word| names_protected(word)))
+        })
+        .all(|candidate| {
+            rm_protected_file_reason(candidate.raw) == RM_PROTECTED_GIT_INTERNAL_REASON
+        });
     RmParseDecision::Deny(RmParseMatch {
         pattern_name: RM_PROTECTED_FILE_NAME,
-        reason: RM_PROTECTED_FILE_REASON,
+        reason: if git_only {
+            RM_PROTECTED_GIT_INTERNAL_REASON
+        } else {
+            RM_PROTECTED_FILE_REASON
+        },
         severity: Severity::Critical,
         span: Some(path.range.clone()),
     })
+}
+
+/// The `rm-protected-file` reason for one POSIX operand that this rule denies
+/// (#533): the git-internals wording only when every protected target the
+/// operand (or its literal brace expansions) names is inside `.git`.
+fn rm_protected_file_reason(raw: &str) -> &'static str {
+    use crate::packs::core::credential_files::{
+        may_name_protected_path, names_protected_file, names_protected_git_internal,
+    };
+    let names_protected = |word: &str| may_name_protected_path(word) && names_protected_file(word);
+    let git_only = if names_protected(raw) {
+        names_protected_git_internal(raw)
+    } else {
+        literal_brace_expansions(raw).is_some_and(|expansions| {
+            let protected: Vec<&String> = expansions
+                .iter()
+                .filter(|word| names_protected(word))
+                .collect();
+            !protected.is_empty()
+                && protected
+                    .iter()
+                    .all(|word| names_protected_git_internal(word))
+        })
+    };
+    if git_only {
+        RM_PROTECTED_GIT_INTERNAL_REASON
+    } else {
+        RM_PROTECTED_FILE_REASON
+    }
 }
 
 /// The words bash brace-expands an unquoted `a{b,c}d` operand into, when every
@@ -4297,7 +4508,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     // `--no-preserve-root` and every other long option still fall through to the
     // destructive rules, and a second `--` would have to satisfy the
     // temp-operand group (it cannot), so `rm -rf -- -- /tmp/x` keeps denying.
-    vec![
+    let mut patterns = vec![
         // The baseline Format-Volume / Clear-Disk rules (#451) mirror
         // windows.system's regexes, so they take its preview carve-out too:
         // a bare `-WhatIf` is a preview, `-WhatIf:$false` is not.
@@ -4713,7 +4924,14 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "mv-relative-into-home",
             r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:\./)?(?![-~.])[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:\./)?(?![-~.])[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
         ),
-    ]
+    ];
+    // Every possible safe match still runs its complete authored regex. The
+    // opt-in proof only avoids compiling/running an anchored backtracking
+    // pattern when its required literal prefix cannot match (#555).
+    for pattern in &mut patterns {
+        pattern.regex.enable_anchored_prefix_filter();
+    }
+    patterns
 }
 
 /// The destructive patterns for `core.filesystem`.
@@ -4760,6 +4978,15 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "GNU sed executes shell input that dcg cannot statically verify.",
             High,
             "Use a literal sed replacement or inspect the fully rendered shell command before allowing execution. Backreferences, '&', and an empty `e` command depend on runtime input."
+        ),
+        // Emitted by the bounded tar helper semantic pass, never by a raw
+        // command regex. Keep metadata available for diagnostics and review.
+        destructive_pattern!(
+            "tar-exec-unverified",
+            r"(?!)",
+            "GNU tar executes a helper whose command or executable input dcg cannot statically verify.",
+            High,
+            "Inspect the fully resolved tar helper and any archive data it executes before using an exact-command allow-once review. Prefer literal helper commands; archive bytes are not verified shell or database input."
         ),
         // ----- cross-segment sensitive propagation before rm fallbacks -----
         //
@@ -5893,6 +6120,35 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn cd_to_root_or_an_ancestor_of_a_protected_root_is_recognised() {
+        for command in [
+            "cd / && echo x >> etc/sudoers",
+            "cd // && x",
+            "cd /usr/.. && x",
+            "cd -P / && x",
+            "cd '/' && x",
+            "pushd /var && x",
+            "cd /home && x",
+            "cd /private && x",
+            "cd /volume1 && x",
+            "x; cd /; y",
+        ] {
+            assert!(cd_reaches_a_protected_ancestor(command), "{command:?}");
+        }
+        for command in [
+            "cd /tmp && x",
+            "cd /home/u/proj && x",
+            "cd src && x",
+            "abcd / && x",
+            "echo cd",
+            "cd",
+            "cd /usr/local && x",
+        ] {
+            assert!(!cd_reaches_a_protected_ancestor(command), "{command:?}");
+        }
+    }
 
     #[test]
     fn dequote_rm_flag_token_collapses_balanced_quotes() {
@@ -9056,6 +9312,228 @@ mod tests {
         }
     }
 
+    // The unfiltered implementation before #555. Keep this independent of the
+    // context facts so the differential tests catch an over-eager exclusion.
+    fn reference_rm_segment_receives_automated_stdin(
+        command: &str,
+        segment_start: usize,
+        dialect: ShellDialect,
+    ) -> bool {
+        let Some(prefix) = command.get(..segment_start) else {
+            return false;
+        };
+        let prefix = prefix.trim_end();
+        if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
+            return true;
+        }
+        if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            return false;
+        }
+        posix_pipeline_group_is_active(command, segment_start)
+            || prior_posix_exec_redirects_stdin(command, segment_start)
+    }
+
+    #[test]
+    fn stdin_context_matches_legacy_at_every_source_boundary_issue_555() {
+        for command in [
+            "",
+            "ls -la",
+            "rm -ri ./tree",
+            "yes | rm -ri ./tree",
+            "printf y |& rm -rI ./tree",
+            "true || rm -ri ./tree",
+            "printf '%s' '|'; rm -ri ./tree",
+            r"printf \|; rm -ri ./tree",
+            "yes | { echo ready; rm -ri ./tree; }",
+            "yes | ( echo ready; rm -ri ./tree )",
+            "yes | while true; do rm -ri ./tree; break; done",
+            "yes | if true; then rm -ri ./tree; else true; fi",
+            "yes | { # }\n rm -ri ./tree; }",
+            "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }",
+            "yes | { cat <<-'EOF'\n\t}\n\tEOF\nrm -ri ./tree; }",
+            "printf y | { cat; }; rm -ri ./tree",
+            "printf '%s' \"$(yes | { rm -ri ./tree; })\"",
+            "printf '%s' `yes | rm -ri ./tree`",
+            "exec < answers.txt; rm -ri ./tree",
+            "exec 0<answers.txt; rm -rI ./tree",
+            "'exec' 0<answers.txt; rm -ri ./tree",
+            "\"/bin/exec\" 0<answers.txt; rm -ri ./tree",
+            r"\exec 0<answers.txt; rm -ri ./tree",
+            "e''xec 0<answers.txt; rm -ri ./tree",
+            "FOO=bar exec <answers.txt; rm -ri ./tree",
+            "exec 0<&3; rm -ri ./tree",
+            "exec 0<&-; rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "exec <>answers.txt; rm -ri ./tree",
+            "(exec < answers.txt; true); rm -ri ./tree",
+            "(exec < answers.txt; rm -ri ./tree); true",
+            "echo 'exec <answers.txt'; rm -ri ./tree",
+            "cat <<'EOF'\nexec <answers.txt\nEOF\nrm -ri ./tree",
+            "python3 - <<'PY'\nvalue = 'λ雪'\nprint(value)\nPY\nrm -ri ./tree",
+            "printf '%s' '雪'\r\nexec <answers.txt\r\nrm -ri ./tree",
+            "yes | { cat <<'EOF'\nunterminated body\nrm -ri ./tree",
+            "printf '%s' \"$(exec <answers; rm -ri ./tree",
+            "Get-Content answers.txt | Remove-Item -Recurse ./tree",
+            "type answers.txt | del tree",
+            "echo ^| literal & del tree",
+        ] {
+            let context = RmStdinContext::new(command);
+            for dialect in [
+                ShellDialect::Posix,
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+                ShellDialect::Unknown,
+            ] {
+                // Walk backwards as well as querying offsets outside the
+                // source: callers do not promise monotonic segment order.
+                for offset in (0..=command.len() + 1).rev() {
+                    if offset < command.len() && !command.is_char_boundary(offset) {
+                        continue;
+                    }
+                    let expected =
+                        reference_rm_segment_receives_automated_stdin(command, offset, dialect);
+                    assert_eq!(
+                        context.segment_receives_automated_stdin(offset, dialect),
+                        expected,
+                        "context: dialect={dialect:?}, offset={offset}, source={command:?}",
+                    );
+                    assert_eq!(
+                        rm_segment_receives_automated_stdin(command, offset, dialect),
+                        expected,
+                        "standalone: dialect={dialect:?}, offset={offset}, source={command:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stdin_context_preserves_multiline_interactive_verdicts_issue_555() {
+        use std::fmt::Write as _;
+
+        for lines in [1, 40, 300] {
+            let mut body = String::from("python3 - <<'PY'\n");
+            for index in 0..lines {
+                writeln!(body, "value_{index} = {index}").expect("write fixture line");
+            }
+            body.push_str("PY\n");
+            for (prefix, suffix, automated) in [
+                ("", "rm -ri ./tree", false),
+                ("yes | { ", "rm -ri ./tree; }", true),
+                ("exec 0<answers; ", "rm -ri ./tree", true),
+            ] {
+                let command = format!("{prefix}{body}{suffix}");
+                let context = RmStdinContext::new(&command);
+                for segment in crate::packs::split_command_segments(&command) {
+                    let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                    assert_eq!(
+                        context.segment_receives_automated_stdin(start, ShellDialect::Posix),
+                        reference_rm_segment_receives_automated_stdin(
+                            &command,
+                            start,
+                            ShellDialect::Posix,
+                        ),
+                        "lines={lines}, prefix={prefix:?}, start={start}",
+                    );
+                }
+                let rm_start = command.rfind("rm -ri").expect("explicit final rm");
+                assert_eq!(
+                    context.segment_receives_automated_stdin(rm_start, ShellDialect::Posix),
+                    automated,
+                );
+                match parse_rm_command(&command) {
+                    RmParseDecision::Allow if !automated => {}
+                    RmParseDecision::Deny(hit) if automated => {
+                        assert_eq!(hit.pattern_name, RM_RECURSIVE_GENERAL_NAME);
+                        assert_eq!(hit.severity, Severity::High);
+                    }
+                    decision => panic!(
+                        "interactive verdict changed: lines={lines}, automated={automated}, \
+                         decision={decision:?}"
+                    ),
+                }
+            }
+            let destructive = format!("{body}rm -rf /");
+            assert!(matches!(
+                parse_rm_command(&destructive),
+                RmParseDecision::Deny(hit) if hit.pattern_name == RM_RF_ROOT_HOME_NAME
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "paired in-process legacy/context timing; run in release mode with --nocapture"]
+    fn paired_stdin_provenance_benchmark_issue_555() {
+        use std::fmt::Write as _;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for lines in [40, 300, 1_000] {
+            let mut command = String::from("python3 - <<'PY'\n");
+            for index in 0..lines {
+                writeln!(command, "value_{index} = {index}").expect("write fixture line");
+            }
+            command.push_str("print('ready')\nPY");
+            let offsets: Vec<_> = crate::packs::split_command_segments(&command)
+                .iter()
+                .map(|segment| segment.as_ptr() as usize - command.as_ptr() as usize)
+                .collect();
+            let reference = || {
+                offsets
+                    .iter()
+                    .filter(|&&offset| {
+                        reference_rm_segment_receives_automated_stdin(
+                            black_box(&command),
+                            offset,
+                            ShellDialect::Posix,
+                        )
+                    })
+                    .count()
+            };
+            let candidate = || {
+                let context = RmStdinContext::new(black_box(&command));
+                offsets
+                    .iter()
+                    .filter(|&&offset| {
+                        context.segment_receives_automated_stdin(offset, ShellDialect::Posix)
+                    })
+                    .count()
+            };
+            assert_eq!(reference(), candidate());
+            let mut reference_ns = Vec::new();
+            let mut candidate_ns = Vec::new();
+            for iteration in 0..7 {
+                for use_reference in [iteration % 2 == 0, iteration % 2 != 0] {
+                    let start = Instant::now();
+                    let result = if use_reference {
+                        black_box(reference())
+                    } else {
+                        black_box(candidate())
+                    };
+                    let elapsed = start.elapsed().as_nanos();
+                    assert_eq!(result, 0);
+                    if use_reference {
+                        reference_ns.push(elapsed);
+                    } else {
+                        candidate_ns.push(elapsed);
+                    }
+                }
+            }
+            reference_ns.sort_unstable();
+            candidate_ns.sort_unstable();
+            let reference_ns = reference_ns[reference_ns.len() / 2];
+            let candidate_ns = candidate_ns[candidate_ns.len() / 2];
+            eprintln!(
+                "stdin_provenance lines={lines} segments={} legacy_p50_us={:.3} \
+                 context_p50_us={:.3} speedup={:.2}x",
+                offsets.len(),
+                reference_ns as f64 / 1_000.0,
+                candidate_ns as f64 / 1_000.0,
+                reference_ns as f64 / candidate_ns.max(1) as f64,
+            );
+        }
+    }
+
     #[test]
     fn test_rm_parser_normalizes_segment_local_wrappers_and_executables() {
         for command in [
@@ -9081,6 +9559,56 @@ mod tests {
             "busybox nice rm -r ./tree",
         ] {
             assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn automated_stdin_candidates_preserve_full_reader_results() {
+        let large = format!(
+            "python3 - <<'EOF'\n{}EOF\nrm -ri ./tree",
+            "print('ordinary data')\n".repeat(300)
+        );
+        let cases = [
+            large.as_str(),
+            "yes | { echo x; rm -ri ./tree; }",
+            "yes | (echo x; rm -ri ./tree)",
+            "yes | if true; then rm -ri ./tree; fi",
+            "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }",
+            "exec 0<answers.txt; rm -ri ./tree",
+            "'exec' <answers.txt; rm -ri ./tree",
+            "exec <<<yes; rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "(exec <answers.txt; true); rm -ri ./tree",
+            "printf '| exec <'\nrm -ri ./tree",
+            "cat <<'EOF'\nexec <answers.txt\nEOF\nrm -ri ./tree",
+            "echo café && rm -ri ./tree",
+        ];
+        // Compare to the incumbent readers at every extracted segment,
+        // including heredoc lines and nested segments. This catches a
+        // candidate gate hiding a shape those readers already recognized.
+        for command in cases {
+            for segment in crate::packs::split_command_segments(command) {
+                let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                let prefix = command[..start].trim_end();
+                let direct =
+                    prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||"));
+                for dialect in [
+                    ShellDialect::Posix,
+                    ShellDialect::Unknown,
+                    ShellDialect::Cmd,
+                    ShellDialect::PowerShell,
+                ] {
+                    let incumbent = direct
+                        || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+                            && (posix_pipeline_group_is_active(command, start)
+                                || prior_posix_exec_redirects_stdin(command, start)));
+                    assert_eq!(
+                        rm_segment_receives_automated_stdin(command, start, dialect),
+                        incumbent,
+                        "{dialect:?} at {start}: {command}"
+                    );
+                }
+            }
         }
     }
 
@@ -10086,6 +10614,95 @@ mod cmd_protected_file_tests {
                 ),
                 "{command} must not deny under {RM_PROTECTED_FILE_NAME}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod git_internals_rm_reason_tests {
+    //! #533: `rm .git/index.lock` was denied as "a protected credential or
+    //! login-startup file". The decision and rule id stay; only the reason
+    //! now names the repository state actually at risk.
+    use super::*;
+
+    fn deny(command: &str, dialect: ShellDialect) -> RmParseMatch {
+        match parse_rm_command_segment_in_dialect(command, false, dialect) {
+            RmParseDecision::Deny(hit) => hit,
+            other => unreachable!("{command} must stay denied: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rm_of_git_internals_denies_with_a_git_reason_issue_533() {
+        for command in [
+            "rm .git/index.lock",
+            "rm -f .git/index.lock",
+            "rm repo/.git/index.lock",
+            "rm .git/HEAD.lock",
+            "rm .git/notes.txt",
+        ] {
+            let hit = deny(command, ShellDialect::Posix);
+            assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME, "{command}");
+            assert_eq!(hit.severity, Severity::Critical, "{command}");
+            assert_eq!(hit.reason, RM_PROTECTED_GIT_INTERNAL_REASON, "{command}");
+        }
+    }
+
+    #[test]
+    fn rm_of_credentials_keeps_the_credential_reason_issue_533() {
+        for command in [
+            "rm ~/.ssh/id_rsa",
+            "rm ~/.aws/credentials",
+            "rm /etc/shadow",
+        ] {
+            let hit = deny(command, ShellDialect::Posix);
+            assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME, "{command}");
+            assert_eq!(hit.reason, RM_PROTECTED_FILE_REASON, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_credential_anywhere_keeps_the_credential_reason_issue_533() {
+        // The git operand comes first, so the reported span is the git path;
+        // the reason must still not understate the credential deletion.
+        let hit = deny("rm .git/index.lock ~/.ssh/id_rsa", ShellDialect::Posix);
+        assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME);
+        assert_eq!(hit.reason, RM_PROTECTED_FILE_REASON);
+    }
+
+    #[test]
+    fn unprotected_lock_files_stay_allowed_issue_533() {
+        for command in ["rm index.lock", "rm notes.lock", "rm lock", "rm .gitignore"] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::Posix),
+                    RmParseDecision::NoMatch
+                ),
+                "{command} must not deny under {RM_PROTECTED_FILE_NAME}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_deletes_of_git_internals_use_the_git_reason_issue_533() {
+        for (command, dialect) in [
+            ("Remove-Item .git\\index.lock", ShellDialect::PowerShell),
+            ("del .git\\index.lock", ShellDialect::Cmd),
+        ] {
+            let hit = deny(command, dialect);
+            assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME, "{command}");
+            assert_eq!(hit.reason, RM_PROTECTED_GIT_INTERNAL_REASON, "{command}");
+        }
+        for (command, dialect) in [
+            ("Remove-Item $HOME\\.ssh\\id_rsa", ShellDialect::PowerShell),
+            (
+                "Remove-Item .git\\index.lock $HOME\\.ssh\\id_rsa",
+                ShellDialect::PowerShell,
+            ),
+            ("del %USERPROFILE%\\.ssh\\id_rsa", ShellDialect::Cmd),
+        ] {
+            let hit = deny(command, dialect);
+            assert_eq!(hit.reason, RM_PROTECTED_FILE_REASON, "{command}");
         }
     }
 }
