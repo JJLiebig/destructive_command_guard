@@ -119,6 +119,58 @@ impl Lab {
 
 const DEFAULTS: &str = "[general]\ncolor = \"never\"\n";
 
+#[test]
+fn tar_uncertain_mode_review_never_grants_visible_destructive_helpers() {
+    for allowlisted in [false, true] {
+        let config = if allowlisted {
+            DEFAULTS
+        } else {
+            "[general]\ncolor = \"never\"\n[policy.rules]\n\"core.filesystem:tar-exec-unverified\" = \"warn\"\n"
+        };
+        let lab = Lab::new(config);
+        if allowlisted {
+            let allowlist = "[[allow]]\nrule = \"core.filesystem:tar-exec-unverified\"\nreason = \"review only the unresolved tar context\"\n";
+            for dir in ["xdg/dcg", "home/.config/dcg"] {
+                let dir = lab.dir.path().join(dir);
+                std::fs::create_dir_all(&dir).expect("isolated allowlist directory");
+                std::fs::write(dir.join("allowlist.toml"), allowlist)
+                    .expect("isolated tar review grant");
+            }
+        }
+        assert!(
+            !lab.claude_hook_denies("tar \"$MODE\" -f archive --to-command='printf safe'"),
+            "the generic review exception must work independently: allowlisted={allowlisted}"
+        );
+        for command in [
+            "tar \"$MODE\" -f archive --to-command='git reset --hard'",
+            "tar -\"$MODE\" -f archive --to-command='git reset --hard'",
+            "tar -f archive \"$MODE\" --to-command='git reset --hard'",
+            "tar \"$MODE\" -f out -I 'echo safe; git reset --hard'",
+            // PREFIX may be --exclude, making the apparent --help its
+            // operand; a terminal-looking token cannot erase later helpers.
+            "tar -c \"$PREFIX\" --help --checkpoint-action='exec=git reset --hard' file",
+            // An unresolved preceding option can consume an apparent
+            // override. Earlier and later visible helpers must both survive.
+            "TAR_OPTIONS=\"--use-compress-program='git reset --hard'\" tar -c \"$PREFIX\" -z -f out file",
+            "tar -cf out --info-script='git reset --hard' \"$PREFIX\" --info-script='printf safe' file",
+            "tar -cf out --info-script='printf safe' \"$PREFIX\" --info-script='git reset --hard' file",
+            "tar -cf host:out --rmt-command='git reset --hard' \"$PREFIX\" --rmt-command='printf safe' file",
+            "tar -cf host:out --rmt-command='printf safe' \"$PREFIX\" --rmt-command='git reset --hard' file",
+            // PREFIX can own -- or --exclude as its operand, leaving the
+            // following helper active in tar's argument parser.
+            "tar -cf out \"$PREFIX\" -- --checkpoint-action='exec=git reset --hard' file",
+            "tar -cf out \"$PREFIX\" --exclude --checkpoint-action='exec=git reset --hard' file",
+        ] {
+            assert!(lab.claude_hook_denies(command), "{command:?}");
+            assert_eq!(
+                lab.batch_decision(command),
+                ("deny".to_string(), "core.git:reset-hard".to_string()),
+                "generic tar review must not cover a visible destructive helper: {command:?}"
+            );
+        }
+    }
+}
+
 /// A warn-severity first finding followed by a deny, in every separator and
 /// wrapper shape an agent could chain them with.
 const MASKED_DENIES: &[&str] = &[
@@ -292,6 +344,51 @@ fn an_allowlisted_rule_in_a_nested_piece_covers_only_that_rule() {
         "alias x=\"rm -rf ./build\"; git reset --hard",
         "d=rm; $d -rf ./build; git reset --hard",
         "rm -rf ./build; git reset --hard",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+#[test]
+fn tar_helper_warnings_do_not_hide_later_destructive_actions() {
+    let lab = Lab::new(
+        "[general]\ncolor = \"never\"\n\n[policy.rules]\n\"core.filesystem:tar-exec-unverified\" = \"warn\"\n",
+    );
+    assert!(!lab.claude_hook_denies(r#"tar -xf archive.tar --to-command="$HELPER""#));
+    assert!(!lab.claude_hook_denies(
+        "tar -cf backup.tar --checkpoint-action='exec=git stash drop' payload"
+    ));
+    for command in [
+        r#"tar -cf backup.tar --checkpoint-action="exec=$HELPER" --checkpoint-action='exec=git reset --hard' payload"#,
+        r#"tar -cf backup.tar --checkpoint-action="exec=$HELPER; git reset --hard" payload"#,
+        "tar -cf backup.tar --checkpoint-action='exec=git stash drop' --checkpoint-action='exec=git reset --hard' payload",
+        r#"tar -xf archive.tar --to-command="$HELPER"; git reset --hard"#,
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+        assert_eq!(
+            lab.batch_decision(command),
+            ("deny".to_string(), "core.git:reset-hard".to_string()),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn tar_helper_review_rule_does_not_grant_nested_destructive_rules() {
+    let lab = Lab::new(DEFAULTS);
+    let allowlist =
+        "[[allow]]\nrule = \"core.filesystem:tar-exec-unverified\"\nreason = \"test\"\n";
+    for dir in ["xdg/dcg", "home/.config/dcg"] {
+        let dir = lab.dir.path().join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("allowlist.toml"), allowlist).unwrap();
+    }
+    assert!(!lab.claude_hook_denies(r#"tar -xf archive.tar --to-command="$HELPER""#));
+    for command in [
+        r#"tar -cf backup.tar --checkpoint-action="exec=$HELPER" --checkpoint-action='exec=git reset --hard' payload"#,
+        r#"tar -cf backup.tar --checkpoint-action='exec=git reset --hard' --checkpoint-action="exec=$HELPER" payload"#,
+        r#"tar -cf backup.tar --checkpoint-action="exec=$HELPER; git reset --hard" payload"#,
+        r#"tar -xf archive.tar --to-command="$HELPER"; rm -rf /"#,
     ] {
         assert!(lab.claude_hook_denies(command), "{command:?}");
     }
@@ -730,5 +827,335 @@ fn windows_wrappers_and_here_strings_behind_redirects_are_judged() {
         "cat <<<'sh 2>/dev/null -c git reset --hard'".to_string(),
     ] {
         assert!(!lab.claude_hook_denies(&command), "{command:?}");
+    }
+}
+
+/// Eighth review (A13): the prose of a data heredoc with an UNQUOTED
+/// delimiter was read as live commands. `cat <<EOF > notes.md` documenting
+/// `watch '…'`, `sh -c '…'` or `ssh h '…'` was denied although `cat` only
+/// stores the text; the quoted-delimiter spelling was allowed. The shell runs
+/// only the body's substitutions while reading it, so those are still judged,
+/// and a body a shell runs — piped to one, fed to one, or written to a file
+/// the same command then runs — is judged whole.
+#[test]
+fn expanding_data_heredoc_bodies_judge_only_what_the_shell_runs() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "cat <<EOF > notes.md\nwatch 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nsh -c 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nsh 2>/dev/null -c 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nuse a<(watch 'git reset --hard')\nEOF",
+        "cat <<EOF > notes.md\nssh h 'git reset --hard'\nEOF",
+        "cat <<-EOF > notes.md\n\tuse a<(watch 'git reset --hard')\n\tEOF",
+        "git commit -F - <<EOF\nfix: cat a<(ssh h 'git reset --hard') was allowed\nEOF",
+        "cat <<EOF > notes.md\neval \"$x\"\nEOF",
+        "cat <<EOF > notes.md\nbuilt $(date +%F): watch 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nrm -rf ~/src\nEOF\ngit add notes.md",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "cat <<EOF > notes.md\n$(git reset --hard)\nEOF",
+        "cat <<EOF > notes.md\n`git reset --hard`\nEOF",
+        "cat <<EOF > notes.md\nx $(watch 'git reset --hard') y\nEOF",
+        "cat <<EOF > notes.md\n${x:-$(git reset --hard)}\nEOF",
+        "cat <<EOF > notes.md\n$(( $(git reset --hard) ))\nEOF",
+        "cat <<EOF > notes.md\n$\\\n(git reset --hard)\nEOF",
+        "cat <<EOF | sh\nwatch 'git reset --hard'\nEOF",
+        "bash <<EOF\nwatch 'git reset --hard'\nEOF",
+        "ssh h <<EOF\ngit reset --hard\nEOF",
+        "tee x.sh <<EOF\nrm -rf ~/src\nEOF\nsh x.sh",
+        "cat <<EOF > x.sh && ./x.sh\nrm -rf ~/src\nEOF",
+        "cat > x.sh <<'EOF'\nrm -rf ~/src\nEOF\ncat x.sh | bash",
+        "cat <<EOF > x.sh; . ./x.sh\ngit reset --hard\nEOF",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// Review of 6158ee7: a data sink's body is data only while the sink's
+/// output stays put. An unquoted body piped or otherwise fed to a program
+/// that runs it was masked like a contained one and allowed, where v0.15.1
+/// denied it; a quoted one was allowed by both. Both are now judged as
+/// commands. Contained output, and quoted bodies that only reach data
+/// consumers, decide as before.
+#[test]
+fn heredoc_bodies_whose_output_may_run_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    let runs = [
+        "cat <<{d} | sh\n{b}\nEOF",
+        "cat <<{d} 2>&1 | sh\n{b}\nEOF",
+        "cat <<{d} >&2 | sh\n{b}\nEOF",
+        "(cat <<{d}) | sh\n{b}\nEOF",
+        "cat <<{d} | ssh host\n{b}\nEOF",
+        "cat <<{d} | ssh host -- bash -s\n{b}\nEOF",
+        "cat <<{d} | docker exec -i c sh\n{b}\nEOF",
+        "cat <<{d} | kubectl exec -i p -- sh\n{b}\nEOF",
+        "cat <<{d} | at now\n{b}\nEOF",
+        "cat <<{d} | su\n{b}\nEOF",
+        "cat <<{d} | $SHELL\n{b}\nEOF",
+        "cat <<{d} | while read -r l; do eval \"$l\"; done\n{b}\nEOF",
+    ];
+    for delimiter in ["EOF", "'EOF'"] {
+        for body in ["watch 'git reset --hard'", "git reset --hard"] {
+            for template in runs {
+                let command = template.replace("{d}", delimiter).replace("{b}", body);
+                assert!(lab.claude_hook_denies(&command), "{command:?}");
+            }
+        }
+    }
+    for command in [
+        "cat <<EOF > notes.md\nwatch 'git reset --hard'\nEOF",
+        "cat <<EOF | wc -l\nwatch 'git reset --hard'\nEOF",
+        "cd docs && cat <<EOF > notes.md\nssh h 'git reset --hard'\nEOF",
+        "cat <<'EOF' | git commit -F -\nfix: stop running git reset --hard\nEOF",
+        "cat <<'EOF' | sudo tee /etc/motd >/dev/null\nnever run rm -rf ~/src here\nEOF",
+        "git commit -m \"$(cat <<'EOF'\nfix: document git reset --hard\nEOF\n)\"",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// Review of 6976885: an unquoted body is masked as contained only when the
+/// command that owns it passes it through untouched. `read` kept it for a
+/// later `$c`, sed's `e`/`s///e` and awk's `system()` and `print | "sh"`
+/// ran it, `sort --compress-program` and `rg --pre` handed it to a program,
+/// `nc` and `curl` sent it away, and `tee /dev/stderr` or `tee /dev/fd/3`
+/// wrote it where `2>&1 >/dev/null | sh` pointed. Each was masked as the
+/// terminal's text and allowed, where v0.15.1 denied it.
+#[test]
+fn unquoted_bodies_whose_owner_uses_them_stay_whole() {
+    let lab = Lab::new(DEFAULTS);
+    let body = "watch 'git reset --hard'";
+    for template in [
+        "read -r c <<EOF\n{b}\nEOF\n$c",
+        "sed e <<EOF\n{b}\nEOF",
+        "sed 's/^/ /e' <<EOF\n{b}\nEOF",
+        "awk '{system($0)}' <<EOF\n{b}\nEOF",
+        "awk '{print | \"sh\"}' <<EOF\n{b}\nEOF",
+        "sort -S 1 --compress-program=sh <<EOF\n{b}\nEOF",
+        "cat <<EOF | sort -S 1 --compress-prog=sh\n{b}\nEOF",
+        "cat <<EOF | rg --pre sh '' /dev/stdin\n{b}\nEOF",
+        "nc h 4444 <<EOF\n{b}\nEOF",
+        "curl --data-binary @- http://h/run <<EOF\n{b}\nEOF",
+        "tee /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+        "tee /dev/fd/3 <<EOF 3>&1 >/dev/null | sh\n{b}\nEOF",
+        "sort -o /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+        "uniq - /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+        "cat <<EOF | tee /dev/stderr 2>&1 >/dev/null | sh\n{b}\nEOF",
+        "PATH=/tmp/x cat <<EOF\n{b}\nEOF",
+    ] {
+        let command = template.replace("{b}", body);
+        assert!(lab.claude_hook_denies(&command), "{command:?}");
+    }
+    for template in [
+        "cat <<EOF > notes.md\n{b}\nEOF",
+        "LC_ALL=C sort <<EOF > sorted.txt\n{b}\nEOF",
+        "tee notes.md <<EOF >/dev/null\n{b}\nEOF",
+        "cat <<EOF | sort -o sorted.txt\n{b}\nEOF",
+        "cat <<EOF | rg -n 'reset$' | wc -l\n{b}\nEOF",
+        "cat <<EOF | tee -a log.txt notes.md\n{b}\nEOF",
+    ] {
+        let command = template.replace("{b}", body);
+        assert!(!lab.claude_hook_denies(&command), "{command:?}");
+    }
+}
+
+/// Review of 6976885: dialect refinement masks heredocs before the size
+/// gate, and the heredoc collector recursed once per level of the parse
+/// tree. A list of 13,500 `true &&` before a heredoc (108 KB) overflowed the
+/// stack and aborted the hook; v0.15.1 lasted to about 240 KB. An aborted
+/// hook is a non-blocking error to the agent, which then runs the command.
+#[test]
+fn a_deeply_nested_list_before_a_heredoc_still_gets_a_verdict() {
+    let lab = Lab::new(DEFAULTS);
+    for (prefix, repeat) in [
+        ("true && ", 15_000),
+        ("true && ", 30_000),
+        ("x || ", 40_000),
+    ] {
+        let command = format!(
+            "{}cat <<EOF | sh\nwatch 'git reset --hard'\nEOF",
+            prefix.repeat(repeat)
+        );
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "cwd": lab.dir.path(),
+        });
+        let (stdout, stderr) = lab.run_with_stdin(&[], &format!("{payload}\n"));
+        assert!(
+            stdout.contains("\"ask\"") || stdout.contains("\"deny\""),
+            "{prefix:?} x {repeat}: no verdict\nstdout: {stdout}\nstderr: {}",
+            stderr.chars().take(400).collect::<String>()
+        );
+    }
+}
+
+/// Eighth review (A14): spellings that still hid a command from the rules
+/// (all allowed on v0.14.4 and v0.15.1).
+#[test]
+fn eighth_review_spellings_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        // A quoted option after a shell's `-c`.
+        "bash -c -o 'errexit' 'git reset --hard'",
+        "sh -c -O 'extglob' 'git reset --hard'",
+        "bash -c '-e' 'git reset --hard'",
+        // A runner named through `$'…'` escapes.
+        "$'\\x77atch' 'git reset --hard'",
+        "$'\\167atch' 'git reset --hard'",
+        "w$'\\x61'tch 'git reset --hard'",
+        // A runner named at run time.
+        "w${x}atch 'git reset --hard'",
+        "${W}atch 'git reset --hard'",
+        "sudo $W 'git reset --hard'",
+        "$(echo watch) 'git reset --hard'",
+        // A command word that is a substitution printing the command.
+        "$(echo git reset --hard)",
+        "$(printf 'git reset --hard')",
+        "$(echo git reset) --hard",
+        "\"$(echo git)\" reset --hard",
+        // A find action spelled through quoting.
+        "find ~/src '-delete'",
+        "find ~/src -de''lete",
+        "find ~/src -de\\lete",
+        "find ~/src -perm -u+x \"-delete\"",
+        // A relative write after `cd` to `/` or an ancestor of a protected root.
+        "cd / && echo x >> etc/sudoers",
+        "cd // && echo x > etc/passwd",
+        "cd /usr/.. && echo x >> etc/sudoers",
+        "cd / ; tee -a etc/sudoers <<< x",
+        "cd /home && echo x >> luna/.netrc",
+        // A dashed Git built-in behind a wrapper.
+        "xargs git-reset --hard",
+        "echo . | xargs -0 git-clean -fdx",
+        "find . -exec git-clean -fdx \\;",
+        // Found by the self-review of this round (pre-existing).
+        "bash '-c' 'git reset --hard'",
+        "bash -o 'errexit' -c 'git reset --hard'",
+        "f'ind' ~/src '-delete'",
+        "echo $\\\n(git reset --hard)",
+        "awk -f - <<'EOF'\nBEGIN{system(\"rm -rf ~/src\")}\nEOF",
+        "echo 'git reset --hard' | while read l; do eval \"$l\"; done",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "bash -c -o 'errexit' 'ls'",
+        "$'\\x77atch' 'uptime'",
+        "w${x}atch 'df -h'",
+        "echo w${x}atch 'git reset --hard'",
+        "$HOME/.local/bin/tool 'git reset --hard'",
+        "sudo -u \"$USER\" git commit -m 'rm -rf is dangerous'",
+        "awk -f prog.awk <<'EOF'\nrm -rf ~/src\nEOF",
+        "$(echo ls) -la",
+        "echo $(echo git reset --hard)",
+        "git commit -m \"$(echo git reset --hard)\"",
+        "find ~/src -name '-delete'",
+        "find ~/src -exec grep '-delete' {} \\;",
+        "cd / && ls etc/sudoers",
+        "cd /tmp && echo x >> etc/sudoers",
+        "xargs git-log",
+        "echo git-reset --hard",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// Eighth review: a long run of option-like words before a shell's `-c`
+/// (`c -c -c … sh -c '…'`) took seconds; the hook must answer in time and
+/// still find the payload.
+#[test]
+fn long_option_runs_before_a_command_string_answer_fast() {
+    let lab = Lab::new(DEFAULTS);
+    for unit in ["c -", "c -c ", "sh -c -e "] {
+        let long = format!(
+            "{} sh -c 'git reset --hard'",
+            unit.repeat(30_000 / unit.len())
+        );
+        let started = std::time::Instant::now();
+        assert!(lab.claude_hook_denies(&long), "{unit:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{unit:?}: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// bd-2bm3: bash brace-expands a list in command position into the command
+/// it runs, so `{rm,-rf,~}` is `rm -rf ~`; a list whose alternatives are
+/// options makes those options (`rm {-rf,~}`). Lists naming files stay as
+/// they were.
+#[test]
+fn brace_lists_that_make_the_command_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "{rm,-rf,~}",
+        "{git,reset,--hard}",
+        "echo x; {git,reset,--hard}",
+        "sudo {git,reset,--hard}",
+        "{git,reset} --hard",
+        "{rm,-rf} ~/src",
+        "rm {-rf,~/src}",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "echo {a,b}",
+        "mkdir -p src/{a,b}",
+        "{echo,hi}",
+        "cp config.toml{,.bak}",
+        "touch file{1,2,3}",
+        // Judged as the command it becomes, like `rm -rf /tmp/build-x`.
+        "{rm,-rf,/tmp/build-x}",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// bd-v9hh: a command the shell runs later — a `trap` handler (EXIT fires
+/// when the tool call's shell exits), `PROMPT_COMMAND`, a prompt's
+/// substitutions, the file `BASH_ENV` names — was argv data to every rule.
+#[test]
+fn deferred_shell_commands_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "trap 'rm -rf ~' EXIT",
+        "trap \"git reset --hard\" EXIT; true",
+        "trap -- 'git reset --hard' INT TERM EXIT",
+        "trap 'git reset --hard' ERR; false",
+        "PROMPT_COMMAND='rm -rf ~'",
+        "export PROMPT_COMMAND='git reset --hard'",
+        "PROMPT_COMMAND=('git reset --hard')",
+        "PS1='$(git reset --hard)'",
+        "PS4='`git reset --hard`' bash -xc true",
+        "builtin trap 'rm -rf ~' EXIT",
+        "{ trap 'rm -rf ~' EXIT; }",
+        "(trap 'rm -rf ~' EXIT)",
+        "f() { trap 'rm -rf ~' RETURN; }; f",
+        "BASH_ENV=<(echo 'rm -rf ~') bash -c true",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "trap - EXIT",
+        "trap '' INT",
+        "trap 'rm -f /tmp/lock' EXIT",
+        "tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT",
+        "trap -p",
+        "echo trap 'rm -rf ~' EXIT",
+        "PROMPT_COMMAND='history -a'",
+        "PS1='\\u@\\h:\\w\\$ '",
+        "echo PROMPT_COMMAND='rm -rf ~'",
+        // A handler is judged after the text before it, as if it ran there:
+        // these clean up what that text made or a temporary path.
+        "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT",
+        "trap 'rm -rf /tmp/build-x' EXIT",
+        "PS4='+ $(date +%s) ' bash -x script.sh",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
     }
 }

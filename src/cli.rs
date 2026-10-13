@@ -313,6 +313,9 @@ pub enum Command {
 
     /// Install the hook into Claude Code settings (or another agent with
     /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, or `--reasonix`)
+    ///
+    /// Claude user settings honor CLAUDE_CONFIG_DIR when non-empty, otherwise
+    /// ~/.claude/settings.json is used.
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -320,7 +323,7 @@ pub enum Command {
         force: bool,
 
         /// Install to project-level `.claude/settings.json` (in the current repo)
-        /// instead of user-level `~/.claude/settings.json`
+        /// instead of user-level settings (CLAUDE_CONFIG_DIR or ~/.claude)
         #[arg(long)]
         project: bool,
 
@@ -568,6 +571,14 @@ pub enum Command {
         /// replacement for `dcg test --format json`.
         #[arg(long, hide = true)]
         omp_bridge_output: bool,
+
+        /// The working directory the host reported for the command, when the
+        /// generated OMP bridge had to start dcg somewhere else because that
+        /// directory does not exist (#504). Directory-scoped allowlist entries
+        /// are judged against this path, never against dcg's own cwd. Internal
+        /// to the OMP bridge protocol.
+        #[arg(long, hide = true, value_name = "PATH", requires = "omp_bridge_output")]
+        command_cwd: Option<std::path::PathBuf>,
     },
 
     /// Generate a sample configuration file
@@ -1499,6 +1510,11 @@ pub enum HistoryAction {
     },
 
     /// Analyze pack effectiveness and generate recommendations
+    ///
+    /// Works from recorded decisions (allow, deny, warn, bypass), not command
+    /// outcomes: dcg's hooks run before a command executes, so `exit_code` is
+    /// NULL (unknown) on the rows they write. With no recorded commands it
+    /// reports that there is nothing to analyze.
     #[command(name = "analyze")]
     Analyze {
         /// Time period in days (default: 30)
@@ -2555,6 +2571,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             force,
             dialect,
             omp_bridge_output,
+            command_cwd,
         }) => {
             // Robot mode forces JSON output
             let robot_mode = robot_mode_enabled(cli.robot);
@@ -2622,6 +2639,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     force,
                     dialect,
                     omp_bridge_output,
+                    command_cwd.as_deref(),
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
                 if was_blocked {
@@ -5054,6 +5072,7 @@ fn test_command(
     force: bool,
     dialect: DialectArg,
     omp_bridge_output: bool,
+    command_cwd: Option<&std::path::Path>,
 ) -> bool {
     use std::time::{Duration, Instant};
 
@@ -5167,8 +5186,19 @@ fn test_command(
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
     };
 
-    // Use shared evaluator for consistent behavior with hook mode
-    let project_path = std::env::current_dir().ok();
+    // Use shared evaluator for consistent behavior with hook mode.
+    //
+    // A host-reported command cwd (the OMP bridge, #504) is the directory the
+    // command runs in; dcg's own cwd is only where it could be started. As in
+    // hook mode (#387), a reported cwd that is not an absolute directory
+    // leaves directory-scoped allowlist entries inapplicable rather than
+    // judging them against an unrelated directory.
+    let project_path = match command_cwd {
+        Some(reported) => Some(reported)
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .map(std::path::Path::to_path_buf),
+        None => std::env::current_dir().ok(),
+    };
     let start = Instant::now();
     let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
         evaluate_command_with_pack_order_deadline_at_path_in_dialect(
@@ -5222,7 +5252,9 @@ fn test_command(
     // drop wait by the same remaining deadline that governs the robot reply.
     let _robot_history_writer =
         if should_record_robot_history(robot_mode, effective_config.history.enabled) {
-            let working_dir = project_path.as_ref().map_or_else(
+            // Record where the command was going to run, even when that
+            // directory does not exist and so cannot scope anything.
+            let working_dir = command_cwd.or(project_path.as_deref()).map_or_else(
                 || "<unknown>".to_string(),
                 |path| path.to_string_lossy().into_owned(),
             );
@@ -6733,6 +6765,29 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     );
     println!("  Hook self-heal: {}", config.general.self_heal_hook);
     println!("  Fail closed: {}", config.general.fail_closed);
+    // The same effective values `--format json` reports (#530).
+    println!(
+        "  Unverified decision: {}",
+        if config.unverified_denies() {
+            "deny"
+        } else {
+            "ask"
+        }
+    );
+    println!("  Update pin: {}", config.general.update_pin);
+    println!("  Check updates: {}", config.general.check_updates);
+    println!(
+        "  Max hook input bytes: {}",
+        config.general.max_hook_input_bytes()
+    );
+    println!(
+        "  Max command bytes: {}",
+        config.general.max_command_bytes()
+    );
+    println!(
+        "  Max findings per command: {}",
+        config.general.max_findings_per_command()
+    );
     println!();
     let (active_packs, unloaded_packs) = resolved_pack_listing(config);
     let keywordless: &[String] =
@@ -6892,6 +6947,17 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "hook_timeout_source": config.hook_timeout_source(),
             "self_heal_hook": config.general.self_heal_hook,
             "fail_closed": config.general.fail_closed,
+            // Effective values (#530): the hand-written list above used to stop
+            // here, so these settings, and their DCG_* overrides, were invisible
+            // to `dcg config --format json`. `unverified_decision` reads through
+            // `unverified_denies`, which applies `DCG_UNVERIFIED_DECISION` at
+            // use time; the size limits report their defaults when unset.
+            "unverified_decision": if config.unverified_denies() { "deny" } else { "ask" },
+            "update_pin": config.general.update_pin,
+            "check_updates": config.general.check_updates,
+            "max_hook_input_bytes": config.general.max_hook_input_bytes(),
+            "max_command_bytes": config.general.max_command_bytes(),
+            "max_findings_per_command": config.general.max_findings_per_command(),
         },
         "packs": {
             "enabled": enabled_packs,
@@ -10320,7 +10386,9 @@ fn history_analyze(
     // Get enabled packs from config
     let config = Config::load();
     let enabled_pack_ids = config.enabled_pack_ids();
-    let enabled_packs: Vec<&str> = enabled_pack_ids.iter().map(String::as_str).collect();
+    let mut enabled_packs: Vec<&str> = enabled_pack_ids.iter().map(String::as_str).collect();
+    // A set has no order; sort so the listing is stable from run to run.
+    enabled_packs.sort_unstable();
 
     let analysis = db.analyze_pack_effectiveness(days, &enabled_packs)?;
 
@@ -10340,6 +10408,36 @@ fn history_analyze(
         analysis.period_days,
         analysis.total_commands.to_string().yellow()
     );
+
+    // Nothing recorded means nothing was judged. Printing the usual sections
+    // here produced green "no gaps" checks and advice to disable `core` drawn
+    // from zero commands (#513).
+    if !analysis.has_data {
+        println!(
+            "{}",
+            format!(
+                "No command history in the last {} days, so there is nothing to analyze.",
+                analysis.period_days
+            )
+            .yellow()
+        );
+        if crate::history::history_disabled_by_env() {
+            println!(
+                "History collection is turned off by {ENV_HISTORY_DISABLED} in this environment."
+            );
+        } else if config.history.enabled {
+            println!(
+                "History collection is enabled; rows appear as the hook evaluates commands \
+                 (database: {}).",
+                ResolvedHistoryPath::resolve(&config.history).path.display()
+            );
+        } else {
+            println!(
+                "History collection is off. Enable it in config.toml with:\n\n  [history]\n  enabled = true\n"
+            );
+        }
+        return Ok(());
+    }
 
     // Show recommendations (always unless specific view requested)
     if !false_positives && !gaps || recommendations_only {
@@ -10439,11 +10537,14 @@ fn history_analyze(
             );
         }
 
-        // Show inactive packs
+        // Show inactive packs. A guard pack that never fired is working, so
+        // this is a listing, not advice to disable anything (#513).
         if !analysis.inactive_packs.is_empty() {
             println!(
-                "\n{} Inactive packs (enabled but never triggered): {}",
+                "\n{} Enabled packs with no matches in these {} commands (expected for \
+                 guard packs; not a reason to disable them): {}",
                 "ℹ️ ".dimmed(),
+                analysis.total_commands,
                 analysis.inactive_packs.join(", ").dimmed()
             );
         }
@@ -10897,21 +10998,38 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // Check 2: Claude Code settings file exists
     print!("Checking Claude Code settings... ");
     let settings_path = claude_settings_path();
+    let claude_settings_required = claude_config_dir_override().is_some();
     if settings_path.exists() {
         println!("{}", "OK".green());
     } else {
         println!("{}", "NOT FOUND".yellow());
-        println!("  ~/.claude/settings.json not found");
-        println!("  This is normal if Claude Code hasn't been configured yet");
+        if !claude_settings_required {
+            println!("  This is normal if Claude Code hasn't been configured yet");
+        }
         wired_to_an_agent = false;
     }
+    println!("  Settings path: {}", settings_path.display());
 
     // Check 3: Hook wiring (expanded diagnostics)
     print!("Checking hook wiring... ");
     let hook_diag = diagnose_hook_wiring();
-    issues += hook_diagnostics_issue_count(&hook_diag);
+    issues += hook_diagnostics_issue_count(&hook_diag, claude_settings_required);
 
-    if !hook_diag.settings_exists {
+    if !hook_diag.settings_exists && claude_settings_required {
+        println!("{}", "NOT REGISTERED".red());
+        println!("  The active CLAUDE_CONFIG_DIR has no settings.json or dcg hook");
+        if fix {
+            println!("  Attempting to register hook...");
+            if install_hook(false, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install' with the same CLAUDE_CONFIG_DIR");
+        }
+    } else if !hook_diag.settings_exists {
         println!("{}", "SKIPPED".yellow());
         println!("  No settings file to check");
     } else if let Some(ref err) = hook_diag.settings_error {
@@ -10954,7 +11072,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             "  Hook registered with wrong matcher: {:?}",
             hook_diag.wrong_matcher_hooks
         );
-        println!("  → dcg must match both Claude shell tools ({CLAUDE_SHELL_MATCHER})");
+        println!("  → dcg must match all Claude shell tools ({CLAUDE_SHELL_MATCHER})");
         if fix {
             println!("  Attempting to migrate the hook...");
             if install_hook(true, false).is_ok() {
@@ -11018,9 +11136,9 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     //   - GROK_* env vars present in the current process (Grok is the parent)
     //   - ~/.grok directory exists (Grok was installed at some point)
     //
-    // Grok also works via the Claude compatibility layer (~/.claude/settings.json
-    // — covered by Check 3 above). The native dcg.json gives a cleaner doctor
-    // output and avoids coupling Grok's behavior to Claude's settings file.
+    // Grok also works via the Claude compatibility layer, but always reads
+    // ~/.claude/settings.json: it does not honor CLAUDE_CONFIG_DIR. Diagnose
+    // that file independently of the active Claude settings checked above.
     let grok_session_present = std::env::var_os("GROK_SESSION_ID").is_some()
         || std::env::var_os("GROK_HOOK_EVENT").is_some()
         || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
@@ -11031,27 +11149,24 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
 
         let user_hook = grok_user_hook_path();
         let user_hook_exists = user_hook.exists();
-        let claude_compat_path = claude_settings_path();
-        let claude_compat_exists = claude_compat_path.exists();
+        let claude_compat_path = default_claude_settings_path();
+        let claude_compat_diag = diagnose_hook_wiring_at(&claude_compat_path);
 
         if user_hook_exists {
             println!("{}", "OK".green());
             println!("  Found: {}", user_hook.display());
-            if claude_compat_exists {
+            if claude_compat_diag.has_grok_compatible_hook() {
                 println!(
                     "  Grok also picks up dcg from {} (Claude compatibility layer).",
                     claude_compat_path.display()
                 );
             }
-        } else if claude_compat_exists && hook_diag.dcg_hook_count >= 1 {
+        } else if claude_compat_diag.has_grok_compatible_hook() {
             // Grok will use the Claude-compat path; this still works but the
             // native path is preferred. Surface as a friendly note, not an
             // error, so users who deliberately rely on Claude-compat aren't
-            // pestered. Any non-zero hook count is fine here because the
-            // "duplicate Claude hooks" case is already reported as a WARNING
-            // by Check 3 above — from Grok's point of view the compat layer
-            // is wired up either way, so we shouldn't escalate to
-            // "NOT REGISTERED" just because the Claude side has duplicates.
+            // pestered. Duplicate working hooks still protect Grok, but an
+            // async, malformed, or missing-executable hook does not.
             println!("{}", "OK (via Claude compat)".green());
             println!(
                 "  No native ~/.grok/hooks/dcg.json — Grok will pick up dcg from {}.",
@@ -11086,7 +11201,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             } else {
                 println!("  → Run 'dcg install --grok' to register the native hook");
                 println!(
-                    "    (or 'dcg install' for the Claude-compat path at {})",
+                    "    Grok's Claude-compat settings: {}",
                     claude_compat_path.display()
                 );
             }
@@ -11710,23 +11825,26 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
 
     // Check 8: Allowlist discovery + validation
     print!("Checking allowlist entries... ");
-    let allowlist_diag = diagnose_allowlists();
+    let allowlist_diag = diagnose_allowlists(config);
     if allowlist_diag.total_errors > 0 {
         println!("{}", "INVALID".red());
         issues += allowlist_diag.total_errors;
         for msg in &allowlist_diag.error_messages {
             println!("  {msg}");
         }
-        println!("  → Run 'dcg allowlist validate' for details");
+        for msg in &allowlist_diag.warning_messages {
+            println!("  {msg}");
+        }
+        println!("  → {ALLOWLIST_DOCTOR_REMEDIATION}");
     } else if allowlist_diag.total_warnings > 0 {
         println!("{}", "WARNING".yellow());
         for msg in &allowlist_diag.warning_messages {
             println!("  {msg}");
         }
-        println!("  → Run 'dcg allowlist validate' for details");
+        println!("  → {ALLOWLIST_DOCTOR_REMEDIATION}");
     } else if allowlist_diag.layers_found == 0 {
         println!("{}", "NONE".yellow().dimmed());
-        println!("  No allowlist files found (project or user)");
+        println!("  No allowlist files found (project, user, or system)");
         println!("  → Use 'dcg allow <rule-id> -r \"reason\"' to create one");
     } else {
         println!(
@@ -11980,6 +12098,7 @@ fn collect_doctor_report(
 
     // Check 2: Claude settings file exists
     let settings_path = claude_settings_path();
+    let claude_settings_required = claude_config_dir_override().is_some();
     let (status, message) = if settings_path.exists() {
         (
             DoctorCheckStatus::Ok,
@@ -11988,7 +12107,7 @@ fn collect_doctor_report(
     } else {
         (
             DoctorCheckStatus::Warning,
-            "settings.json not found (Claude Code not configured)".to_string(),
+            format!("settings.json not found at {}", settings_path.display()),
         )
     };
     checks.push(DoctorCheck {
@@ -12002,10 +12121,10 @@ fn collect_doctor_report(
 
     // Check 3: Hook wiring
     let hook_diag = diagnose_hook_wiring();
-    issues += hook_diagnostics_issue_count(&hook_diag);
+    issues += hook_diagnostics_issue_count(&hook_diag, claude_settings_required);
     let mut hook_fixed = false;
     let hook_repair = if fix
-        && hook_diag.settings_exists
+        && (hook_diag.settings_exists || claude_settings_required)
         && hook_diag.settings_error.is_none()
         && hook_diag.has_issues()
     {
@@ -12013,12 +12132,23 @@ fn collect_doctor_report(
     } else {
         None
     };
-    let (status, message, remediation) = if !hook_diag.settings_exists {
-        (
-            DoctorCheckStatus::Skipped,
-            "No settings file to check".to_string(),
-            None,
-        )
+    let (status, message, remediation) = if !hook_diag.settings_exists && hook_repair.is_none() {
+        if claude_settings_required {
+            (
+                DoctorCheckStatus::Error,
+                format!(
+                    "No dcg hook in active Claude settings at {}",
+                    settings_path.display()
+                ),
+                Some("Run 'dcg install' with the same CLAUDE_CONFIG_DIR".to_string()),
+            )
+        } else {
+            (
+                DoctorCheckStatus::Skipped,
+                "No settings file to check".to_string(),
+                None,
+            )
+        }
     } else if let Some(ref err) = hook_diag.settings_error {
         (
             DoctorCheckStatus::Error,
@@ -12106,6 +12236,17 @@ fn collect_doctor_report(
             None,
         )
     };
+    if hook_fixed && !hook_diag.settings_exists {
+        // A missing explicit configuration may have been created above.
+        // Keep JSON and the rich summary aligned with the repaired state.
+        if let Some(check) = checks
+            .iter_mut()
+            .find(|check| check.id == "claude_settings")
+        {
+            check.status = DoctorCheckStatus::Ok;
+            check.message = format!("settings.json found at {}", settings_path.display());
+        }
+    }
     checks.push(DoctorCheck {
         id: "hook_wiring",
         name: "Hook wiring",
@@ -12357,16 +12498,22 @@ fn collect_doctor_report(
     });
 
     // Check 8: Allowlist discovery + validation
-    let allowlist_diag = diagnose_allowlists();
+    let allowlist_diag = diagnose_allowlists(config);
     let (status, message, remediation) = if allowlist_diag.total_errors > 0 {
         issues += allowlist_diag.total_errors;
         (
             DoctorCheckStatus::Error,
             format!(
                 "Allowlist errors: {}",
-                allowlist_diag.error_messages.join("; ")
+                allowlist_diag
+                    .error_messages
+                    .iter()
+                    .chain(&allowlist_diag.warning_messages)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
-            Some("Run 'dcg allowlist validate' for details".to_string()),
+            Some(ALLOWLIST_DOCTOR_REMEDIATION.to_string()),
         )
     } else if allowlist_diag.total_warnings > 0 {
         (
@@ -12375,12 +12522,12 @@ fn collect_doctor_report(
                 "Allowlist warnings: {}",
                 allowlist_diag.warning_messages.join("; ")
             ),
-            Some("Run 'dcg allowlist validate' for details".to_string()),
+            Some(ALLOWLIST_DOCTOR_REMEDIATION.to_string()),
         )
     } else if allowlist_diag.layers_found == 0 {
         (
             DoctorCheckStatus::Warning,
-            "No allowlist files found (project or user)".to_string(),
+            "No allowlist files found (project, user, or system)".to_string(),
             Some("Use 'dcg allow <rule-id> -r \"reason\"' to create one".to_string()),
         )
     } else {
@@ -12451,7 +12598,8 @@ fn collect_doctor_report(
     let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
     if grok_session_present || grok_home_exists {
         let user_hook = grok_user_hook_path();
-        let claude_compat_exists = claude_settings_path().exists();
+        let claude_compat_path = default_claude_settings_path();
+        let claude_compat_diag = diagnose_hook_wiring_at(&claude_compat_path);
         let mut grok_fixed = false;
         let (status, message, remediation) = if user_hook.exists() {
             (
@@ -12459,14 +12607,16 @@ fn collect_doctor_report(
                 format!("Native Grok hook found at {}", user_hook.display()),
                 None,
             )
-        } else if claude_compat_exists && hook_diag.dcg_hook_count >= 1 {
+        } else if claude_compat_diag.has_grok_compatible_hook() {
             // Wired via the Claude compatibility layer. Deliberately not an
             // error: users who rely on compat should not be pestered.
             (
                 DoctorCheckStatus::Ok,
-                "No native ~/.grok/hooks/dcg.json; Grok picks up dcg from the Claude \
-                 compatibility layer"
-                    .to_string(),
+                format!(
+                    "No native ~/.grok/hooks/dcg.json; Grok picks up dcg from {} \
+                     (Claude compatibility layer; ignores CLAUDE_CONFIG_DIR)",
+                    claude_compat_path.display()
+                ),
                 Some("Run 'dcg install --grok' for a native hook".to_string()),
             )
         } else {
@@ -12960,8 +13110,8 @@ fn collect_doctor_report(
     }
 }
 
-const CLAUDE_SHELL_MATCHER: &str = "Bash|PowerShell";
-const LEGACY_CLAUDE_SHELL_MATCHER: &str = "Bash";
+const CLAUDE_SHELL_MATCHER: &str = "Bash|PowerShell|Monitor";
+const LEGACY_CLAUDE_SHELL_MATCHERS: &[&str] = &["Bash", "Bash|PowerShell"];
 const ANTIGRAVITY_SHELL_MATCHER: &str = "Bash";
 
 fn current_dcg_executable() -> std::io::Result<std::path::PathBuf> {
@@ -13531,7 +13681,7 @@ fn install_dcg_hook_into_settings(
         settings,
         force,
         CLAUDE_SHELL_MATCHER,
-        &[LEGACY_CLAUDE_SHELL_MATCHER],
+        LEGACY_CLAUDE_SHELL_MATCHERS,
         desired_hook,
     )
 }
@@ -13579,7 +13729,7 @@ fn uninstall_dcg_hook_from_settings(
 ///
 /// When `project` is `true`, writes to `.claude/settings.json` inside the
 /// current git repository root instead of the user-level
-/// `~/.claude/settings.json`.
+/// settings selected by `CLAUDE_CONFIG_DIR` (default `~/.claude/settings.json`).
 ///
 /// This is a wrapper around `install_dcg_hook_into_settings` that handles the
 /// file I/O and error reporting.
@@ -14646,15 +14796,19 @@ fn project_opencode_plugin_path() -> Result<std::path::PathBuf, Box<dyn std::err
 /// Generate the OpenCode `tool.execute.before` plugin source (#318).
 ///
 /// The legacy OpenCode v1 plugin routes every `bash` tool call through dcg's
-/// Claude-compatible hook protocol: an empty stdout means allow; a
-/// `hookSpecificOutput.permissionDecision` of `deny` (or `ask`, since
-/// OpenCode has no operator-review state) aborts the v1 tool hook by throwing.
+/// Claude-compatible hook protocol with `"dcg_explicit_verdict": true`, so an
+/// allowed command is answered with `{"dcg_verdict":"allow"}` rather than
+/// silence; a `hookSpecificOutput.permissionDecision` of `deny` (or `ask`,
+/// since OpenCode has no operator-review state) aborts the v1 tool hook by
+/// throwing.
 /// OpenCode v2 changed both its module/runtime contract and its interception
 /// APIs; dcg refuses to install or bless this v1 bridge when v2+ is detected
-/// until an authoritative veto path is verified (#419). Infrastructure
-/// failures (dcg missing/unrunnable) fail open with a stderr notice, matching
-/// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
-/// inside dcg.
+/// until an authoritative veto path is verified (#419).
+///
+/// A dcg that ran but gave no verdict (killed by a signal or the plugin's
+/// timeout, a non-zero exit, or exit 0 without the allow line) blocks unless
+/// `DCG_BRIDGE_CRASH_DECISION=allow`. Only a dcg that could not be started at
+/// all (missing or not executable) fails open, with a stderr notice.
 ///
 /// The dcg binary path is embedded as a JSON string literal (valid JSON
 /// strings are valid JS string literals), NOT shell-quoted — the plugin
@@ -14678,14 +14832,21 @@ fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result
 // Guard) before execution. Remove with `uninstall.sh` or by deleting this
 // file. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
 //
-// One file serves both plugin contracts (#419). OpenCode v1 loads the named
-// `DcgGuard` export and calls `tool.execute.before(input, output)`; v2 loads
-// the default export and requires `{{ id, setup(ctx) }}`, registering through
-// `ctx.tool.hook("execute.before", cb)` with a single `event` argument. An ES
-// module may carry both, and each loader reads only the shape it knows, so
-// the plugin does not depend on detecting the runtime — which matters because
+// One file serves every OpenCode plugin loader (#419, #516), because
 // `dcg update` regenerates this file and the installed OpenCode may have
-// changed major version since `dcg install` ran.
+// changed version since `dcg install` ran:
+//
+// - OpenCode v1 from 1.3.4 reads a default export that has an `id` as a
+//   plugin module and requires `server(input, options)` to return the hook
+//   map; without `server()` it rejects the whole file ("must default export an
+//   object with server()") and the bash tool runs unguarded. It then ignores
+//   the named export.
+// - OpenCode v1 up to 1.3.3 calls every export as a plugin function, so it
+//   registers the named `DcgGuard` export (and logs an error for the default
+//   object, which it cannot call).
+// - OpenCode v2 requires a default export `{{ id, setup(ctx) }}` and registers
+//   through `ctx.tool.hook("execute.before", cb)` with a single `event`
+//   argument; it drops keys it does not know, such as `server`.
 //
 // `node:child_process` rather than `Bun.spawn`: v2 migrated Bun -> Node, so
 // `Bun` is undefined there, while Bun implements the `node:` modules — so the
@@ -14694,16 +14855,38 @@ import {{ spawnSync }} from "node:child_process";
 
 const DCG_BIN = {path_literal};
 
-// Returns a deny reason, or null to allow. Infrastructure failures (dcg
-// missing, unrunnable, timed out) fail OPEN with a stderr notice, matching
-// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
-// inside dcg.
+// dcg's own boolean spelling for environment flags.
+function envFlag(name) {{
+  const value = process.env[name];
+  return typeof value === "string" && ["1", "true", "yes", "y", "on"].includes(value.trim().toLowerCase());
+}}
+
+// dcg ran but gave no verdict: it was killed (a signal, or this plugin's
+// timeout), exited non-zero, or exited 0 without its explicit allow line.
+// That is not an allow. Block, unless the operator opted out with
+// DCG_BRIDGE_CRASH_DECISION=allow.
+function noVerdict(detail) {{
+  const setting = process.env.DCG_BRIDGE_CRASH_DECISION;
+  if (typeof setting === "string" && setting.trim().toLowerCase() === "allow") {{
+    console.error(`[dcg] OpenCode guard got no verdict from dcg (${{detail}}); allowed because DCG_BRIDGE_CRASH_DECISION=allow`);
+    return null;
+  }}
+  console.error(`[dcg] OpenCode guard got no verdict from dcg (${{detail}}); blocking`);
+  return `Blocked by dcg: the command could not be verified because dcg gave no verdict (${{detail}}). Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`;
+}}
+
+// Returns a deny reason, or null to allow. dcg is asked for an explicit allow
+// line, so an empty stdout means it never answered. Only a dcg that could not
+// be started at all (missing or not executable) fails OPEN, with a stderr
+// notice, so that a broken install does not block every command.
 function dcgDenyReason(command) {{
   if (typeof command !== "string" || command.length === 0) return null;
+  // dcg's escape hatch exits before reading its input, so it never answers.
+  if (envFlag("DCG_BYPASS")) return null;
   let result;
   try {{
     result = spawnSync(process.env.DCG_BIN || DCG_BIN, {{
-      input: JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }} }}),
+      input: JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }}, dcg_explicit_verdict: true }}),
       encoding: "utf8",
       env: {{ ...process.env, OPENCODE: "1" }},
       timeout: 10000,
@@ -14712,31 +14895,47 @@ function dcgDenyReason(command) {{
     console.error(`[dcg] OpenCode guard could not run dcg: ${{err}}`);
     return null;
   }}
-  if (!result || result.error) {{
-    console.error(`[dcg] OpenCode guard could not run dcg: ${{result && result.error}}`);
+  if (!result) {{
+    console.error("[dcg] OpenCode guard could not run dcg: no result");
+    return null;
+  }}
+  // Never started: Node reports status null, Bun leaves it undefined.
+  if (result.error && result.status == null && !result.signal) {{
+    console.error(`[dcg] OpenCode guard could not run dcg: ${{result.error}}`);
     return null;
   }}
 
   const text = (result.stdout || "").trim();
-  if (!text) return null; // empty stdout = allow
-
-  let decision;
-  try {{
-    decision = JSON.parse(text);
-  }} catch {{
-    return null; // non-JSON stdout: treat as allow (matches other harnesses)
+  let decision = null;
+  if (text) {{
+    try {{
+      decision = JSON.parse(text);
+    }} catch {{
+      decision = null;
+    }}
   }}
-  const hso = decision.hookSpecificOutput;
+  const hso = decision && typeof decision === "object" ? decision.hookSpecificOutput : undefined;
   const verdict = hso && hso.permissionDecision;
-  // OpenCode has no operator-review state, so `ask` fails closed.
+  // OpenCode has no operator-review state, so `ask` fails closed. A blocking
+  // verdict stands whatever happened to the process afterwards.
   if (verdict === "deny" || verdict === "ask") {{
     return (hso && hso.permissionDecisionReason) || "Blocked by dcg";
   }}
-  return null;
+
+  const stderr = (result.stderr || "").trim().slice(-500);
+  const tail = stderr ? `: ${{stderr}}` : "";
+  if (result.signal) {{
+    const timedOut = result.error && result.error.code === "ETIMEDOUT" ? ", timed out" : "";
+    return noVerdict(`dcg was killed by ${{result.signal}}${{timedOut}}${{tail}}`);
+  }}
+  if (result.status !== 0) return noVerdict(`dcg exited ${{result.status}}${{tail}}`);
+  if (!text) return noVerdict(`dcg exited 0 with nothing on stdout${{tail}}`);
+  if (decision && typeof decision === "object" && decision.dcg_verdict === "allow") return null;
+  return noVerdict("dcg stdout was not a verdict");
 }}
 
-// OpenCode v1: named export, hook map, command in `output.args`.
-export const DcgGuard = async () => {{
+// OpenCode v1 hook map, command in `output.args`.
+function v1Hooks() {{
   return {{
     "tool.execute.before": async (input, output) => {{
       if (!input || input.tool !== "bash") return;
@@ -14744,11 +14943,16 @@ export const DcgGuard = async () => {{
       if (reason) throw new Error(reason);
     }},
   }};
-}};
+}}
 
-// OpenCode v2: default export with `id` + `setup`, command in `event.input`.
+// OpenCode v1 up to 1.3.3: every export is called as a plugin function.
+export const DcgGuard = async () => v1Hooks();
+
 export default {{
   id: "dcg-guard",
+  // OpenCode v1 from 1.3.4: `server(input, options)` returns the hook map.
+  server: async () => v1Hooks(),
+  // OpenCode v2: `setup(ctx)` registers the hook, command in `event.input`.
   async setup(ctx) {{
     await ctx.tool.hook("execute.before", async (event) => {{
       if (!event || event.tool !== "bash") return;
@@ -15581,8 +15785,13 @@ fn project_omp_extension_path() -> std::io::Result<std::path::PathBuf> {
 /// Generate an OMP ExtensionAPI module that gates every `bash` tool call on
 /// dcg's robot-mode evaluator. The command is sent on stdin and dcg is spawned
 /// directly (never through a shell). A deny-like JSON verdict or exit 1 is a
-/// safety block; status-only infrastructure failures fail open with a visible
-/// diagnostic, consistent with dcg's other generated integration bridges. A
+/// safety block. A dcg that started and then died without a blocking verdict
+/// (a signal, or an exit status dcg never uses for a verdict) is a crash and
+/// blocks unless `DCG_BRIDGE_CRASH_DECISION=allow`; a dcg that could not be
+/// started at all fails open with a visible diagnostic unless
+/// `DCG_UNVERIFIED_DECISION=deny`, which blocks both. A cwd that does not
+/// exist still gets a verdict: dcg starts from its nearest existing ancestor
+/// and receives the real cwd as `--command-cwd` (#504). A
 /// separate generous parent-side ceiling kills a pathologically wedged child;
 /// it does not replace dcg's own configurable evaluation deadline.
 fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<String> {
@@ -15591,6 +15800,8 @@ fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<S
         r#"// {OMP_EXTENSION_MARKER}: generated by `dcg install --omp` — do not edit.
 // Routes every Oh My Pi bash tool call through dcg (Destructive Command Guard)
 // before execution. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
+import {{ statSync }} from "node:fs";
+import path from "node:path";
 import type {{ ExtensionAPI }} from "@oh-my-pi/pi-coding-agent";
 import {{ settings }} from "@oh-my-pi/pi-coding-agent/config/settings";
 import {{ procmgr }} from "@oh-my-pi/pi-utils";
@@ -15610,7 +15821,7 @@ export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};
 const DCG_SIGNAL_CODE_MAX_CHARS = 64;
 type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other" | "signal";
 type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
-type DcgBridgeAction = "allow" | "block" | "infrastructure";
+type DcgBridgeAction = "allow" | "block" | "infrastructure" | "crash";
 type DcgParsedOutput = {{
   verdict: DcgParsedVerdict;
   reason?: string;
@@ -15634,16 +15845,19 @@ type OmpToolCallClassification =
 
 const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set<DcgParsedVerdict>(["deny", "ask", "indeterminate"]);
 const DCG_OBSERVATION_ABORTED = Symbol("dcg-child-observation-aborted");
-// Bun exposes no stdout when spawn itself throws. That runtime catch remains a
-// visible infrastructure fail-open; this total row makes the pure classifier
-// exhaustive for replay/model tests and preserves deny-like monotonicity.
+// Bun exposes no stdout when spawn itself throws, so the runtime catch reads
+// the "spawn-throw" row's empty-output cell: a visible infrastructure failure
+// that the unverified posture may still turn into a block. A dcg that started
+// and then died (a signal, or an exit status dcg never uses for a verdict)
+// without a blocking verdict is a "crash": it blocks unless
+// DCG_BRIDGE_CRASH_DECISION=allow.
 const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, DcgBridgeAction>> = {{
   "spawn-throw": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
   "exit-0": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
   "exit-1": {{ empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }},
   "exit-2": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
-  "exit-other": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
-  "signal": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
+  "exit-other": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
+  "signal": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
 }};
 
 // OMP's agent loop schema-validates built-in bash arguments before emitting
@@ -15728,6 +15942,60 @@ export function classifyDcgChild(
 ): {{ action: DcgBridgeAction; output: DcgParsedOutput }} {{
   const output = parseDcgOutput(stdoutText);
   return {{ action: DCG_CHILD_TRANSITIONS[outcome][output.verdict], output }};
+}}
+
+function isExistingDirectory(candidate: string): boolean {{
+  try {{
+    return statSync(candidate).isDirectory();
+  }} catch {{
+    return false;
+  }}
+}}
+
+// A command's cwd can be missing: an agent removed its scratch directory, or
+// the call names a directory it has yet to create. Bun then reports ENOENT for
+// the dcg binary, not for the directory, and dcg never runs (#504). The command
+// still needs a verdict, so start dcg from the nearest directory that exists:
+// an ancestor keeps the same project config, allowlists and Git branch. The
+// caller passes the reported cwd separately so dcg never judges a
+// directory-scoped allowlist entry against the ancestor. Returns undefined only
+// when no ancestor exists at all.
+export function dcgSpawnDirectory(commandCwd: string): string | undefined {{
+  let candidate = path.resolve(commandCwd);
+  while (true) {{
+    if (isExistingDirectory(candidate)) return candidate;
+    const parent = path.dirname(candidate);
+    if (parent === candidate) return undefined;
+    candidate = parent;
+  }}
+}}
+
+// An infrastructure failure means dcg produced no verdict. By default that
+// fails open with a visible diagnostic (#346), so a broken install cannot
+// block every command. `DCG_UNVERIFIED_DECISION=deny` (#338) asks for the
+// opposite posture: block whatever dcg could not judge. dcg's own config file
+// is out of reach when dcg did not run, so the environment override is the
+// posture this bridge can honour; `ask` and anything else keep the default.
+export function unverifiedPostureDenies(): boolean {{
+  const value = process.env.DCG_UNVERIFIED_DECISION;
+  return typeof value === "string" && value.trim().toLowerCase() === "deny";
+}}
+
+function unverifiedBlockReason(detail: string): string {{
+  return `Blocked by dcg: the command could not be verified (${{detail}}) and DCG_UNVERIFIED_DECISION=deny`;
+}}
+
+// A dcg that started and then crashed or was killed gave no verdict. That
+// blocks by default: dcg ran, so the install works, and the failure says
+// nothing about the command. DCG_BRIDGE_CRASH_DECISION=allow restores the
+// fail-open posture for crashes.
+export function crashPostureAllows(): boolean {{
+  const value = process.env.DCG_BRIDGE_CRASH_DECISION;
+  return typeof value === "string" && value.trim().toLowerCase() === "allow";
+}}
+
+function crashBlockReason(terminationDetail: string): string {{
+  return `Blocked by dcg: dcg ended without a verdict${{terminationDetail}}, so the command could not be verified. Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`;
 }}
 
 function isDcgSignalName(signalCode: string): boolean {{
@@ -16076,15 +16344,28 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       }}
     }}
 
+    // Start dcg in the command's cwd whenever it exists, so an ordinary call
+    // keeps the exact argv and directory context. Otherwise start it from the
+    // nearest existing ancestor (or dcg's own directory) and report the real
+    // cwd as data (#504).
+    const dcgArgv = [
+      DCG_BIN,
+      "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
+      "--format", "json",
+      "--omp-bridge-output",
+    ];
+    let spawnCwd = commandCwd;
+    if (!isExistingDirectory(commandCwd)) {{
+      spawnCwd = dcgSpawnDirectory(commandCwd) ?? path.dirname(DCG_BIN);
+      // One `--flag=value` word, so a cwd spelled like an option can never
+      // be parsed as one.
+      dcgArgv.push(`--command-cwd=${{commandCwd}}`);
+    }}
+
     let proc: Bun.ReadableSubprocess;
     try {{
-      proc = Bun.spawn([
-        DCG_BIN,
-        "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
-        "--format", "json",
-        "--omp-bridge-output",
-      ], {{
-        cwd: commandCwd,
+      proc = Bun.spawn(dcgArgv, {{
+        cwd: spawnCwd,
         stdin: commandStdin(command),
         stdout: "pipe",
         stderr: "pipe",
@@ -16094,7 +16375,22 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
         killSignal: "SIGKILL",
       }});
     }} catch (err) {{
-      console.error(`[dcg] OMP guard could not run dcg: ${{describeChildCollectionFailure(err)}}`);
+      // Bun names the binary for any ENOENT from posix_spawn, including a
+      // missing cwd, so say which directory was used as well. The cwd comes
+      // from tool input; JSON quoting keeps a control character in it from
+      // forging a separate diagnostic line.
+      const location = spawnCwd === commandCwd
+        ? `in ${{JSON.stringify(spawnCwd)}}`
+        : `in ${{JSON.stringify(spawnCwd)}} (command cwd ${{JSON.stringify(commandCwd)}} does not exist)`;
+      const detail = boundedDiagnosticText(
+        `could not start ${{DCG_BIN}} ${{location}}: ${{describeChildCollectionFailure(err)}}`,
+      );
+      // No child means no stdout: the transition table's empty-output cell.
+      const spawnAction = DCG_CHILD_TRANSITIONS["spawn-throw"].empty;
+      console.error(`[dcg] OMP guard infrastructure failure (dcg did not start): ${{detail}}`);
+      if (spawnAction === "infrastructure" && unverifiedPostureDenies()) {{
+        return {{ block: true, reason: unverifiedBlockReason("dcg did not start") }};
+      }}
       return;
     }}
 
@@ -16182,6 +16478,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     }}
     const hasInfrastructureDiagnostic =
       classification.action === "infrastructure" ||
+      classification.action === "crash" ||
       childOutcome === "exit-other" ||
       isDcgSignalCode(signalCode) ||
       Boolean(protocolDetail) ||
@@ -16192,6 +16489,13 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       console.error(`[dcg] OMP guard infrastructure failure${{terminationDetail}}${{details ? `: ${{details}}` : ""}}`);
       // A collection fault is not allowed to erase a completed deny-like
       // stdout verdict or the independent blocking exit-1 signal.
+      const unverified = classification.action === "infrastructure" || classification.action === "crash";
+      if (unverified && unverifiedPostureDenies()) {{
+        return {{ block: true, reason: unverifiedBlockReason(`dcg infrastructure failure${{terminationDetail}}`) }};
+      }}
+      if (classification.action === "crash" && !crashPostureAllows()) {{
+        return {{ block: true, reason: crashBlockReason(terminationDetail) }};
+      }}
       if (classification.action !== "block") return;
     }}
     if (!hasInfrastructureDiagnostic && stderrDetail) {{
@@ -16527,9 +16831,17 @@ const DCG_PROFILE_CHECK_MARKER: &str = "# dcg: warn if the Claude Code hook was 
 /// missing although it is installed (#503), and the warning's own advice —
 /// `dcg install` — is where the stale block gets repaired.
 #[cfg(any(windows, test))]
-const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction SilentlyContinue) -and
+    ((-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or
+     (Test-Path -LiteralPath (Join-Path (Join-Path $HOME '.claude') 'settings.json') -PathType Leaf))) {
   try {
-    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgClaudeDir = $env:CLAUDE_CONFIG_DIR
+    if ([string]::IsNullOrEmpty($dcgClaudeDir)) { $dcgClaudeDir = Join-Path $HOME '.claude' }
+    elseif ($dcgClaudeDir -eq '~') { $dcgClaudeDir = $HOME }
+    elseif ($dcgClaudeDir.StartsWith('~/') -or $dcgClaudeDir.StartsWith('~\')) { $dcgClaudeDir = Join-Path $HOME $dcgClaudeDir.Substring(2) }
+    if (-not (Split-Path -Path $dcgClaudeDir -IsAbsolute)) { $dcgClaudeDir = Join-Path (Get-Location).ProviderPath $dcgClaudeDir }
+    $dcgSettings = Join-Path $dcgClaudeDir 'settings.json'
+    $dcgCfg = if (Test-Path -LiteralPath $dcgSettings -PathType Leaf) { Get-Content -Raw -LiteralPath $dcgSettings | ConvertFrom-Json } else { $null }
     $dcgHas = $false
     foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
       foreach ($dcgH in @($dcgE.hooks)) {
@@ -16540,7 +16852,7 @@ const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction Silen
         if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
       }
     }
-    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+    if (-not $dcgHas) { Write-Host "[dcg] Hook missing from $dcgSettings - run: dcg install" -ForegroundColor Yellow }
   } catch { }
 }"#;
 
@@ -16651,11 +16963,24 @@ fn repair_powershell_profile_checks() -> Vec<std::path::PathBuf> {
 const DCG_SHELL_CHECK_SNIPPET: &str = r#"
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
-  if [ -f "$HOME/.claude/settings.json" ] && \
-     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
-       "$HOME/.claude/settings.json" &>/dev/null; then
-    printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
-  fi
+  (
+    dcg_claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    case "$dcg_claude_dir" in
+      "~") dcg_claude_dir="$HOME" ;;
+      "~/"*) dcg_claude_dir="$HOME/${dcg_claude_dir#"~/"}" ;;
+    esac
+    case "$dcg_claude_dir" in
+      /*) ;;
+      *) dcg_claude_dir="$PWD/$dcg_claude_dir" ;;
+    esac
+    dcg_claude_settings="${dcg_claude_dir%/}/settings.json"
+    if { [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ -f "$dcg_claude_settings" ]; } && \
+       { [ ! -f "$dcg_claude_settings" ] || \
+         ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
+           "$dcg_claude_settings" &>/dev/null; }; then
+      printf '\033[1;33m[dcg] Hook missing from %s — run: dcg install\033[0m\n' "$dcg_claude_settings"
+    fi
+  )
 fi
 "#;
 
@@ -16663,11 +16988,12 @@ fi
 #[cfg(unix)]
 const DCG_SHELL_CHECK_MARKER: &str = "# dcg: warn if hook was silently removed";
 
-/// Check whether a shell RC file already contains the DCG startup check.
+/// Check whether a shell RC file contains the current DCG startup check.
+/// A marker alone may belong to a stale check of the wrong settings file.
 #[cfg(unix)]
 fn rc_has_dcg_check(path: &std::path::Path) -> bool {
     if let Ok(content) = std::fs::read_to_string(path) {
-        content.contains(DCG_SHELL_CHECK_MARKER)
+        content.contains(DCG_SHELL_CHECK_SNIPPET.trim_start_matches('\n'))
     } else {
         false
     }
@@ -17641,12 +17967,44 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Get the path to user-level Claude Code settings (`~/.claude/settings.json`).
-fn claude_settings_path() -> std::path::PathBuf {
+/// The fixed Claude-compatible location used by integrations such as Grok,
+/// which do not honor Claude Code's `CLAUDE_CONFIG_DIR` environment variable.
+fn default_claude_settings_path() -> std::path::PathBuf {
     crate::config::home_dir()
         .unwrap_or_default()
         .join(".claude")
         .join("settings.json")
+}
+
+/// A non-empty override is explicit intent to use Claude Code, even when its
+/// directory/settings file does not exist yet. Do not trim: spaces are valid
+/// path characters, and an invalid override must never select the default.
+fn claude_config_dir_override() -> Option<std::path::PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Get the active user-level Claude Code settings. Expand only a leading `~`
+/// path component (never `~user`, variables, or shell expressions) and resolve
+/// relative values against the working directory, without requiring the
+/// destination to exist. Native path components preserve non-UTF-8 filenames
+/// on Unix and recognize both separators on Windows.
+fn claude_settings_path() -> std::path::PathBuf {
+    let Some(mut directory) = claude_config_dir_override() else {
+        return default_claude_settings_path();
+    };
+    if let Ok(rest) = directory.strip_prefix("~") {
+        if let Some(home) = crate::config::home_dir() {
+            directory = home.join(rest);
+        }
+    }
+    if directory.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            directory = cwd.join(directory);
+        }
+    }
+    directory.join("settings.json")
 }
 
 /// Get the path to project-level Claude Code settings (`.claude/settings.json`
@@ -17788,8 +18146,11 @@ fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
     Ok(registered)
 }
 
-/// Ensure the DCG hook is registered in `~/.claude/settings.json` with the
-/// current absolute executable path.
+/// Ensure the DCG hook is registered in the active Claude Code settings with
+/// the current absolute executable path.
+///
+/// Other detected integrations retain the default Claude-compatible location
+/// they have historically used.
 ///
 /// This is the self-healing mechanism that protects against Claude Code
 /// silently overwriting `settings.json` mid-session (removing the DCG hook),
@@ -17806,7 +18167,14 @@ fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
 ///   parse + array scan (typically < 1ms).
 /// - **Idempotent**: safe to call on every invocation.
 pub fn ensure_hook_registered() {
-    if let Err(e) = ensure_hook_registered_inner() {
+    ensure_hook_registered_for_agent(&crate::agent::detect_agent());
+}
+
+/// Self-heal using the host identified by the hook payload when available.
+/// Known clients that do not honor `CLAUDE_CONFIG_DIR` retain
+/// their fixed default location even when that variable is inherited.
+pub fn ensure_hook_registered_for_agent(agent: &crate::agent::Agent) {
+    if let Err(e) = ensure_hook_registered_inner(agent) {
         // Fail-open: log warning but never block the hook pipeline.
         crate::emit_stderr!("[dcg] Warning: self-heal check failed: {e}");
     }
@@ -17814,8 +18182,13 @@ pub fn ensure_hook_registered() {
 
 /// Inner implementation for `ensure_hook_registered` that returns errors
 /// so the outer function can swallow them for fail-open behavior.
-fn ensure_hook_registered_inner() -> Result<(), Box<dyn std::error::Error>> {
-    let settings_path = claude_settings_path();
+fn ensure_hook_registered_inner(
+    agent: &crate::agent::Agent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let settings_path = match agent {
+        crate::agent::Agent::ClaudeCode | crate::agent::Agent::Unknown => claude_settings_path(),
+        _ => default_claude_settings_path(),
+    };
     let lock_path = self_heal_lock_path(&settings_path);
     ensure_hook_registered_at(&settings_path, &lock_path)
 }
@@ -18070,6 +18443,23 @@ struct HookDiagnostics {
 
 #[allow(dead_code)]
 impl HookDiagnostics {
+    /// Whether this file can synchronously guard Grok's shell commands.
+    ///
+    /// Grok aliases its terminal tools to Bash, so the legacy Claude matchers
+    /// still protect it. Multiple working entries are redundant but remain
+    /// effective; active Claude wiring still requires the current matcher.
+    fn has_grok_compatible_hook(&self) -> bool {
+        self.settings_valid
+            && self.settings_error.is_none()
+            && self.dcg_hook_count > 0
+            && self
+                .wrong_matcher_hooks
+                .iter()
+                .all(|matcher| LEGACY_CLAUDE_SHELL_MATCHERS.contains(&matcher.as_str()))
+            && self.misconfigured_hooks.is_empty()
+            && self.missing_executable_hooks.is_empty()
+    }
+
     fn is_healthy(&self) -> bool {
         self.settings_valid
             && self.dcg_hook_count == 1
@@ -18088,15 +18478,21 @@ impl HookDiagnostics {
     }
 }
 
-fn hook_diagnostics_issue_count(diagnostics: &HookDiagnostics) -> usize {
-    usize::from(diagnostics.settings_exists && diagnostics.has_issues())
+fn hook_diagnostics_issue_count(diagnostics: &HookDiagnostics, settings_required: bool) -> usize {
+    usize::from((diagnostics.settings_exists || settings_required) && diagnostics.has_issues())
 }
 
 /// Diagnose hook wiring in detail.
 #[allow(dead_code)]
 fn diagnose_hook_wiring() -> HookDiagnostics {
-    let mut diag = HookDiagnostics::default();
     let settings_path = claude_settings_path();
+    diagnose_hook_wiring_at(&settings_path)
+}
+
+/// Diagnose a particular settings file so Grok's fixed compatibility source
+/// cannot accidentally reuse the active Claude Code configuration's verdict.
+fn diagnose_hook_wiring_at(settings_path: &std::path::Path) -> HookDiagnostics {
+    let mut diag = HookDiagnostics::default();
 
     if !settings_path.exists() {
         return diag;
@@ -18104,7 +18500,7 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
     diag.settings_exists = true;
 
     // Read and parse settings
-    let content = match std::fs::read_to_string(&settings_path) {
+    let content = match std::fs::read_to_string(settings_path) {
         Ok(c) => c,
         Err(e) => {
             diag.settings_error = Some(format!("Failed to read settings: {e}"));
@@ -18157,7 +18553,6 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     }
 
                     let hook_object = hook.as_object();
-                    let expected_property_count = if cfg!(windows) { 3 } else { 2 };
                     let type_is_command =
                         hook.get("type").and_then(serde_json::Value::as_str) == Some("command");
                     let is_synchronous =
@@ -18167,15 +18562,24 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     } else {
                         hook.get("shell").is_none()
                     };
-                    let exact_owned_shape =
-                        hook_object.is_some_and(|object| object.len() == expected_property_count);
-                    if !type_is_command || !is_synchronous || !shell_is_safe || !exact_owned_shape {
+                    // Judged on dcg-owned keys only, exactly as install and
+                    // hook-mode self-heal judge it (#528, #345): a host- or
+                    // operator-owned field such as `"timeout": 10` is carried
+                    // forward by `dcg install --force`, so counting it as a
+                    // defect produced a finding no remedy could clear. The one
+                    // host key that changes enforcement, `async`, is still
+                    // checked above.
+                    if hook_object.is_none()
+                        || !type_is_command
+                        || !is_synchronous
+                        || !shell_is_safe
+                    {
                         diag.misconfigured_hooks.push(format!(
                             "{cmd} (expected a synchronous command hook with the platform-safe shell)"
                         ));
                     }
                     match &desired_hook {
-                        Ok(expected) if hook != expected => {
+                        Ok(expected) if !hook_has_dcg_identity(hook, expected) => {
                             diag.misconfigured_hooks.push(format!(
                                 "{cmd} (hook does not invoke this dcg executable with \
                                  platform-safe quoting)"
@@ -18413,7 +18817,7 @@ fn run_smoke_test(config: &Config) -> bool {
 /// Allowlist validation diagnostics for doctor command.
 #[derive(Debug, Default)]
 struct AllowlistDiagnostics {
-    /// Number of allowlist layers found (project/user)
+    /// Number of allowlist layers found (project/user/system)
     layers_found: usize,
     /// Total error count
     total_errors: usize,
@@ -18425,10 +18829,17 @@ struct AllowlistDiagnostics {
     warning_messages: Vec<String>,
 }
 
-/// Diagnose allowlist health across project and user layers.
-fn diagnose_allowlists() -> AllowlistDiagnostics {
-    use crate::allowlist::{AllowSelector, AllowlistLayer};
+const ALLOWLIST_DOCTOR_REMEDIATION: &str = "Review the named allowlist file. Restrict working directories with paths (--path), \
+     set expires_at (--expires), or remove obsolete entries; use 'dcg allow-once' for \
+     one-off exceptions. Run 'dcg allowlist validate' for project/user validation; \
+     inspect system entries in their source file.";
 
+/// None denotes a synthetic namespace with dynamically generated rule names.
+type DoctorAllowlistRules =
+    std::collections::HashMap<String, Option<std::collections::HashSet<&'static str>>>;
+
+/// Diagnose the same persistent allowlist layers the evaluator loads.
+fn diagnose_allowlists(config: &Config) -> AllowlistDiagnostics {
     let mut diag = AllowlistDiagnostics::default();
 
     // An inactive repository allowlist is intentionally absent from the
@@ -18444,80 +18855,186 @@ fn diagnose_allowlists() -> AllowlistDiagnostics {
         ));
     }
 
-    // Load all allowlists
+    let active_rules = doctor_allowlist_active_rules(config);
     let allowlist = crate::allowlist::load_default_allowlists();
-
-    // Check each layer
     for loaded in &allowlist.layers {
-        // Skip system layer in doctor (less common)
-        if loaded.layer == AllowlistLayer::System {
-            continue;
-        }
-
-        // Count as found if path exists
-        let path = match loaded.layer {
-            AllowlistLayer::Agent => continue,
-            AllowlistLayer::Project => allowlist_path_for_layer(AllowlistLayer::Project),
-            AllowlistLayer::User => crate::allowlist::user_allowlist_path(),
-            AllowlistLayer::System => continue,
-        };
-
-        if !path.exists() {
-            continue;
-        }
-
-        diag.layers_found += 1;
-        let layer_label = loaded.layer.label();
-
-        // Report parse errors
-        for err in &loaded.file.errors {
-            diag.total_errors += 1;
-            diag.error_messages
-                .push(format!("{layer_label}: {}", err.message));
-        }
-
-        // Check entries
-        for (idx, entry) in loaded.file.entries.iter().enumerate() {
-            let entry_num = idx + 1;
-
-            // Check for expired entries
-            if let Some(expires_at) = &entry.expires_at {
-                if is_expired(expires_at) {
-                    diag.total_warnings += 1;
-                    diag.warning_messages.push(format!(
-                        "{layer_label}: entry {entry_num} expired ({expires_at})"
-                    ));
-                }
-            }
-
-            // Check for risky regex patterns without acknowledgement
-            if matches!(entry.selector, AllowSelector::RegexPattern(_)) && !entry.risk_acknowledged
-            {
-                diag.total_warnings += 1;
-                diag.warning_messages.push(format!(
-                    "{layer_label}: entry {entry_num} uses regex without risk_acknowledged"
-                ));
-            }
-
-            // Check for overly broad wildcards
-            if let AllowSelector::Rule(rule_id) = &entry.selector {
-                if rule_id.pack_id == "*" {
-                    diag.total_errors += 1;
-                    diag.error_messages.push(format!(
-                        "{layer_label}: entry {entry_num} uses dangerous global wildcard (*:*)"
-                    ));
-                } else if rule_id.pattern_name == "*" {
-                    diag.total_warnings += 1;
-                    diag.warning_messages.push(format!(
-                        "{layer_label}: entry {entry_num} uses pack wildcard ({}:*)",
-                        rule_id.pack_id
-                    ));
-                }
-            }
+        if loaded.layer != AllowlistLayer::Agent && loaded.path.exists() {
+            diagnose_allowlist_layer(loaded, &active_rules, &mut diag);
         }
     }
 
     diag
+}
+
+/// Resolve enabled rule inventories once. Guidance includes semantic filesystem
+/// rules as well as regex rules; heredoc refinements have dynamic identities.
+fn doctor_allowlist_active_rules(config: &Config) -> DoctorAllowlistRules {
+    use crate::heredoc::ScriptLanguage;
+
+    let mut active = DoctorAllowlistRules::new();
+    // Windows payloads enable their default packs on Unix too. Doctor audits
+    // persistent grants that can affect either supported shell dialect.
+    for pack_id in REGISTRY.expand_enabled_ordered(&config.enabled_pack_ids_for_payload(true)) {
+        if let Some(pack) = REGISTRY.get(&pack_id) {
+            active.insert(pack_id, Some(pack.guidance_rule_names().collect()));
+        }
+    }
+    let external = load_external_packs(&config.packs.expand_custom_paths());
+    for (pack_id, pack) in external.iter_packs() {
+        active.insert(pack_id.clone(), Some(pack.guidance_rule_names().collect()));
+    }
+
+    // Executable-text sinks are checked even when optional heredoc scanning
+    // is disabled. Do not mistake these synthetic namespaces for inert rules.
+    for pack_id in ["heredoc.posix", "heredoc.shell", "heredoc.powershell"] {
+        active.insert(pack_id.to_string(), None);
+    }
+
+    let settings = config.heredoc_settings();
+    if settings.enabled {
+        for (pack_id, language) in [
+            ("heredoc.bash", ScriptLanguage::Bash),
+            ("heredoc.go", ScriptLanguage::Go),
+            ("heredoc.php", ScriptLanguage::Php),
+            ("heredoc.python", ScriptLanguage::Python),
+            ("heredoc.ruby", ScriptLanguage::Ruby),
+            ("heredoc.perl", ScriptLanguage::Perl),
+            ("heredoc.javascript", ScriptLanguage::JavaScript),
+            ("heredoc.typescript", ScriptLanguage::TypeScript),
+        ] {
+            if settings
+                .allowed_languages
+                .as_ref()
+                .is_none_or(|languages| languages.contains(&language))
+            {
+                active.insert(pack_id.to_string(), None);
+            }
+        }
+    }
+
+    active
+}
+
+fn diagnose_allowlist_layer(
+    loaded: &crate::allowlist::LoadedAllowlistLayer,
+    active_rules: &DoctorAllowlistRules,
+    diag: &mut AllowlistDiagnostics,
+) {
+    diag.layers_found += 1;
+    let source = format!("{}: {}", loaded.layer.label(), loaded.path.display());
+
+    for err in &loaded.file.errors {
+        diag.total_errors += 1;
+        let entry = err
+            .entry_index
+            .map_or_else(String::new, |idx| format!("entry {}: ", idx + 1));
+        diag.error_messages
+            .push(format!("{source}: {entry}{}", err.message));
+    }
+
+    // Parsing drops invalid entries. Keep the original [[allow]] ordinal so a
+    // malformed earlier row cannot make remediation point at the wrong entry.
+    let rejected: std::collections::HashSet<_> = loaded
+        .file
+        .errors
+        .iter()
+        .filter_map(|err| err.entry_index)
+        .collect();
+    let mut source_index = 0;
+    for entry in &loaded.file.entries {
+        while rejected.contains(&source_index) {
+            source_index += 1;
+        }
+        let entry_num = source_index + 1;
+        source_index += 1;
+        let location = format!("{source}: entry {entry_num}");
+
+        // Share timestamp/date-only/TTL semantics with matching, including its
+        // fail-closed treatment of an uncomputable TTL.
+        if crate::allowlist::is_expired(entry) {
+            diag.total_warnings += 1;
+            diag.warning_messages.push(format!(
+                "{location} expired or has unusable expiration metadata \
+                 (expires_at={:?}, ttl={:?}, added_at={:?})",
+                entry.expires_at, entry.ttl, entry.added_at
+            ));
+        }
+
+        if matches!(entry.selector, AllowSelector::RegexPattern(_)) && !entry.risk_acknowledged {
+            diag.total_warnings += 1;
+            diag.warning_messages
+                .push(format!("{location} uses regex without risk_acknowledged"));
+        }
+
+        if let Some(warning) = unrestricted_allowlist_warning(entry, active_rules) {
+            diag.total_warnings += 1;
+            diag.warning_messages.push(format!("{location}: {warning}"));
+        } else if let AllowSelector::Rule(rule_id) = &entry.selector {
+            if rule_id.pack_id == "*" {
+                diag.total_errors += 1;
+                diag.error_messages
+                    .push(format!("{location} uses dangerous global wildcard (*:*)"));
+            } else if rule_id.pattern_name == "*" {
+                diag.total_warnings += 1;
+                diag.warning_messages.push(format!(
+                    "{location} uses pack wildcard ({}:*)",
+                    rule_id.pack_id
+                ));
+            }
+        }
+    }
+}
+
+/// Audit whole-rule grants, not exact commands or regex selectors. Eligibility
+/// deliberately follows parsed runtime semantics: e.g. environments/context
+/// metadata does not enforce a restriction, and session=false is indefinite.
+fn unrestricted_allowlist_warning(
+    entry: &AllowEntry,
+    active_rules: &DoctorAllowlistRules,
+) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let AllowSelector::Rule(rule_id) = &entry.selector else {
+        return None;
+    };
+    let rule_is_active = active_rules.get(&rule_id.pack_id).is_some_and(|names| {
+        names.as_ref().is_none_or(|names| {
+            (rule_id.pattern_name == "*" && !names.is_empty())
+                || names.contains(rule_id.pattern_name.as_str())
+        })
+    });
+    if rule_id.pack_id == "*"
+        || !rule_is_active
+        || !crate::allowlist::entry_has_unrestricted_path_scope(entry)
+        || entry.expires_at.is_some()
+        || entry.ttl.is_some()
+        || entry.session == Some(true)
+        || !crate::allowlist::is_entry_valid(entry)
+    {
+        return None;
+    }
+
+    let risk = match rule_id.pack_id.as_str() {
+        "core.filesystem" | "windows.filesystem" => {
+            "HIGH RISK: bypasses destructive filesystem protection"
+        }
+        "core.git" => "HIGH RISK: bypasses destructive Git protection",
+        _ => "bypasses this rule's protection",
+    };
+    let mut warning = format!(
+        "active globally scoped, indefinite allowlist exception for rule {rule_id}: \
+         {risk}; all working directories, no expiration; reason={:?}",
+        entry.reason
+    );
+    // Debug quoting preserves malformed provenance without allowing control
+    // characters to forge extra diagnostic lines or terminal escape sequences.
+    if let Some(added_by) = &entry.added_by {
+        let _ = write!(warning, "; added_by={added_by:?}");
+    }
+    if let Some(added_at) = &entry.added_at {
+        let _ = write!(warning, "; added_at={added_at:?}");
+    }
+    Some(warning)
 }
 // Allowlist CLI implementation
 // ============================================================================
@@ -22349,38 +22866,51 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     }
 
     #[test]
-    fn install_into_settings_migrates_legacy_bash_hook_without_widening_siblings() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
-                    "hooks": [
-                        { "type": "command", "command": "dcg" },
-                        { "type": "command", "command": "bash-only-hook" }
-                    ],
-                    "customField": "preserve"
-                }]
-            }
-        });
+    fn install_into_settings_migrates_legacy_matchers_without_widening_siblings() {
+        for legacy_matcher in LEGACY_CLAUDE_SHELL_MATCHERS {
+            let mut settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": legacy_matcher,
+                        "hooks": [
+                            { "type": "command", "command": "dcg" },
+                            { "type": "command", "command": "original-tool-hook" }
+                        ],
+                        "customField": "preserve"
+                    }]
+                }
+            });
 
-        let changed = install_dcg_hook_into_settings(&mut settings, false).expect("migration ok");
-        assert!(changed, "legacy matcher should be migrated without --force");
+            let changed =
+                install_dcg_hook_into_settings(&mut settings, false).expect("migration ok");
+            assert!(
+                changed,
+                "{legacy_matcher} should be migrated without --force"
+            );
 
-        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(
-            pre.iter().filter(|entry| is_dcg_hook_entry(entry)).count(),
-            1
-        );
-        assert_eq!(pre[0]["matcher"], CLAUDE_SHELL_MATCHER);
-        assert_eq!(pre[0]["hooks"][0], claude_dcg_hook().expect("desired hook"));
+            let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(
+                pre.iter().filter(|entry| is_dcg_hook_entry(entry)).count(),
+                1
+            );
+            assert_eq!(pre[0]["matcher"], CLAUDE_SHELL_MATCHER);
+            assert_eq!(pre[0]["hooks"][0], claude_dcg_hook().expect("desired hook"));
 
-        let legacy = pre
-            .iter()
-            .find(|entry| entry["matcher"] == LEGACY_CLAUDE_SHELL_MATCHER)
-            .expect("Bash-only sibling entry must remain");
-        assert!(entry_has_hook_command(legacy, "bash-only-hook"));
-        assert_eq!(legacy["customField"], "preserve");
-        assert!(!entry_has_hook_command(legacy, "dcg"));
+            let legacy = pre
+                .iter()
+                .find(|entry| entry["matcher"] == *legacy_matcher)
+                .expect("sibling entry must retain its original matcher");
+            assert!(entry_has_hook_command(legacy, "original-tool-hook"));
+            assert_eq!(legacy["customField"], "preserve");
+            assert!(!entry_has_hook_command(legacy, "dcg"));
+
+            let installed = settings.clone();
+            assert!(!install_dcg_hook_into_settings(&mut settings, false).unwrap());
+            assert_eq!(
+                settings, installed,
+                "{legacy_matcher} migration is idempotent"
+            );
+        }
     }
 
     #[test]
@@ -22518,23 +23048,28 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
 
     #[test]
     fn install_into_settings_refuses_malformed_legacy_matcher_hooks() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
-                    "hooks": { "not": "an array" }
-                }]
-            }
-        });
-        let original = settings.clone();
+        for legacy_matcher in LEGACY_CLAUDE_SHELL_MATCHERS {
+            let mut settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": legacy_matcher,
+                        "hooks": { "not": "an array" }
+                    }]
+                }
+            });
+            let original = settings.clone();
 
-        let err = install_dcg_hook_into_settings(&mut settings, false)
-            .expect_err("malformed legacy entry must fail closed");
-        assert!(err.to_string().contains("legacy Bash matcher hooks"));
-        assert_eq!(
-            settings, original,
-            "in-memory settings must remain unchanged on validation failure"
-        );
+            let err = install_dcg_hook_into_settings(&mut settings, false)
+                .expect_err("malformed legacy entry must fail closed");
+            assert!(
+                err.to_string()
+                    .contains(&format!("legacy {legacy_matcher} matcher hooks"))
+            );
+            assert_eq!(
+                settings, original,
+                "in-memory settings must remain unchanged on validation failure"
+            );
+        }
     }
 
     #[test]
@@ -23985,7 +24520,8 @@ if ($errors.Count -ne 0) {
     /// #419: the generated plugin must load under BOTH OpenCode plugin
     /// contracts.
     ///
-    /// v1 reads the named `DcgGuard` export and calls
+    /// v1 up to 1.3.3 calls the named `DcgGuard` export, v1 from 1.3.4 calls
+    /// the default export's `server()` (#516), and both then call
     /// `tool.execute.before(input, output)`; v2 requires a default export
     /// `{ id, setup(ctx) }` and registers through
     /// `ctx.tool.hook("execute.before", cb)`. A v1-only file fails v2's loader
@@ -24010,6 +24546,13 @@ if ($errors.Count -ne 0) {
         assert!(
             source.contains("\"tool.execute.before\""),
             "v1 registers a tool.execute.before hook map"
+        );
+        // #516: OpenCode v1 from 1.3.4 treats a default export with an `id`
+        // as a plugin module and rejects it without `server()`, so the v2
+        // shape alone made v1 refuse the whole file.
+        assert!(
+            source.contains("server: async () => v1Hooks()"),
+            "v1 (>= 1.3.4) needs the default export's server() to return the hook map"
         );
 
         // v2 contract.
@@ -24186,7 +24729,7 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("\"--robot\", \"test\", \"--stdin\""));
         assert!(source.contains("\"--agent\", \"omp\""));
         assert!(
-            source.contains("\"--format\", \"json\",\n        \"--omp-bridge-output\","),
+            source.contains("\"--format\", \"json\",\n      \"--omp-bridge-output\","),
             "the private robot bridge must pin compact JSON before Clap reads ambient DCG_FORMAT"
         );
         assert!(source.contains("\"deny\", \"ask\", \"indeterminate\""));
@@ -24221,9 +24764,20 @@ if ($errors.Count -ne 0) {
             "each effective bash cwd must be resolved against the callback's session cwd"
         );
         assert!(
-            source.contains("cwd: commandCwd,"),
-            "dcg must run in the same effective cwd as the guarded bash call"
+            source.contains(
+                "let spawnCwd = commandCwd;\n    if (!isExistingDirectory(commandCwd)) {"
+            ),
+            "dcg must run in the same effective cwd as the guarded bash call whenever it exists"
         );
+        assert!(
+            source.contains("spawnCwd = dcgSpawnDirectory(commandCwd) ?? path.dirname(DCG_BIN);"),
+            "a missing cwd must still reach dcg from an existing directory (#504)"
+        );
+        assert!(
+            source.contains("dcgArgv.push(`--command-cwd=${commandCwd}`);"),
+            "the real cwd must reach dcg as data, in a single argv word that cannot pose as an option"
+        );
+        assert!(source.contains("cwd: spawnCwd,"));
 
         let line = source
             .lines()
@@ -24246,7 +24800,8 @@ if ($errors.Count -ne 0) {
             "the generated artifact must not overstate pathname authority as byte identity"
         );
         assert!(
-            source.contains("proc = Bun.spawn([\n        DCG_BIN,"),
+            source.contains("const dcgArgv = [\n      DCG_BIN,")
+                && source.contains("proc = Bun.spawn(dcgArgv, {"),
             "the installed absolute executable must be the direct child capability"
         );
         assert!(
@@ -24357,7 +24912,7 @@ if ($errors.Count -ne 0) {
             !has_bounded_compact_contract(&unbounded_collector_mutant),
             "the source contract must reject the former unbounded `.text()` collectors"
         );
-        let full_envelope_mutant = source.replacen("        \"--omp-bridge-output\",\n", "", 1);
+        let full_envelope_mutant = source.replacen("      \"--omp-bridge-output\",\n", "", 1);
         assert!(
             !has_bounded_compact_contract(&full_envelope_mutant),
             "the source contract must reject restoring the command-echoing general robot envelope"
@@ -24400,9 +24955,9 @@ if ($errors.Count -ne 0) {
         assert!(source.contains(
             "if (!cancellationRequested) readFailure = describeChildCollectionFailure(reason);"
         ));
-        assert!(
-            source.contains("OMP guard could not run dcg: ${describeChildCollectionFailure(err)}")
-        );
+        assert!(source.contains(
+            "`could not start ${DCG_BIN} ${location}: ${describeChildCollectionFailure(err)}`"
+        ));
         assert_eq!(
             source
                 .matches("${describeChildCollectionFailure(err)}")
@@ -24670,8 +25225,8 @@ if ($errors.Count -ne 0) {
             r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
             r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#,
             r#""exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
-            r#""exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
-            r#""signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
+            r#""exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
+            r#""signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
         ] {
             assert!(
                 source.contains(row),
@@ -24898,6 +25453,10 @@ function equal(actual: unknown, expected: unknown, caseId: string): void {
   check(left === right, `${caseId}: expected ${right}, received ${left}`);
 }
 
+// The unverified posture is ambient configuration; the corpus sets it
+// explicitly where it matters and must not inherit an operator's value.
+delete process.env.DCG_UNVERIFIED_DECISION;
+
 const toolCaseIds: string[] = [];
 const toolCases: Array<[string, unknown, string, string?]> = [
   ["tool/null-event", null, "other-tool"],
@@ -24940,8 +25499,8 @@ const expectedActions = {
   "exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
   "exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" },
   "exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
-  "exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
-  "signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
+  "exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
+  "signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
 } as const;
 const transitionCaseIds: string[] = [];
 for (const outcome of outcomes) {
@@ -25409,6 +25968,12 @@ try {
     };
   };
 
+  // A dcg that started and died without a blocking verdict blocks by default.
+  const crashBlock = (terminationDetail: string) => ({
+    block: true,
+    reason: `Blocked by dcg: dcg ended without a verdict${terminationDetail}, so the command could not be verified. Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`,
+  });
+
   let replay = await invoke("callback/other-tool", { toolName: "read", input: {} });
   equal(replay.result, undefined, "callback/other-tool/result");
   equal(replay.spawns.length, 0, "callback/other-tool/spawn-count");
@@ -25638,7 +26203,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitError: "synthetic exit status failure" },
   );
-  equal(replay.result, undefined, "callback/exit-reject-no-verdict/result");
+  equal(replay.result, crashBlock(" (exit status unavailable)"), "callback/exit-reject-no-verdict/result");
   equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-no-verdict/direct-child-kill");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-no-verdict/diagnostics-without-unobserved-signal");
 
@@ -25671,7 +26236,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { stdout: "", stderr: "child crash", exitCode: 9 },
   );
-  equal(replay.result, undefined, "callback/infrastructure-exit/result");
+  equal(replay.result, crashBlock(" (exit 9)"), "callback/infrastructure-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9): child crash"], "callback/infrastructure-exit/diagnostics");
 
   replay = await invoke(
@@ -25687,7 +26252,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: null },
   );
-  equal(replay.result, undefined, "callback/normal-exit-137/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/normal-exit-137/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137)"], "callback/normal-exit-137/diagnostics");
 
   replay = await invoke(
@@ -25703,7 +26268,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: "SIGKILL" },
   );
-  equal(replay.result, undefined, "callback/sigkill-no-verdict/result");
+  equal(replay.result, crashBlock(" (signal SIGKILL)"), "callback/sigkill-no-verdict/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/sigkill-no-verdict/diagnostics");
 
   replay = await invoke(
@@ -25732,7 +26297,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: undefined },
   );
-  equal(replay.result, undefined, "callback/undefined-exit/result");
+  equal(replay.result, crashBlock(" (exit status unavailable)"), "callback/undefined-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable)"], "callback/undefined-exit/diagnostics");
 
   replay = await invoke(
@@ -25740,7 +26305,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: null },
   );
-  equal(replay.result, undefined, "callback/null-exit/result");
+  equal(replay.result, crashBlock(" (exit status null)"), "callback/null-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status null)"], "callback/null-exit/diagnostics");
 
   replay = await invoke(
@@ -25748,7 +26313,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: "137\n\u001b[31mFORGED" },
   );
-  equal(replay.result, undefined, "callback/control-exit/result");
+  equal(replay.result, crashBlock(" (exit status invalid: string)"), "callback/control-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/control-exit/diagnostics");
 
   replay = await invoke(
@@ -25756,7 +26321,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: "7".repeat(DCG_STDERR_MAX_BYTES + 1) },
   );
-  equal(replay.result, undefined, "callback/oversized-exit/result");
+  equal(replay.result, crashBlock(" (exit status invalid: string)"), "callback/oversized-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/oversized-exit/diagnostics");
 
   replay = await invoke(
@@ -25764,7 +26329,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: { toString(): string { throw new Error("invalid exit status must not be coerced"); } } },
   );
-  equal(replay.result, undefined, "callback/hostile-object-exit/result");
+  equal(replay.result, crashBlock(" (exit status invalid: object)"), "callback/hostile-object-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: object)"], "callback/hostile-object-exit/diagnostics");
 
   replay = await invoke(
@@ -25772,7 +26337,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: { signal: "SIGKILL" } },
   );
-  equal(replay.result, undefined, "callback/invalid-signal/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/invalid-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: object"], "callback/invalid-signal/diagnostics");
 
   replay = await invoke(
@@ -25780,7 +26345,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: "SIGKILL\n\u001b[31mFORGED" },
   );
-  equal(replay.result, undefined, "callback/control-signal/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/control-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/control-signal/diagnostics");
 
   replay = await invoke(
@@ -25788,7 +26353,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: "S".repeat(DCG_STDERR_MAX_BYTES + 1) },
   );
-  equal(replay.result, undefined, "callback/oversized-signal/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/oversized-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/oversized-signal/diagnostics");
 
   replay = await invoke(
@@ -25973,7 +26538,7 @@ try {
     { stuckUntilTimeout: true },
   );
   check(replay.elapsedMs < 1_000, "callback/timeout-no-verdict/remained-bounded");
-  equal(replay.result, undefined, "callback/timeout-no-verdict/result");
+  equal(replay.result, crashBlock(" (signal SIGKILL)"), "callback/timeout-no-verdict/result");
   equal(replay.spawns.length, 1, "callback/timeout-no-verdict/spawn-count");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/timeout-no-verdict/diagnostics");
 
@@ -25996,7 +26561,119 @@ try {
   equal(replay.result, undefined, "callback/spawn-throw/result");
   equal(replay.spawns.length, 0, "callback/spawn-throw/spawn-count");
   equal(replay.watchdogSchedules, 0, "callback/spawn-throw/no-watchdog-before-successful-spawn");
-  equal(replay.errors, ["[dcg] OMP guard could not run dcg: Error: synthetic spawn failure"], "callback/spawn-throw/diagnostics");
+  equal(replay.errors, [
+    `[dcg] OMP guard infrastructure failure (dcg did not start): could not start ${observedExecutable} in ${JSON.stringify(process.cwd())}: Error: synthetic spawn failure`,
+  ], "callback/spawn-throw/diagnostics");
+
+  // #504: a cwd that does not exist must not cost the command its verdict.
+  const missingCwd = `${process.cwd()}/dcg-missing-cwd-504/nested`;
+  replay = await invoke(
+    "callback/missing-cwd-deny",
+    { toolName: "bash", input: { command: "git reset --hard", cwd: missingCwd } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "judged from an ancestor", rule_id: "core.git:reset-hard" }), exitCode: 1 },
+  );
+  equal(replay.result, { block: true, reason: "judged from an ancestor\n\nRule: core.git:reset-hard" }, "callback/missing-cwd-deny/result");
+  equal(replay.spawns.length, 1, "callback/missing-cwd-deny/spawn-count");
+  equal(replay.spawns[0]!.cwd, process.cwd(), "callback/missing-cwd-deny/nearest-existing-ancestor");
+  equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix", "--format", "json", "--omp-bridge-output", `--command-cwd=${missingCwd}`], "callback/missing-cwd-deny/argv");
+  equal(replay.errors, [], "callback/missing-cwd-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/existing-cwd-unchanged-argv",
+    { toolName: "bash", input: { command: "echo ok", cwd: process.cwd() } },
+    { stdout: JSON.stringify({ decision: "allow" }), exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/existing-cwd-unchanged-argv/result");
+  equal(replay.spawns[0]!.cwd, process.cwd(), "callback/existing-cwd-unchanged-argv/cwd");
+  equal(replay.spawns[0]!.argv.some(arg => arg.startsWith("--command-cwd")), false, "callback/existing-cwd-unchanged-argv/argv");
+
+  replay = await invoke(
+    "callback/missing-cwd-spawn-throw",
+    { toolName: "bash", input: { command: "echo safe", cwd: missingCwd } },
+    { spawnError: "synthetic spawn failure" },
+  );
+  equal(replay.result, undefined, "callback/missing-cwd-spawn-throw/result");
+  equal(replay.errors, [
+    `[dcg] OMP guard infrastructure failure (dcg did not start): could not start ${observedExecutable} in ${JSON.stringify(process.cwd())} (command cwd ${JSON.stringify(missingCwd)} does not exist): Error: synthetic spawn failure`,
+  ], "callback/missing-cwd-spawn-throw/diagnostics");
+
+  // #338 posture: DCG_UNVERIFIED_DECISION=deny turns every verdict-less
+  // infrastructure outcome into a block; `ask` keeps the #346 fail-open.
+  process.env.DCG_UNVERIFIED_DECISION = " Deny ";
+  try {
+    replay = await invoke(
+      "callback/spawn-throw-unverified-deny",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { spawnError: "synthetic spawn failure" },
+    );
+    equal(replay.result, {
+      block: true,
+      reason: "Blocked by dcg: the command could not be verified (dcg did not start) and DCG_UNVERIFIED_DECISION=deny",
+    }, "callback/spawn-throw-unverified-deny/result");
+    equal(replay.errors.length, 1, "callback/spawn-throw-unverified-deny/diagnostics");
+
+    replay = await invoke(
+      "callback/infrastructure-exit-unverified-deny",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { exitCode: 9 },
+    );
+    equal(replay.result, {
+      block: true,
+      reason: "Blocked by dcg: the command could not be verified (dcg infrastructure failure (exit 9)) and DCG_UNVERIFIED_DECISION=deny",
+    }, "callback/infrastructure-exit-unverified-deny/result");
+    equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9)"], "callback/infrastructure-exit-unverified-deny/diagnostics");
+
+    replay = await invoke(
+      "callback/allow-unaffected-by-unverified-deny",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { stdout: JSON.stringify({ decision: "allow" }), exitCode: 0 },
+    );
+    equal(replay.result, undefined, "callback/allow-unaffected-by-unverified-deny/result");
+
+    process.env.DCG_UNVERIFIED_DECISION = "ask";
+    replay = await invoke(
+      "callback/spawn-throw-unverified-ask",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { spawnError: "synthetic spawn failure" },
+    );
+    equal(replay.result, undefined, "callback/spawn-throw-unverified-ask/result");
+  } finally {
+    delete process.env.DCG_UNVERIFIED_DECISION;
+  }
+
+  // DCG_BRIDGE_CRASH_DECISION=allow restores fail-open for a crash only: a
+  // deny written before the crash, and DCG_UNVERIFIED_DECISION=deny, still win.
+  process.env.DCG_BRIDGE_CRASH_DECISION = " Allow ";
+  try {
+    replay = await invoke(
+      "callback/crash-opt-out-allows",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { exitCode: 137, signalCode: "SIGKILL" },
+    );
+    equal(replay.result, undefined, "callback/crash-opt-out-allows/result");
+    equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/crash-opt-out-allows/diagnostics");
+
+    replay = await invoke(
+      "callback/crash-opt-out-keeps-deny",
+      { toolName: "bash", input: { command: "danger" } },
+      { stdout: JSON.stringify({ decision: "deny", reason: "deny survives the opt-out" }), exitCode: 9 },
+    );
+    equal(replay.result, { block: true, reason: "deny survives the opt-out" }, "callback/crash-opt-out-keeps-deny/result");
+
+    process.env.DCG_UNVERIFIED_DECISION = "deny";
+    replay = await invoke(
+      "callback/crash-opt-out-loses-to-unverified-deny",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { exitCode: 9 },
+    );
+    equal(replay.result, {
+      block: true,
+      reason: "Blocked by dcg: the command could not be verified (dcg infrastructure failure (exit 9)) and DCG_UNVERIFIED_DECISION=deny",
+    }, "callback/crash-opt-out-loses-to-unverified-deny/result");
+  } finally {
+    delete process.env.DCG_BRIDGE_CRASH_DECISION;
+    delete process.env.DCG_UNVERIFIED_DECISION;
+  }
 } finally {
   (Bun as unknown as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
   console.error = originalConsoleError;
@@ -26048,6 +26725,8 @@ console.log(JSON.stringify({
             .current_dir(root)
             .env("DCG_BIN", root.join("ambient-decoy-dcg"))
             .env_remove("PI_NO_PTY")
+            .env_remove("DCG_UNVERIFIED_DECISION")
+            .env_remove("DCG_BRIDGE_CRASH_DECISION")
             .output()
             .expect("launch Bun OMP bridge replay")
     }
@@ -26330,6 +27009,16 @@ console.log(JSON.stringify({
                 "callback/timeout-no-verdict",
                 "callback/timeout-after-deny",
                 "callback/spawn-throw",
+                "callback/missing-cwd-deny",
+                "callback/existing-cwd-unchanged-argv",
+                "callback/missing-cwd-spawn-throw",
+                "callback/spawn-throw-unverified-deny",
+                "callback/infrastructure-exit-unverified-deny",
+                "callback/allow-unaffected-by-unverified-deny",
+                "callback/spawn-throw-unverified-ask",
+                "callback/crash-opt-out-allows",
+                "callback/crash-opt-out-keeps-deny",
+                "callback/crash-opt-out-loses-to-unverified-deny",
             ]
             .map(str::to_string)
         );
@@ -26467,9 +27156,11 @@ console.log(JSON.stringify({
             "the executable corpus vacuously accepted echoing hostile exit-status bytes\nstdout:\n{}",
             String::from_utf8_lossy(&unsafe_exit_mutant_output.stdout)
         );
+        // The crash block reason carries the same termination detail, so the
+        // forged bytes are caught at the case's result or its diagnostics.
         assert!(
             String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
-                .contains("callback/control-exit/diagnostics"),
+                .contains("callback/control-exit/"),
             "unsafe invalid-exit mutant red must identify the control-injection callback\nstderr:\n{}",
             String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
         );
@@ -29562,14 +30253,15 @@ exclude = ["target/**"]
         };
         assert!(!diag.is_healthy());
         assert!(diag.has_issues());
-        assert_eq!(hook_diagnostics_issue_count(&diag), 1);
+        assert_eq!(hook_diagnostics_issue_count(&diag, false), 1);
     }
 
     #[test]
     fn hook_diagnostics_missing_settings_is_skipped_not_an_issue() {
         let diag = HookDiagnostics::default();
         assert!(!diag.settings_exists);
-        assert_eq!(hook_diagnostics_issue_count(&diag), 0);
+        assert_eq!(hook_diagnostics_issue_count(&diag, false), 0);
+        assert_eq!(hook_diagnostics_issue_count(&diag, true), 1);
     }
 
     #[test]
@@ -29618,6 +30310,169 @@ exclude = ["target/**"]
         };
         assert!(!diag.is_healthy());
         assert!(diag.has_issues());
+    }
+
+    #[test]
+    fn doctor_allowlist_audit_respects_runtime_scope_and_lifetime() {
+        use crate::allowlist::{LoadedAllowlistLayer, parse_allowlist_toml};
+
+        let active_rules = doctor_allowlist_active_rules(&Config::default());
+        for (metadata, expect_warning) in [
+            ("", true),
+            ("paths = []", true),
+            ("paths = [\"*\"]", true),
+            ("paths = [\"/reviewed/**\", \"*\"]", true),
+            ("paths = [\"**\"]", true),
+            ("paths = [\"**/\"]", true),
+            ("paths = [\"**/*\"]", true),
+            ("paths = [\"**/**\"]", true),
+            (r"paths = ['\\?/**']", true),
+            ("paths = [\"/reviewed/**\"]", false),
+            ("paths = [\"/tmp/**\"]", false),
+            ("paths = [\"**/reviewed/**\"]", false),
+            ("paths = [\"**/*/\"]", false),
+            ("paths = [\"/**\"]", cfg!(unix)),
+            ("paths = [\"/**/*\"]", cfg!(unix)),
+            ("session = false", true),
+            ("session = true\nsession_id = \"bounded-session\"", false),
+            ("expires_at = \"2099-12-31\"", false),
+            ("expires_at = \"2000-01-01\"", false),
+            ("ttl = \"1h\"\nadded_at = \"2099-01-01\"", false),
+            ("ttl = \"1h\"\nadded_at = \"2000-01-01\"", false),
+            ("ttl = \"1h\"", false),
+            ("ttl = \"1h\"\nadded_at = \"bad-timestamp\"", false),
+            ("added_at = \"bad-timestamp\"", true),
+            ("expires_at = 123", true),
+            ("ttl = 123", true),
+            ("session = \"true\"", true),
+            ("paths = [\"**/*\"]\nexpires_at = \"2099-12-31\"", false),
+            ("paths = [\"**/*\"]\nexpires_at = \"2000-01-01\"", false),
+            ("paths = [\"**/*\"]\nttl = \"1h\"", false),
+            (
+                "paths = [\"**/*\"]\nsession = true\nsession_id = \"bounded-session\"",
+                false,
+            ),
+        ] {
+            let path = std::path::PathBuf::from("doctor-allowlist.toml");
+            let file = parse_allowlist_toml(
+                AllowlistLayer::User,
+                &path,
+                &format!(
+                    "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"review\"\n{metadata}\n"
+                ),
+            );
+            assert!(file.errors.is_empty(), "{metadata}: {:?}", file.errors);
+            assert_eq!(file.entries.len(), 1, "{metadata}");
+            let mut diag = AllowlistDiagnostics::default();
+            diagnose_allowlist_layer(
+                &LoadedAllowlistLayer {
+                    layer: AllowlistLayer::User,
+                    path,
+                    file,
+                },
+                &active_rules,
+                &mut diag,
+            );
+            let warnings = diag.warning_messages.join("; ");
+            assert_eq!(
+                warnings.contains("active globally scoped, indefinite"),
+                expect_warning,
+                "{metadata}: {warnings}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_allowlist_audit_uses_concrete_enabled_rules_and_synthetic_namespaces() {
+        let mut config = Config::default();
+        config.packs.enabled = vec![
+            "core".to_string(),
+            "containers.docker".to_string(),
+            "made.up".to_string(),
+        ];
+        config.packs.disabled = vec!["containers.docker".to_string()];
+        config.heredoc.enabled = Some(false);
+        let rules = doctor_allowlist_active_rules(&config);
+        assert!(!rules.contains_key("core"));
+        assert!(!rules.contains_key("made.up"));
+        assert!(!rules.contains_key("containers.docker"));
+        assert!(rules.contains_key("windows.filesystem"));
+        let filesystem = rules["core.filesystem"].as_ref().unwrap();
+        assert!(filesystem.contains("rm-rf-root-home"));
+        assert!(filesystem.contains("tar-exec-unverified"));
+        assert!(!filesystem.contains("rm-rf-root"));
+        assert!(rules.contains_key("heredoc.posix"));
+        assert!(rules.contains_key("heredoc.shell"));
+        assert!(rules.contains_key("heredoc.powershell"));
+        assert!(!rules.contains_key("heredoc.python"));
+        assert!(!rules.contains_key("heredoc.madeup"));
+
+        config.heredoc.enabled = Some(true);
+        config.heredoc.languages = Some(vec!["python".to_string()]);
+        let rules = doctor_allowlist_active_rules(&config);
+        assert!(rules.contains_key("heredoc.python"));
+        assert!(!rules.contains_key("heredoc.ruby"));
+        assert!(rules.contains_key("heredoc.posix"));
+
+        config.packs.disabled.push("windows.filesystem".to_string());
+        assert!(!doctor_allowlist_active_rules(&config).contains_key("windows.filesystem"));
+    }
+
+    #[test]
+    fn doctor_allowlist_audit_keeps_source_ordinals_and_escapes_provenance() {
+        use crate::allowlist::{LoadedAllowlistLayer, parse_allowlist_toml};
+
+        let path = std::path::PathBuf::from("system-allowlist.toml");
+        let file = parse_allowlist_toml(
+            AllowlistLayer::System,
+            &path,
+            r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "rejected expiry"
+expires_at = "bad-expiry"
+
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "review\nforged diagnostic"
+added_by = "reviewer\u001b[31m"
+added_at = "not-a-timestamp"
+
+[[allow]]
+rule = "core.git:reset-hard"
+
+[[allow]]
+rule = "core.filesystem:rm-rf-general"
+reason = "filesystem exception"
+added_at = 2026-08-01T12:00:00Z
+"#,
+        );
+        let mut diag = AllowlistDiagnostics::default();
+        diagnose_allowlist_layer(
+            &LoadedAllowlistLayer {
+                layer: AllowlistLayer::System,
+                path,
+                file,
+            },
+            &doctor_allowlist_active_rules(&Config::default()),
+            &mut diag,
+        );
+        assert_eq!(diag.layers_found, 1);
+        assert_eq!(diag.total_errors, 2);
+        assert_eq!(diag.total_warnings, 2);
+        assert!(diag.error_messages[0].contains("entry 1"));
+        assert!(diag.error_messages[1].contains("entry 3"));
+        let git = &diag.warning_messages[0];
+        assert!(git.contains("system: system-allowlist.toml: entry 2"));
+        assert!(git.contains("HIGH RISK: bypasses destructive Git protection"));
+        assert!(git.contains(r"review\nforged diagnostic"));
+        assert!(git.contains(r"reviewer\u{1b}[31m"));
+        assert!(git.contains("not-a-timestamp"));
+        assert!(!git.contains(['\n', '\r', '\u{1b}']));
+        let filesystem = &diag.warning_messages[1];
+        assert!(filesystem.contains("entry 4"));
+        assert!(filesystem.contains("destructive filesystem protection"));
+        assert!(filesystem.contains("2026-08-01T12:00:00Z"));
     }
 
     #[test]
@@ -30443,26 +31298,42 @@ exclude = ["target/**"]
     fn self_heal_repair_carries_timeout_from_legacy_matcher() {
         // A hook migrating off the legacy matcher keeps its host-owned fields.
         let desired = claude_dcg_hook().unwrap();
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
-                    "hooks": [dcg_hook_with_timeout("/stale/path/to/dcg", 7)]
-                }]
-            }
-        });
+        for legacy_matcher in LEGACY_CLAUDE_SHELL_MATCHERS {
+            let dir = tempfile::tempdir().unwrap();
+            let settings_path = dir.path().join("settings.json");
+            let lock_path = dir.path().join("selfheal.lock");
+            let settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": legacy_matcher,
+                        "hooks": [dcg_hook_with_timeout(desired["command"].as_str().unwrap(), 7)]
+                    }]
+                }
+            });
+            assert!(!settings_has_exact_dcg_hook(&settings, &desired));
+            std::fs::write(
+                &settings_path,
+                serde_json::to_vec_pretty(&settings).unwrap(),
+            )
+            .unwrap();
 
-        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
-        assert!(changed);
-        let hook = canonical_dcg_hook(&settings);
-        assert_eq!(hook["command"], desired["command"]);
-        assert_eq!(hook["timeout"], 7);
-        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert!(
-            pre.iter()
-                .all(|entry| entry["matcher"] != LEGACY_CLAUDE_SHELL_MATCHER),
-            "emptied legacy entry is dropped"
-        );
+            ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+            let content = std::fs::read(&settings_path).unwrap();
+            let healed: serde_json::Value = serde_json::from_slice(&content).unwrap();
+            let hook = canonical_dcg_hook(&healed);
+            assert_eq!(hook["command"], desired["command"]);
+            assert_eq!(hook["timeout"], 7);
+            assert!(settings_has_exact_dcg_hook(&healed, &desired));
+            let pre = healed["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(pre.len(), 1, "emptied {legacy_matcher} entry is dropped");
+
+            ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+            assert_eq!(
+                std::fs::read(&settings_path).unwrap(),
+                content,
+                "self-heal is idempotent"
+            );
+        }
     }
 
     #[cfg(not(windows))]

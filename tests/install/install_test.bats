@@ -325,27 +325,110 @@ printf '{"gitVersion":"%s"}\n' "$MOCK_COSIGN_VERSION"
 MOCKEOF
     chmod +x "$mock_cosign"
 
-    export MOCK_COSIGN_VERSION="v2.6.1"
-    run cosign_version_is_patched "$mock_cosign"
-    [ "$status" -ne 0 ]
-    MOCK_COSIGN_VERSION="v2.6.2"
+    # version|expected status (0 = patched)
+    local cases=(
+        "v2.6.1|1"
+        "v2.6.2|0"
+        "v3.0.3|1"
+        "v3.0.4|0"
+        "v3.1.2|0"
+        "v3.0.4-rc.1|1"
+        "v2.6.2-rc.1|1"
+        "devel|1"
+        "v3.1.3+dirty|0"
+        "v3.0.4+dirty|0"
+        "v3.0.3+dirty|1"
+        "3.1.3|0"
+        "v3.1.3-dirty|0"
+        "v3.0.4-dirty|1"
+        "v3.0.4-3-gabc1234|1"
+        "v3.1.0-rc.1+build.5|0"
+        "v2.6.10|0"
+        "v2.08.0|0"
+        "v4.0.0-rc.1|0"
+        "v1.13.9|1"
+        "v3.1|1"
+        "v3.1.3 junk|1"
+        "|1"
+    )
+    local entry version expected
+    for entry in "${cases[@]}"; do
+        version="${entry%|*}"
+        expected="${entry##*|}"
+        export MOCK_COSIGN_VERSION="$version"
+        run cosign_version_is_patched "$mock_cosign"
+        if [ "$expected" -eq 0 ]; then
+            [ "$status" -eq 0 ] || { echo "expected '$version' to count as patched"; return 1; }
+        else
+            [ "$status" -ne 0 ] || { echo "expected '$version' to be rejected"; return 1; }
+        fi
+    done
+}
+
+@test "cosign_version_is_patched: reads pretty JSON and the plain-text GitVersion line (GH #505)" {
+    local mock_cosign="$TEST_TMPDIR/bin/cosign"
+    cat > "$mock_cosign" << 'MOCKEOF'
+#!/bin/bash
+if [ "${2:-}" = "--json" ]; then
+  [ "$MOCK_COSIGN_JSON" = 0 ] && exit 1
+  printf '{\n  "gitVersion": "%s",\n  "gitTreeState": "dirty"\n}\n' "$MOCK_COSIGN_VERSION"
+  exit 0
+fi
+printf '  ______\nGitVersion:    %s\nGitCommit:     11926fa\n' "$MOCK_COSIGN_VERSION"
+MOCKEOF
+    chmod +x "$mock_cosign"
+
+    export MOCK_COSIGN_VERSION="v3.1.3+dirty"
+    export MOCK_COSIGN_JSON=1
     run cosign_version_is_patched "$mock_cosign"
     [ "$status" -eq 0 ]
-    MOCK_COSIGN_VERSION="v3.0.3"
-    run cosign_version_is_patched "$mock_cosign"
-    [ "$status" -ne 0 ]
-    MOCK_COSIGN_VERSION="v3.0.4"
+    MOCK_COSIGN_JSON=0
     run cosign_version_is_patched "$mock_cosign"
     [ "$status" -eq 0 ]
-    MOCK_COSIGN_VERSION="v3.1.2"
+    MOCK_COSIGN_VERSION="v3.0.3+dirty"
     run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+}
+
+@test "verify_sigstore_bundle: a distro cosign build verifies instead of being skipped (GH #505)" {
+    TMP="$TEST_TMPDIR/sigstore-work"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local bundle="$TEST_TMPDIR/release.sigstore.json"
+    printf 'artifact' > "$artifact"
+    printf '{}' > "$bundle"
+    export COSIGN_ARGS_FILE="$TMP/cosign.args"
+    cat > "$TEST_TMPDIR/bin/cosign" << 'MOCKEOF'
+#!/bin/bash
+if [ "${1:-}" = "version" ]; then
+  printf '{"gitVersion":"%s"}\n' "$MOCK_COSIGN_VERSION"
+  exit 0
+fi
+if [ "${1:-}" = "verify-blob" ] && [ "${2:-}" = "--help" ]; then
+  printf '%s\n' 'Usage: cosign verify-blob --bundle FILE --key FILE'
+  exit 0
+fi
+printf '%s\n' "$@" > "$COSIGN_ARGS_FILE"
+case " $* " in
+  *" --key "*) exit 0 ;;
+  *) exit 1 ;;
+esac
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/cosign"
+    SIGSTORE_BUNDLE_URL="file://$bundle"
+
+    export MOCK_COSIGN_VERSION="v3.1.3+dirty"
+    run verify_sigstore_bundle "$artifact" "https://example.invalid/dcg.tar.xz"
     [ "$status" -eq 0 ]
-    MOCK_COSIGN_VERSION="v3.0.4-rc.1"
-    run cosign_version_is_patched "$mock_cosign"
-    [ "$status" -ne 0 ]
-    MOCK_COSIGN_VERSION="devel"
-    run cosign_version_is_patched "$mock_cosign"
-    [ "$status" -ne 0 ]
+    [[ "$output" == *"cosign local release key"* ]]
+    grep -Fxq -- "--key" "$COSIGN_ARGS_FILE"
+
+    rm -f "$COSIGN_ARGS_FILE"
+    MOCK_COSIGN_VERSION="v3.0.3+dirty"
+    run verify_sigstore_bundle "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"cosign reports version 'v3.0.3+dirty'"* ]]
+    [ ! -e "$COSIGN_ARGS_FILE" ]
 }
 
 @test "verify_sigstore_bundle: prefers the pinned local release key" {
@@ -386,6 +469,86 @@ MOCKEOF
 # ============================================================================
 # Agent Detection Tests
 # ============================================================================
+
+@test "Claude settings resolver: default, empty, absolute, relative, tilde and literal path values" {
+    unset CLAUDE_CONFIG_DIR
+    [ "$(claude_config_dir)" = "$HOME/.claude" ]
+    export CLAUDE_CONFIG_DIR=""
+    [ "$(claude_config_dir)" = "$HOME/.claude" ]
+
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/active Claude"
+    [ "$(claude_config_dir)" = "$TEST_TMPDIR/active Claude" ]
+    export CLAUDE_CONFIG_DIR="relative Claude/../active"
+    [ "$(claude_config_dir)" = "$PWD/relative Claude/../active" ]
+    export CLAUDE_CONFIG_DIR='~/active Claude'
+    [ "$(claude_config_dir)" = "$HOME/active Claude" ]
+    export CLAUDE_CONFIG_DIR='~'
+    [ "$(claude_config_dir)" = "$HOME" ]
+
+    export CLAUDE_CONFIG_DIR='~someone/$HOME/$(touch should-not-execute)'
+    [ "$(claude_config_dir)" = "$PWD/~someone/\$HOME/\$(touch should-not-execute)" ]
+    [ ! -e "$PWD/should-not-execute" ]
+    export CLAUDE_CONFIG_DIR=$'active\n'
+    # Keep the helper's terminating newline distinct from the literal path.
+    local resolved
+    resolved="$(claude_config_dir; printf .)"
+    [ "${resolved%$'\n.'}" = "$PWD/"$'active\n' ]
+}
+
+@test "detect_agents: explicit CLAUDE_CONFIG_DIR detects Claude before its directory exists" {
+    setup_mock_codex
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/active Claude"
+    detect_agents
+    [[ " ${DETECTED_AGENTS[*]} " =~ " claude-code " ]]
+    [[ " ${DETECTED_AGENTS[*]} " =~ " codex-cli " ]]
+    [ ! -e "$CLAUDE_CONFIG_DIR" ]
+
+    mkdir -p "$CLAUDE_CONFIG_DIR"
+    detect_agents
+    [[ " ${DETECTED_AGENTS[*]} " =~ " claude-code " ]]
+}
+
+@test "shell startup check: resolves active Claude directory each time and warns when missing" {
+    command -v jq >/dev/null || skip "jq not available"
+    cat > "$TEST_TMPDIR/bin/dcg" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    chmod +x "$TEST_TMPDIR/bin/dcg"
+    mkdir -p "$HOME/.claude" "$HOME/active Claude"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg"}]}]}}' > "$HOME/.claude/settings.json"
+    printf '{}\n' > "$HOME/active Claude/settings.json"
+
+    maybe_add_shell_check
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+
+    export CLAUDE_CONFIG_DIR='~/active Claude'
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Hook missing from $HOME/active Claude/settings.json"* ]]
+
+    export CLAUDE_CONFIG_DIR='missing Claude'
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Hook missing from $PWD/missing Claude/settings.json"* ]]
+
+    export CLAUDE_CONFIG_DIR=""
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+
+    mv "$HOME/.claude/settings.json" "$TEST_TMPDIR/protected-default.json"
+    unset CLAUDE_CONFIG_DIR
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    export CLAUDE_CONFIG_DIR=""
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
 
 @test "detect_agents: finds Claude Code when directory exists" {
     log_test "Testing Claude Code detection via directory..."

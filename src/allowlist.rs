@@ -386,6 +386,11 @@ impl LayeredAllowlist {
 
         let mut cached_session_id = SessionIdCache::Unresolved;
         let cwd = cwd.map(ScopeCwd::new);
+        // Ids this rule was split out of (#509). An entry for one of them
+        // still covers the rule, but only when no entry names the rule itself
+        // (or the pack wildcard) in any layer.
+        let legacy_names = crate::packs::legacy_rule_names(pack_id, pattern_name);
+        let mut legacy_hit: Option<AllowlistHit<'_>> = None;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
@@ -409,10 +414,24 @@ impl LayeredAllowlist {
                         entry,
                     });
                 }
+
+                // The agent layer's rule entries are in-memory grants
+                // (`with_rule_grants`) for exactly the finding they name; a
+                // grant past `branch-force-delete` must not also hide a
+                // `branch-delete` finding on the same line.
+                if legacy_hit.is_none()
+                    && layer.layer != AllowlistLayer::Agent
+                    && legacy_names.contains(&rule_id.pattern_name.as_str())
+                {
+                    legacy_hit = Some(AllowlistHit {
+                        layer: layer.layer,
+                        entry,
+                    });
+                }
             }
         }
 
-        None
+        legacy_hit
     }
 
     /// Find the first allowlist entry that matches a rule, with no known cwd.
@@ -1281,6 +1300,90 @@ pub fn entry_is_path_scoped(entry: &AllowEntry) -> bool {
         .is_some_and(|patterns| !patterns.is_empty() && !patterns.iter().any(|p| p == "*"))
 }
 
+/// Recognize path scopes that cover every absolute working directory.
+///
+/// This is an audit-only property. Recursive universal globs still require a
+/// known cwd when matching, so this must not replace [`entry_is_path_scoped`]
+/// in the evaluator. Normalize and resolve literal prefixes exactly as the
+/// runtime matcher does; a spelling such as `/./**/*` has no real restriction.
+pub(crate) fn entry_has_unrestricted_path_scope(entry: &AllowEntry) -> bool {
+    if !entry_is_path_scoped(entry) {
+        return true;
+    }
+
+    entry.paths.as_ref().is_some_and(|patterns| {
+        patterns.iter().any(|pattern| {
+            glob_has_unrestricted_path_scope(&normalize_scope_text(pattern))
+                || cached_pattern_prefix(pattern)
+                    .is_some_and(|resolved| glob_has_unrestricted_path_scope(&resolved))
+        })
+    })
+}
+
+/// Prove universality for the star/separator subset of the runtime glob syntax.
+///
+/// In `glob::Pattern`, `**/` is one recursive token: its following separator is
+/// consumed by the parser. With no remaining literal separator, recursive
+/// tokens and an optional final `*` cover every path. With one separator, a `*`
+/// immediately before it covers the first or penultimate component while a
+/// recursive token on either side covers any depth. Without that component
+/// wildcard, the separator can only be the Unix root and the suffix must cover
+/// any depth: a recursive prefix cannot stop midway through a component. A
+/// final literal `/` would exclude ordinary cwd paths.
+/// More restrictive syntax and unions of individually bounded patterns are
+/// intentionally not classified from a handful of sample directories.
+fn glob_has_unrestricted_path_scope(pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if glob::Pattern::new(pattern).is_err() {
+        return false;
+    }
+
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut has_recursive = false;
+    let mut recursive_after_separator = false;
+    let mut component_before_separator = false;
+    let mut literal_separators = 0;
+    let mut ends_with_separator = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'*' => {
+                index += 1;
+                if bytes.get(index) == Some(&b'*') {
+                    has_recursive = true;
+                    recursive_after_separator |= literal_separators == 1;
+                    index += 1;
+                    // Pattern validation above guarantees a whole-component
+                    // `**`; its optional trailing slash is part of the token.
+                    if bytes.get(index) == Some(&b'/') {
+                        index += 1;
+                    }
+                }
+                ends_with_separator = false;
+            }
+            b'/' => {
+                literal_separators += 1;
+                if literal_separators > 1 {
+                    return false;
+                }
+                component_before_separator =
+                    bytes[..index].ends_with(b"*") && !bytes[..index].ends_with(b"**");
+                index += 1;
+                ends_with_separator = true;
+            }
+            _ => return false,
+        }
+    }
+
+    has_recursive
+        && !ends_with_separator
+        && (literal_separators == 0
+            || component_before_separator
+            || (cfg!(unix) && recursive_after_separator))
+}
+
 /// The string form of a working directory used for path-scope glob matching.
 ///
 /// Symlinks are resolved first. A scope is a claim about a real directory, and
@@ -1841,14 +1944,22 @@ pub(crate) fn user_allowlist_path() -> PathBuf {
 /// directory tree. The CLI separately enforces the explicit project-policy
 /// trust requirement before any project-layer mutation.
 pub(crate) fn project_allowlist_path(start: &Path) -> PathBuf {
-    if let Some(root) =
-        crate::config::find_repo_root(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
-    {
+    project_allowlist_path_within(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
+}
+
+/// [`project_allowlist_path`] with the upward search limited to `max_hops`
+/// parents of `start` (both for the repository root and for an existing
+/// allowlist). Tests pass the depth of their temporary tree so the answer
+/// does not depend on what lies above it: a temporary directory created
+/// inside a checkout (as a remote build worker's `TMPDIR` can be) would
+/// otherwise resolve to that checkout's root.
+fn project_allowlist_path_within(start: &Path, max_hops: usize) -> PathBuf {
+    if let Some(root) = crate::config::find_repo_root(start, max_hops) {
         return root.join(".dcg").join("allowlist.toml");
     }
 
     let mut current = Some(start);
-    for _ in 0..=crate::config::REPO_ROOT_SEARCH_MAX_HOPS {
+    for _ in 0..=max_hops {
         let Some(dir) = current else {
             break;
         };
@@ -2150,11 +2261,16 @@ fn get_timestamp_string(tbl: &toml::value::Table, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // These tests bound the upward search to their temporary tree: the
+    // system temporary directory can itself sit inside a Git checkout (a
+    // remote build worker points `TMPDIR` at `<checkout>/.rch-tmp`), and an
+    // unbounded search then answers with that checkout's root.
+
     #[test]
     fn project_allowlist_path_falls_back_to_cwd_outside_git() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            project_allowlist_path(tmp.path()),
+            project_allowlist_path_within(tmp.path(), 0),
             tmp.path().join(".dcg").join("allowlist.toml")
         );
     }
@@ -2168,7 +2284,12 @@ mod tests {
         let nested = tmp.path().join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(project_allowlist_path(&nested), root_allowlist);
+        assert_eq!(project_allowlist_path_within(&nested, 2), root_allowlist);
+        // Below the bound, the nested directory governs itself.
+        assert_eq!(
+            project_allowlist_path_within(&nested, 1),
+            nested.join(".dcg").join("allowlist.toml")
+        );
     }
 
     #[test]
@@ -2176,6 +2297,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            project_allowlist_path_within(&nested, 2),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
+
+    /// The production entry point searches the full default depth.
+    #[test]
+    fn project_allowlist_path_searches_the_default_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
         std::fs::create_dir_all(&nested).unwrap();
 
         assert_eq!(
@@ -2663,6 +2798,86 @@ mod tests {
             .expect("wildcard should match");
         assert_eq!(hit.layer, AllowlistLayer::Project);
         assert_eq!(hit.entry.reason, "allow all git rules in this pack");
+    }
+
+    /// #509: an entry for `branch-force-delete` keeps covering the split-out
+    /// `branch-delete`, an entry for `branch-delete` covers only itself, and an
+    /// in-memory grant for the old id stays exact.
+    #[test]
+    fn legacy_rule_entry_covers_split_rule_but_grants_stay_exact_509() {
+        let layer_with = |layer: AllowlistLayer, pattern: &str, reason: &str| {
+            let mut entry = make_test_entry();
+            entry.selector = AllowSelector::Rule(RuleId {
+                pack_id: "core.git".to_string(),
+                pattern_name: pattern.to_string(),
+            });
+            entry.reason = reason.to_string();
+            LoadedAllowlistLayer {
+                layer,
+                path: PathBuf::from("test"),
+                file: AllowlistFile {
+                    entries: vec![entry],
+                    errors: Vec::new(),
+                },
+            }
+        };
+
+        let legacy = LayeredAllowlist {
+            layers: vec![layer_with(
+                AllowlistLayer::User,
+                "branch-force-delete",
+                "legacy",
+            )],
+        };
+        assert!(
+            legacy
+                .match_rule("core.git", "branch-force-delete")
+                .is_some()
+        );
+        let hit = legacy
+            .match_rule("core.git", "branch-delete")
+            .expect("legacy entry still covers the split-out rule");
+        assert_eq!(hit.entry.reason, "legacy");
+        assert!(
+            legacy.match_rule("other.pack", "branch-delete").is_none(),
+            "the legacy link is pack-specific"
+        );
+
+        let split = LayeredAllowlist {
+            layers: vec![layer_with(AllowlistLayer::User, "branch-delete", "split")],
+        };
+        assert!(split.match_rule("core.git", "branch-delete").is_some());
+        assert!(
+            split
+                .match_rule("core.git", "branch-force-delete")
+                .is_none(),
+            "the new id must not allow the forced forms"
+        );
+
+        // An exact entry in a lower layer is preferred over a legacy entry in
+        // a higher one: the more specific id wins.
+        let mixed = LayeredAllowlist {
+            layers: vec![
+                layer_with(AllowlistLayer::Project, "branch-force-delete", "legacy"),
+                layer_with(AllowlistLayer::User, "branch-delete", "split"),
+            ],
+        };
+        let hit = mixed.match_rule("core.git", "branch-delete").expect("hit");
+        assert_eq!(hit.entry.reason, "split");
+
+        // A re-evaluation grant past `branch-force-delete` must not also hide
+        // a `branch-delete` finding.
+        let granted = LayeredAllowlist { layers: Vec::new() }.with_rule_grants(
+            &[("core.git", "branch-force-delete")],
+            "grant",
+            "test",
+        );
+        assert!(
+            granted
+                .match_rule("core.git", "branch-force-delete")
+                .is_some()
+        );
+        assert!(granted.match_rule("core.git", "branch-delete").is_none());
     }
 
     // ==========================================================================
@@ -3512,6 +3727,122 @@ mod tests {
 
         entry.paths = Some(vec!["/srv/scratch/**".to_string()]);
         assert!(entry_is_path_scoped(&entry));
+    }
+
+    #[test]
+    fn unrestricted_scope_audit_recognizes_equivalent_recursive_globs() {
+        for pattern in [
+            "**", "**/", "**/*", "**/**", "**/**/*", "**/*/**", "**/*/*", "*/**", "*/**/*",
+            r"\\?/**", r"\\?/*",
+        ] {
+            let mut entry = make_test_entry();
+            entry.paths = Some(vec![pattern.to_string()]);
+            assert!(validate_glob_pattern(pattern).is_ok(), "{pattern}");
+            assert!(entry_has_unrestricted_path_scope(&entry), "{pattern}");
+
+            // These are regression witnesses against the actual matcher, not
+            // the basis for the diagnostic's structural universality proof.
+            for cwd in [
+                "/",
+                "/etc",
+                "/home/review/.private/deep",
+                "/workspace/日本語",
+                "C:/",
+                "C:/Users/reviewer/project",
+                "//server/share/.private/deep",
+            ] {
+                assert!(path_matches_glob(pattern, cwd), "{pattern} vs {cwd}");
+            }
+
+            assert!(entry_is_path_scoped(&entry), "{pattern}");
+            assert!(
+                !is_entry_valid_at_path(&entry, None),
+                "auditing {pattern} must preserve unknown-cwd matching behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn unrestricted_scope_audit_preserves_bounded_globs() {
+        for pattern in [
+            "/tmp/**",
+            "/reviewed/workspace/**",
+            "**/workspace/**",
+            "**/*.rs",
+            "projects/**",
+            "*/*",
+            "/*/**",
+            "**/*/",
+            "**/*/*/*",
+            "**//",
+            "**//*",
+            "[abc]/**",
+            "?/**",
+            "***",
+            "[",
+        ] {
+            let mut entry = make_test_entry();
+            entry.paths = Some(vec![pattern.to_string()]);
+            assert!(!entry_has_unrestricted_path_scope(&entry), "{pattern}");
+        }
+
+        // Root coverage alone does not establish universality: a required
+        // trailing slash still excludes normal canonical working directories.
+        assert!(path_matches_glob("**/*/", "/"));
+        assert!(!path_matches_glob("**/*/", "/etc"));
+        assert!(!path_matches_glob("/*/**", "/"));
+        assert!(path_matches_glob("**//*", "/etc"));
+        assert!(!path_matches_glob("**//*", "/etc/deep"));
+
+        let mut entry = make_test_entry();
+        entry.paths = Some(vec!["/tmp/**".to_string(), "**/*".to_string()]);
+        assert!(entry_has_unrestricted_path_scope(&entry));
+    }
+
+    #[test]
+    fn unrestricted_scope_audit_respects_platform_roots() {
+        for pattern in ["/**", "/**/", "/**/*", "/**/**", "/**/**/*", "**//**"] {
+            let mut entry = make_test_entry();
+            entry.paths = Some(vec![pattern.to_string()]);
+            assert_eq!(
+                entry_has_unrestricted_path_scope(&entry),
+                cfg!(unix),
+                "{pattern}"
+            );
+            for cwd in ["/", "/etc", "/home/review/.private/deep"] {
+                assert!(path_matches_glob(pattern, cwd), "{pattern} vs {cwd}");
+            }
+            assert!(!path_matches_glob(pattern, "C:/Users/reviewer"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrestricted_scope_audit_uses_runtime_canonical_prefixes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root_link = temp.path().join("root-link");
+        let scoped_link = temp.path().join("scoped-link");
+        std::os::unix::fs::symlink("/", &root_link).expect("root symlink");
+        std::os::unix::fs::symlink(temp.path(), &scoped_link).expect("scoped symlink");
+
+        let mut entry = make_test_entry();
+        for pattern in [
+            "/./**/*".to_string(),
+            format!("{}/**/*", root_link.display()),
+        ] {
+            entry.paths = Some(vec![pattern.clone()]);
+            assert!(entry_has_unrestricted_path_scope(&entry), "{pattern}");
+            for cwd in ["/", "/etc", "/var/tmp"] {
+                assert!(
+                    entry_path_matches_cwd(&entry, Path::new(cwd)),
+                    "{pattern} vs {cwd}"
+                );
+            }
+        }
+
+        entry.paths = Some(vec![format!("{}/**/*", scoped_link.display())]);
+        assert!(!entry_has_unrestricted_path_scope(&entry));
+        assert!(!entry_path_matches_cwd(&entry, Path::new("/")));
     }
 
     #[test]

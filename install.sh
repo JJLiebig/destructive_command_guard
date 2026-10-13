@@ -27,6 +27,17 @@ set -euo pipefail
 umask 022
 shopt -s lastpipe 2>/dev/null || true
 
+# Match Claude Code's active user configuration; do not eval path contents.
+claude_config_dir() {
+  local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  case "$dir" in
+    '~') dir="$HOME" ;;
+    '~/'*) dir="$HOME/${dir#\~/}" ;;
+  esac
+  case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac
+  printf '%s\n' "$dir"
+}
+
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-JJLiebig}"
 REPO="${REPO:-destructive_command_guard}"
@@ -287,6 +298,12 @@ try_version() {
   fi
 }
 
+# Capture before any download or source-build work can change directories.
+# A sentinel preserves literal trailing newlines in the directory name.
+CLAUDE_SETTINGS="$(claude_config_dir; printf .)"
+CLAUDE_SETTINGS="${CLAUDE_SETTINGS%$'\n.'}"
+CLAUDE_SETTINGS="${CLAUDE_SETTINGS%/}/settings.json"
+
 # Posit Assistant ships as an IDE extension (Positron/RStudio), a standalone
 # server, and the `pa` terminal client, so no single probe covers every
 # install. Any one of these is enough to configure the shared global settings
@@ -404,7 +421,7 @@ detect_agents() {
   DETECTED_AGENTS=()
 
   # Claude Code
-  if [[ -d "$HOME/.claude" ]] || command -v claude &>/dev/null; then
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" || -d "$(claude_config_dir)" ]] || command -v claude &>/dev/null; then
     DETECTED_AGENTS+=("claude-code")
     CLAUDE_VERSION=$(try_version claude)
   fi
@@ -1055,18 +1072,31 @@ repair_shell_check_region() {
 
 maybe_add_shell_check() {
   # Add a shell startup check that warns if the DCG hook has been silently
-  # removed from ~/.claude/settings.json. Silent when present, fast (ms),
+  # removed from the active Claude Code settings. Silent when present, fast (ms),
   # and only runs when both dcg and jq are on PATH.
   local snippet
   snippet=$(cat <<'EOFSNIPPET'
 
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
-  if [ -f "$HOME/.claude/settings.json" ] && \
-     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
-       "$HOME/.claude/settings.json" &>/dev/null; then
-    printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
-  fi
+  (
+    dcg_claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    case "$dcg_claude_dir" in
+      "~") dcg_claude_dir="$HOME" ;;
+      "~/"*) dcg_claude_dir="$HOME/${dcg_claude_dir#"~/"}" ;;
+    esac
+    case "$dcg_claude_dir" in
+      /*) ;;
+      *) dcg_claude_dir="$PWD/$dcg_claude_dir" ;;
+    esac
+    dcg_claude_settings="${dcg_claude_dir%/}/settings.json"
+    if { [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ -f "$dcg_claude_settings" ]; } && \
+       { [ ! -f "$dcg_claude_settings" ] || \
+         ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
+           "$dcg_claude_settings" &>/dev/null; }; then
+      printf '\033[1;33m[dcg] Hook missing from %s — run: dcg install\033[0m\n' "$dcg_claude_settings"
+    fi
+  )
 fi
 EOFSNIPPET
   )
@@ -1410,35 +1440,69 @@ verify_minisign_signature() {
   return 0
 }
 
+# Print the version string a cosign binary reports: `gitVersion` from
+# `cosign version --json`, or the `GitVersion:` line of the plain-text output
+# for builds whose JSON is missing or unusable. Prints nothing when neither
+# is present.
+cosign_reported_version() {
+  local cosign_bin="$1"
+  local output=""
+  local reported=""
+
+  output=$("$cosign_bin" version --json 2>/dev/null) || output=""
+  reported=$(printf '%s\n' "$output" |
+    sed -nE 's/.*"gitVersion"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' |
+    head -n 1) || true
+  if [ -z "$reported" ]; then
+    output=$("$cosign_bin" version 2>&1) || return 0
+    reported=$(printf '%s\n' "$output" |
+      sed -nE 's/^[[:space:]]*GitVersion:[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' |
+      head -n 1) || true
+  fi
+  printf '%s' "$reported"
+}
+
 # Return success only for cosign releases that contain the repaired bundle
 # verification logic from CVE-2026-22703 (>=2.6.2 or >=3.0.4).
+#
+# The version is read as SemVer: an optional `v`, MAJOR.MINOR.PATCH, an
+# optional `-pre.release`, and optional `+build` metadata. Build metadata has
+# no bearing on precedence (distro builds report e.g. `v3.1.3+dirty`, GH #505),
+# so it is ignored. A pre-release precedes its release, so `v3.0.4-rc.1` is
+# not patched; a pre-release (including git-describe `-N-gSHA` and `-dirty`
+# suffixes) counts only when its core version is strictly above the floor.
+# Anything that does not parse is rejected rather than trusted.
 cosign_version_is_patched() {
   local cosign_bin="$1"
-  local version_json=""
-  local version=""
-  local major=""
-  local minor=""
-  local patch=""
+  local reported=""
+  local semver_re='^v?([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+  local major=0
+  local minor=0
+  local patch=0
+  local prerelease=""
+  local floor_minor=0
+  local floor_patch=0
 
-  version_json=$("$cosign_bin" version --json 2>/dev/null) || return 1
-  version=$(printf '%s\n' "$version_json" |
-    sed -nE 's/.*"gitVersion"[[:space:]]*:[[:space:]]*"v([0-9]+)\.([0-9]+)\.([0-9]+)".*/\1.\2.\3/p' |
-    head -n 1)
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
-  IFS=. read -r major minor patch <<< "$version"
+  reported=$(cosign_reported_version "$cosign_bin")
+  [[ "$reported" =~ $semver_re ]] || return 1
+  major=$((10#${BASH_REMATCH[1]}))
+  minor=$((10#${BASH_REMATCH[2]}))
+  patch=$((10#${BASH_REMATCH[3]}))
+  prerelease="${BASH_REMATCH[4]}"
 
   if (( major > 3 )); then
     return 0
   fi
-  if (( major == 3 )); then
-    (( minor > 0 || (minor == 0 && patch >= 4) ))
+  case "$major" in
+    3) floor_minor=0; floor_patch=4 ;;
+    2) floor_minor=6; floor_patch=2 ;;
+    *) return 1 ;;
+  esac
+  if [ -n "$prerelease" ]; then
+    (( minor > floor_minor || (minor == floor_minor && patch > floor_patch) ))
     return
   fi
-  if (( major == 2 )); then
-    (( minor > 6 || (minor == 6 && patch >= 2) ))
-    return
-  fi
-  return 1
+  (( minor > floor_minor || (minor == floor_minor && patch >= floor_patch) ))
 }
 
 # Verify Sigstore/cosign bundle for a file (best-effort).
@@ -1469,7 +1533,9 @@ verify_sigstore_bundle() {
   fi
 
   if ! cosign_version_is_patched "$cosign_bin"; then
-    warn "cosign is missing required bundle-verification security fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
+    local reported_version=""
+    reported_version=$(cosign_reported_version "$cosign_bin")
+    warn "cosign reports version '${reported_version:-unknown}', which is not a release known to carry the CVE-2026-22703 bundle-verification fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
     return 0
   fi
 
@@ -1610,15 +1676,10 @@ mkdir -p "$DEST" 2>/dev/null || true
 
 preflight_checks
 
-# Check if already at target version (skip download if so, unless --force)
-if [ "$FORCE_INSTALL" -eq 0 ] && [ "$REQUIRE_MINISIGN" -eq 0 ] && check_installed_version "$VERSION"; then
-  assert_installed_version "$VERSION" || exit 1
-  ok "dcg $VERSION is already installed at $DEST/dcg"
-  info "Use --force to reinstall"
-  maybe_install_completions
-  exit 0
-fi
-
+# Every successful binary path returns here so hook configuration below also
+# runs for an existing version or a source build (including a relocated Claude
+# configuration). Only acquisition/verification failures abort installation.
+install_binary() {
 # Cross-platform locking using mkdir (atomic on all POSIX systems including macOS)
 LOCK_DIR="${LOCK_FILE}.d"
 LOCKED=0
@@ -1650,6 +1711,16 @@ cleanup() {
 
 TMP=$(mktemp -d)
 trap cleanup EXIT
+
+# Reusing an installed version still configures the active agent settings, so
+# keep that mutation under the same lock as a fresh or source installation.
+if [ "$FORCE_INSTALL" -eq 0 ] && [ "$REQUIRE_MINISIGN" -eq 0 ] && check_installed_version "$VERSION"; then
+  assert_installed_version "$VERSION" || exit 1
+  ok "dcg $VERSION is already installed at $DEST/dcg"
+  info "Use --force to reinstall"
+  maybe_install_completions
+  return 0
+fi
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
@@ -1684,7 +1755,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   fi
   ok "Done. Binary at: $DEST/dcg"
   maybe_install_completions
-  exit 0
+  return 0
 fi
 
 # Checksum verification (can be skipped with --no-verify for testing)
@@ -1783,6 +1854,9 @@ fi
 ok "Done. Binary at: $DEST/dcg"
 maybe_install_completions
 echo ""
+}
+
+install_binary
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Predecessor Detection & Removal
@@ -1795,9 +1869,15 @@ PREDECESSOR_LOCATIONS=()
 detect_predecessor() {
   # Check common file locations for the predecessor script
   local locations=(
-    "$HOME/.claude/hooks/$PREDECESSOR_SCRIPT"
-    ".claude/hooks/$PREDECESSOR_SCRIPT"
+    "${CLAUDE_SETTINGS%/*}/hooks/$PREDECESSOR_SCRIPT"
   )
+  # From HOME (or a project with a symlink to the default hooks directory),
+  # the project candidate aliases ~/.claude. An active override must leave
+  # that inactive installation intact. Distinct project hooks still migrate.
+  if [ -z "${CLAUDE_CONFIG_DIR:-}" ] || \
+     ! [ ".claude/hooks" -ef "$HOME/.claude/hooks" ]; then
+    locations+=(".claude/hooks/$PREDECESSOR_SCRIPT")
+  fi
 
   for loc in "${locations[@]}"; do
     if [ -f "$loc" ]; then
@@ -1874,7 +1954,6 @@ remove_predecessor() {
 # Claude Code / Gemini CLI / Cursor Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 GEMINI_SETTINGS="$HOME/.gemini/settings.json"
 AIDER_SETTINGS="$HOME/.aider.conf.yml"
 CODEX_SETTINGS="$HOME/.codex/hooks.json"
@@ -1931,7 +2010,12 @@ configure_claude_code() {
   # Default to cleaning up predecessor if not specified or empty
   [ -z "$cleanup_predecessor" ] && cleanup_predecessor=1
   local settings_dir
-  settings_dir=$(dirname "$settings_file")
+  # Keep every pathname byte, including a trailing newline in the directory.
+  # A plain $(dirname ...) capture would trim it and create the wrong location.
+  case "$settings_file" in
+    */*) settings_dir="${settings_file%/*}"; [ -n "$settings_dir" ] || settings_dir="/" ;;
+    *) settings_dir="." ;;
+  esac
 
   # Always create the config directory if it doesn't exist
   if [ ! -d "$settings_dir" ]; then
@@ -1998,12 +2082,11 @@ if not isinstance(pre_tool_use, list):
     print("invalid")
     raise SystemExit(0)
 
-# Claude Code matchers are regexes over the tool name. `Bash` alone leaves the
-# native-Windows `PowerShell` tool completely unguarded (issue #226), so the
-# canonical dcg registration covers both. A dcg hook still sitting under the
-# legacy `Bash`-only matcher must be migrated, not left beside the new entry.
-CANONICAL_MATCHER = "Bash|PowerShell"
-LEGACY_MATCHERS = ("Bash",)
+# Claude Code matchers are regexes over the tool name. Guard shell commands
+# from Bash, native-Windows PowerShell (#226), and Monitor scripts (#529).
+# Migrate both older matchers instead of leaving duplicate dcg registrations.
+CANONICAL_MATCHER = "Bash|PowerShell|Monitor"
+LEGACY_MATCHERS = ("Bash", "Bash|PowerShell")
 
 dcg_commands = []
 predecessor_present = False
@@ -2057,9 +2140,9 @@ PYEOF
     else
       # Fallback for systems without python3; the merge path below is also
       # python-backed. Only trust the exact hook path when it is already the
-      # first command hook under the canonical `Bash|PowerShell` matcher — a
-      # legacy `Bash`-only registration must fall through to the merge so the
-      # native-Windows PowerShell tool stops being unguarded (issue #226).
+      # first command hook under the canonical `Bash|PowerShell|Monitor`
+      # matcher. Both legacy matchers must fall through to the merge so
+      # PowerShell and Monitor scripts receive the same protection.
       local dcg_hook_regex
       local compact_settings
       local dcg_command_marker
@@ -2075,7 +2158,7 @@ PYEOF
       if [ "$after_first_dcg" != "$compact_settings" ] &&
          [ "${after_first_dcg#*"$dcg_command_marker"}" = "$after_first_dcg" ] &&
          printf '%s\n' "$compact_settings" |
-           grep -Eq "\"matcher\":\"Bash\\|PowerShell\",\"hooks\":\\[\\{[^}]*\"command\":\"$dcg_hook_regex\""; then
+           grep -Eq "\"matcher\":\"Bash\\|PowerShell\\|Monitor\",\"hooks\":\\[\\{[^}]*\"command\":\"$dcg_hook_regex\""; then
         CLAUDE_STATUS="already"
         AUTO_CONFIGURED=1
         return 0
@@ -2153,11 +2236,11 @@ elif not isinstance(settings['hooks']['PreToolUse'], list):
     print(f"Claude Code settings.json PreToolUse must contain a list: {settings_file}", file=sys.stderr)
     raise SystemExit(1)
 
-# Claude Code matchers are regexes over the tool name. Registering only `Bash`
-# leaves the native-Windows `PowerShell` tool unguarded (issue #226), so dcg
-# owns a single `Bash|PowerShell` entry hoisted to the front of PreToolUse.
-CANONICAL_MATCHER = "Bash|PowerShell"
-LEGACY_MATCHERS = ("Bash",)
+# Claude Code matchers are regexes over the tool name. Guard Bash, PowerShell
+# (#226), and Monitor scripts (#529) through one dcg entry hoisted to the
+# front of PreToolUse.
+CANONICAL_MATCHER = "Bash|PowerShell|Monitor"
+LEGACY_MATCHERS = ("Bash", "Bash|PowerShell")
 
 # First pass: strip dcg (and, when asked, its predecessor) out of every entry
 # dcg may previously have owned. Other hooks keep their own matcher so their
@@ -2197,8 +2280,8 @@ for entry in settings['hooks']['PreToolUse']:
         new_pre_tool_use.append(entry)
 
 # Add exactly one current dcg hook, first, so it runs before any other hook.
-# Existing dcg hooks, including stale paths, duplicates, and legacy `Bash`-only
-# registrations, were collapsed above.
+# Existing dcg hooks, including stale paths, duplicates, and both legacy
+# matcher registrations, were collapsed above.
 new_pre_tool_use.insert(0, {
     "matcher": CANONICAL_MATCHER,
     "hooks": [{"type": "command", "command": dcg_path}]
@@ -2236,7 +2319,7 @@ PYEOF
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|PowerShell",
+        "matcher": "Bash|PowerShell|Monitor",
         "hooks": [
           {
             "type": "command",
@@ -3230,11 +3313,45 @@ def ask(reason):
         "agent_message": reason,
     })
 
-def main():
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
+# dcg ran but gave no verdict, or the payload could not be read: that is not an
+# allow (#517). Block, unless the operator opted out with
+# DCG_BRIDGE_CRASH_DECISION=allow.
+def no_verdict(detail):
+    if (os.environ.get("DCG_BRIDGE_CRASH_DECISION") or "").strip().lower() == "allow":
+        sys.stderr.write(
+            "[dcg] Cursor bridge got no verdict (%s); allowed because "
+            "DCG_BRIDGE_CRASH_DECISION=allow\n" % detail
+        )
         allow()
+        return
+    deny(
+        "Blocked by dcg: the command could not be verified (%s). Set "
+        "DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails."
+        % detail
+    )
+
+def main():
+    if (os.environ.get("DCG_BYPASS") or "").strip().lower() in ("1", "true", "yes", "y", "on"):
+        allow()
+        return 0
+
+    # Raw bytes, so a UTF-8 BOM (cursor-agent sends one) is dropped instead of
+    # failing the JSON parse.
+    try:
+        raw = sys.stdin.buffer.read().decode("utf-8-sig")
+    except Exception:
+        no_verdict("the hook payload could not be read")
+        return 0
+    if not raw.strip():
+        no_verdict("the hook payload was empty")
+        return 0
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        no_verdict("the hook payload was not JSON")
+        return 0
+    if not isinstance(payload, dict):
+        no_verdict("the hook payload was not a JSON object")
         return 0
 
     command = payload.get("command") or ""
@@ -3245,12 +3362,18 @@ def main():
         except Exception:
             pass
 
-    if not command:
+    if not isinstance(command, str) or not command:
         allow()
         return 0
 
     dcg_bin = os.environ.get("DCG_BIN") or DCG_BIN_FALLBACK
-    hook_input = {"tool_name": "Bash", "tool_input": {"command": command}}
+    # dcg answers an allowed command with {"dcg_verdict":"allow"} when asked,
+    # so silence means it never answered.
+    hook_input = {
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "dcg_explicit_verdict": True,
+    }
 
     env = os.environ.copy()
     env["CURSOR_IDE"] = "1"
@@ -3258,43 +3381,53 @@ def main():
     try:
         proc = subprocess.run(
             [dcg_bin],
-            input=json.dumps(hook_input),
-            text=True,
+            input=json.dumps(hook_input).encode("utf-8"),
             capture_output=True,
             env=env,
+            timeout=30,
         )
-    except Exception:
+    except (FileNotFoundError, PermissionError, NotADirectoryError) as err:
+        # dcg could not be started at all: fail open so a broken install does
+        # not block every command, and say so.
+        sys.stderr.write("[dcg] Cursor bridge could not run dcg: %s; command allowed unchecked\n" % err)
         allow()
         return 0
-
-    output = (proc.stdout or "").strip()
-    if not output:
-        allow()
+    except subprocess.TimeoutExpired:
+        no_verdict("dcg timed out")
+        return 0
+    except Exception as err:
+        no_verdict("dcg could not be run: %s" % err)
         return 0
 
-    try:
-        dcg_out = json.loads(output)
-    except Exception:
-        allow()
-        return 0
+    output = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    dcg_out = None
+    if output:
+        try:
+            dcg_out = json.loads(output)
+        except Exception:
+            dcg_out = None
+    hso = dcg_out.get("hookSpecificOutput") if isinstance(dcg_out, dict) else None
+    hso = hso if isinstance(hso, dict) else {}
+    decision = hso.get("permissionDecision")
+    reason = hso.get("permissionDecisionReason") or "Blocked by dcg"
 
-    decision = (
-        dcg_out.get("hookSpecificOutput", {})
-        .get("permissionDecision")
-    )
-    reason = (
-        dcg_out.get("hookSpecificOutput", {})
-        .get("permissionDecisionReason", "Blocked by dcg")
-    )
-
+    # A blocking verdict stands whatever happened to the process afterwards.
     if decision == "deny":
         deny(reason)
         return 0
     if decision == "ask":
         ask(reason)
         return 0
-
-    allow()
+    if proc.returncode != 0:
+        no_verdict("dcg exited %d" % proc.returncode)
+        return 0
+    if isinstance(dcg_out, dict) and dcg_out.get("dcg_verdict") == "allow":
+        allow()
+        return 0
+    if not output:
+        no_verdict("dcg exited 0 with nothing on stdout")
+        return 0
+    no_verdict("dcg stdout was not a verdict")
     return 0
 
 if __name__ == "__main__":
