@@ -1,13 +1,13 @@
-# dcg PowerShell installer
+﻿# dcg PowerShell installer
 #
-# Usage:
-#   irm https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/install.ps1 | iex
+# Authenticate a pinned release installer before running this script:
+#   https://github.com/JJLiebig/destructive_command_guard#this-fork-ask-before-dcg-flagged-codex-commands
 #
 # Options:
 #   -Version vX.Y.Z   Install specific version (default: latest)
 #   -Dest DIR         Install to DIR (default: ~/.local/bin)
 #   -EasyMode         Auto-add to PATH
-#   -Verify           Run self-test after install
+#   -Verify           Self-test the candidate before installing
 #   -RequireMinisign  Require a valid release .minisig and the minisign tool
 #   -MinisignSignatureUrl <url|file://> Override the adjacent .minisig source
 #   -Force            Configure agent hooks even if the agent CLI isn't detected
@@ -145,8 +145,18 @@ function Get-DcgFileSha256 {
   # Get-FileHash currently instantiates SHA256CryptoServiceProvider and is
   # rejected by WDAC ConstrainedLanguage. certutil.exe is a signed Windows
   # inbox binary and remains usable under that policy.
-  $lines = @(& certutil.exe -hashfile $Path SHA256 2>&1)
-  if ($LASTEXITCODE -eq 0) {
+  $originalErrorActionPreference = $ErrorActionPreference
+  try {
+    # A caller-local LASTEXITCODE must not turn failed hashing into success.
+    # Windows PowerShell 5.1 also surfaces native stderr as error records.
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = -1
+    $lines = @(& certutil.exe -hashfile $Path SHA256 2>&1)
+    $hashExitCode = $global:LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $originalErrorActionPreference
+  }
+  if ($hashExitCode -eq 0) {
     foreach ($line in $lines) {
       $token = ([string]$line).Trim()
       if (Test-Sha256Token $token) { return $token.ToLowerInvariant() }
@@ -266,7 +276,8 @@ function Test-DcgHookCommand {
     $command = $prop.Value
   }
 
-  $name = Get-DcgCommandName ([string]$command)
+  if ($command -isnot [string]) { return $false }
+  $name = Get-DcgCommandName $command
   $name -eq "dcg" -or $name -eq "dcg.exe"
 }
 
@@ -321,6 +332,43 @@ function Test-JsonObject {
   $null -ne $Value -and $Value.GetType() -eq [System.Management.Automation.PSCustomObject]
 }
 
+# Compare JSON values without PowerShell's string/boolean/number coercions.
+# Object property order is immaterial, but names, strings and array order are
+# significant. Used both for duplicate policy conflicts and lossless writes.
+function Test-JsonValueEqual {
+  param([object]$Left, [object]$Right)
+
+  if ($null -eq $Left -or $null -eq $Right) {
+    return $null -eq $Left -and $null -eq $Right
+  }
+  if ((Test-JsonArray $Left) -or (Test-JsonArray $Right)) {
+    if (-not (Test-JsonArray $Left) -or -not (Test-JsonArray $Right) -or
+        $Left.Count -ne $Right.Count) { return $false }
+    for ($i = 0; $i -lt $Left.Count; $i++) {
+      if (-not (Test-JsonValueEqual $Left[$i] $Right[$i])) { return $false }
+    }
+    return $true
+  }
+  if ((Test-JsonObject $Left) -or (Test-JsonObject $Right)) {
+    if (-not (Test-JsonObject $Left) -or -not (Test-JsonObject $Right) -or
+        @($Left.PSObject.Properties).Count -ne @($Right.PSObject.Properties).Count) {
+      return $false
+    }
+    foreach ($prop in $Left.PSObject.Properties) {
+      $other = $Right.PSObject.Properties[$prop.Name]
+      if ($null -eq $other -or $other.Name -cne $prop.Name -or
+          -not (Test-JsonValueEqual $prop.Value $other.Value)) { return $false }
+    }
+    return $true
+  }
+  if (($Left -is [string]) -ne ($Right -is [string]) -or
+      ($Left -is [bool]) -ne ($Right -is [bool])) { return $false }
+  # JSON numbers may be Int32 in a fresh hook and Int64 after parsing. Compare
+  # their JSON representation, which still distinguishes false, 0 and "0".
+  (ConvertTo-Json -InputObject $Left -Compress -Depth 100) -ceq
+    (ConvertTo-Json -InputObject $Right -Compress -Depth 100)
+}
+
 function Test-UserPathContains {
   param([string]$PathValue, [string]$PathToFind)
 
@@ -341,21 +389,30 @@ function Test-UserPathContains {
 }
 
 # Generic: true when the config already has exactly one dcg hook anywhere under
-# the given $Event, installed under $Matcher, equal to $DcgHook, and first.
+# the given $Event, installed under $Matcher, with the desired command identity,
+# and first. All other fields belong to the operator/host (#345, #582).
 # $OwnedMatchers identifies legacy matcher entries whose malformed hook arrays
 # must be rejected during migrations.
 function Test-HookMatchesDesired {
   param([object]$Actual, [object]$Desired)
 
   if (-not (Test-JsonObject $Actual) -or -not (Test-JsonObject $Desired)) { return $false }
-  if (@($Actual.PSObject.Properties).Count -ne @($Desired.PSObject.Properties).Count) {
-    return $false
+  foreach ($name in @('type', 'command', 'shell')) {
+    $actualProp = $Actual.PSObject.Properties[$name]
+    $desiredProp = $Desired.PSObject.Properties[$name]
+    if ($null -eq $desiredProp) {
+      if ($null -ne $actualProp) { return $false }
+    } elseif ($null -eq $actualProp -or $actualProp.Name -cne $desiredProp.Name -or
+        -not (Test-JsonValueEqual $actualProp.Value $desiredProp.Value)) { return $false }
   }
   foreach ($prop in $Desired.PSObject.Properties) {
-    $actualProp = $Actual.PSObject.Properties[$prop.Name]
-    if ($null -eq $actualProp -or $actualProp.Value -ne $prop.Value) {
-      return $false
-    }
+    # Host defaults (e.g. Gemini/Posit timeout) are filled only when absent.
+    if (-not (Test-ObjectPropertyExists $Actual $prop.Name)) { return $false }
+  }
+  $async = Get-ObjectPropertyValue $Actual 'async'
+  if ((Test-ObjectPropertyExists $Actual 'async') -and
+      ($async -isnot [bool] -or $async)) {
+    return $false # An asynchronous hook cannot block a destructive command.
   }
   $true
 }
@@ -398,35 +455,85 @@ function Test-AgentHookCurrent {
   if (-not (Test-JsonArray $firstEntryHooksValue)) { return $false }
   $firstEntryHooks = @(Get-JsonArray $firstEntryHooksValue)
   $dcgHooks.Count -eq 1 -and
-    (Get-ObjectPropertyValue $firstEntry "matcher") -eq $Matcher -and
+    (Get-ObjectPropertyValue $firstEntry "matcher") -ceq $Matcher -and
     $firstEntryHooks.Count -gt 0 -and
     (Test-HookMatchesDesired $firstEntryHooks[0] $DcgHook)
 }
 
-# Atomically write $Object as JSON to $Path as UTF-8 WITHOUT a BOM. The BOM is
+# Write $Object as JSON to $Path as UTF-8 WITHOUT a BOM. The BOM is
 # omitted because strict JSON parsers (e.g. Codex) reject the leading EF BB BF
 # ("expected value at line 1 column 1" — #125), and Windows PowerShell 5.1 lacks
-# `-Encoding UTF8NoBOM`. The write is atomic (temp file in the same directory +
-# Move-Item -Force) so a concurrent reader (an agent reading its settings) never
-# sees a half-written file.
+# `-Encoding UTF8NoBOM`. Stage in the same directory and replace with a backup;
+# Move-Item -Force can delete the destination before its replacement succeeds.
 function Write-JsonFileNoBom {
   param([string]$Path, [object]$Object)
 
-  $json = $Object | ConvertTo-Json -Depth 20
+  $json = ConvertTo-Json -InputObject $Object -Depth 100 -WarningAction Stop
+  # Windows PowerShell 5.1 does not warn when ConvertTo-Json truncates deep
+  # objects. Refuse a lossy serialization before touching the settings file.
+  if (-not (Test-JsonValueEqual $Object (ConvertFrom-Json -InputObject $json))) {
+    throw "Cannot serialize settings without changing their values; leaving unchanged: $Path"
+  }
   $dir = Split-Path -Parent $Path
+  if ([string]::IsNullOrEmpty($dir)) { $dir = '.' }
+  $dir = (Get-Item -Force -LiteralPath $dir -ErrorAction Stop).FullName
+  $Path = Join-Path $dir (Split-Path -Leaf $Path)
+  $existing = Get-Item -Force -LiteralPath $Path -ErrorAction SilentlyContinue
+  if ($null -ne $existing) {
+    if ($existing.PSIsContainer -or
+        ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      throw "Cannot safely replace a directory or linked settings file; leaving unchanged: $Path"
+    }
+    if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+      throw "Cannot safely replace existing settings in ConstrainedLanguage; leaving unchanged: $Path"
+    }
+  }
   $tmp = Join-Path $dir (".dcg-tmp-" + [System.Guid]::NewGuid().ToString("N"))
-  Write-Utf8NoBomText -Path $tmp -Text $json
-  Move-Item -Force -LiteralPath $tmp -Destination $Path
+  $backup = $Path + '.bak.' + [System.Guid]::NewGuid().ToString('N')
+  try {
+    if ($null -ne $existing) {
+      # Copying first retains restrictive Unix file modes on the staged file.
+      # File.Replace preserves the destination's Windows access controls.
+      Copy-Item -LiteralPath $Path -Destination $tmp -ErrorAction Stop
+    }
+    Write-Utf8NoBomText -Path $tmp -Text $json
+    if ($null -ne $existing) {
+      [System.IO.File]::Replace($tmp, $Path, $backup)
+    } else {
+      # Rename without Force refuses a raced file OR directory at the target.
+      Rename-Item -LiteralPath $tmp -NewName (Split-Path -Leaf $Path) -ErrorAction Stop
+    }
+  } catch {
+    # ReplaceFile on Windows can move the old file to its backup before a
+    # failure. Recover that file without overwriting a concurrent writer.
+    if (-not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
+      try {
+        Rename-Item -LiteralPath $backup -NewName (Split-Path -Leaf $Path) -ErrorAction Stop
+      } catch {
+        throw "Settings replacement failed; previous settings are preserved at: $backup. $_"
+      }
+    }
+    if (Test-Path -LiteralPath $backup -PathType Leaf) {
+      throw "Settings replacement failed; previous settings are preserved at: $backup. $_"
+    }
+    throw
+  } finally {
+    if (Test-Path -LiteralPath $tmp -PathType Leaf) {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+  }
 }
 
 # Shared create-or-merge for a Claude-Code-style hooks file. Ensures
 # `hooks.<Event>` has an entry with `matcher: <Matcher>` containing exactly one
-# dcg hook ($DcgHook), hoisted first, with any other hooks/entries preserved.
+# dcg hook, hoisted first, with operator-owned fields and other hooks preserved.
 # Stale dcg hooks are removed from every matcher entry so an earlier
 # misinstallation cannot leave an executable but ineffective duplicate.
 # $OwnedMatchers identifies legacy matcher values whose malformed hook arrays
 # must be rejected. Coexisting hooks are never widened. Idempotent. Refuses to
-# touch invalid JSON / malformed owned shapes (throws with $Label).
+# touch invalid JSON / malformed owned shapes or conflicting duplicate policies
+# (throws with $Label). Only type/command/shell are dcg-owned; all other desired
+# fields are defaults for a fresh hook, matching the Rust installer (#345).
 # Returns "created" | "already" | "merged".
 function Merge-AgentHookFile {
   param(
@@ -449,7 +556,7 @@ function Merge-AgentHookFile {
   }
 
   try {
-    $config = Get-Content -Raw -LiteralPath $HooksFile | ConvertFrom-Json
+    $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $HooksFile | ConvertFrom-Json
   } catch {
     throw "$Label is invalid JSON; leaving it unchanged: $HooksFile"
   }
@@ -476,6 +583,48 @@ function Merge-AgentHookFile {
     return "already"
   }
 
+  # Collect metadata before removing any registration. A later duplicate can
+  # carry the only fail-closed policy; choosing just the first hook loses it.
+  $mergedHook = [pscustomobject][ordered]@{}
+  $removedAsync = $false
+  foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
+    $entryMatcher = Get-ObjectPropertyValue $entry 'matcher'
+    $entryHooks = Get-ObjectPropertyValue $entry 'hooks'
+    if ($entryMatcher -in $OwnedMatchers -and
+        (Test-ObjectPropertyExists $entry 'hooks') -and -not (Test-JsonArray $entryHooks)) {
+      throw "$Label $entryMatcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
+    }
+    if (-not (Test-JsonArray $entryHooks)) { continue }
+    foreach ($hook in $entryHooks) {
+      if (-not (Test-DcgHookCommand $hook)) { continue }
+      foreach ($prop in $hook.PSObject.Properties) {
+        if ($prop.Name -in @('type', 'command', 'shell')) { continue }
+        if ($prop.Name -eq 'async') {
+          if ($prop.Value -isnot [bool]) {
+            throw "$Label dcg hook async must be a boolean; leaving it unchanged: $HooksFile"
+          }
+          if ($prop.Value) {
+            $removedAsync = $true
+            continue
+          }
+        }
+        $previous = $mergedHook.PSObject.Properties[$prop.Name]
+        if ($null -ne $previous -and
+            ($previous.Name -cne $prop.Name -or
+             -not (Test-JsonValueEqual $previous.Value $prop.Value))) {
+          throw "$Label has conflicting dcg hook field '$($prop.Name)'; leaving it unchanged: $HooksFile"
+        }
+        Set-ObjectPropertyValue $mergedHook $prop.Name $prop.Value
+      }
+    }
+  }
+  foreach ($prop in $DcgHook.PSObject.Properties) {
+    if ($prop.Name -in @('type', 'command', 'shell') -or
+        -not (Test-ObjectPropertyExists $mergedHook $prop.Name)) {
+      Set-ObjectPropertyValue $mergedHook $prop.Name $prop.Value
+    }
+  }
+
   if (-not $hooksExists) {
     $hooks = [pscustomobject][ordered]@{}
     Set-ObjectPropertyValue $config "hooks" $hooks
@@ -486,7 +635,7 @@ function Merge-AgentHookFile {
 
   foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
     $entryMatcher = Get-ObjectPropertyValue $entry "matcher"
-    if ($entryMatcher -eq $Matcher) {
+    if ($entryMatcher -ceq $Matcher) {
       $entryHooks = Get-ObjectPropertyValue $entry "hooks"
       if ($null -ne $entryHooks -and -not (Test-JsonArray $entryHooks)) {
         throw "$Label $Matcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
@@ -541,12 +690,15 @@ function Merge-AgentHookFile {
       hooks = @()
     }
   }
-  $canonicalHooks = @($DcgHook) + @(Get-JsonArray (Get-ObjectPropertyValue $canonicalEntry "hooks"))
+  $canonicalHooks = @($mergedHook) + @(Get-JsonArray (Get-ObjectPropertyValue $canonicalEntry "hooks"))
   Set-ObjectPropertyValue $canonicalEntry "hooks" $canonicalHooks
   $newEventEntries = @($canonicalEntry) + $newEventEntries
 
   Set-ObjectPropertyValue $hooks $Event $newEventEntries
   Write-JsonFileNoBom -Path $HooksFile -Object $config
+  if ($removedAsync) {
+    Write-Warn "${Label}: removed async=true from the dcg hook so destructive commands can be blocked."
+  }
   "merged"
 }
 
@@ -565,7 +717,11 @@ function Configure-CodexHook {
     New-Item -ItemType Directory -Force -Path $codexDir | Out-Null
   }
 
-  $dcgHook = [pscustomobject][ordered]@{ type = "command"; command = $DcgPath }
+  $dcgHook = [pscustomobject][ordered]@{
+    type = "command"
+    command = $DcgPath
+    statusMessage = "dcg (destructive command guard)"
+  }
   Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
 }
 
@@ -695,8 +851,10 @@ function Assert-ZipLayoutSafe {
       $archive.Dispose()
     }
   } else {
+    $global:LASTEXITCODE = -1
     $entries = @(& $tar.Source -tf $ZipPath 2>&1)
-    if ($LASTEXITCODE -ne 0) {
+    $listingExitCode = $global:LASTEXITCODE
+    if ($listingExitCode -ne 0) {
       throw "Refusing to extract: tar.exe could not inspect the archive"
     }
     $entries = @($entries | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
@@ -704,8 +862,10 @@ function Assert-ZipLayoutSafe {
       throw "Refusing to extract: release archive must contain exactly one member"
     }
     $entryName = [string]$entries[0]
+    $global:LASTEXITCODE = -1
     $details = @(& $tar.Source -tvf $ZipPath 2>&1)
-    if ($LASTEXITCODE -ne 0 -or $details.Count -ne 1) {
+    $detailsExitCode = $global:LASTEXITCODE
+    if ($detailsExitCode -ne 0 -or $details.Count -ne 1) {
       throw "Refusing to extract: tar.exe could not inspect the archive member type"
     }
     $isRegular = ([string]$details[0]).TrimStart().StartsWith('-')
@@ -733,8 +893,10 @@ function Expand-DcgArchive {
     throw "Cannot extract under ConstrainedLanguage: trusted Windows tar.exe is unavailable"
   }
   New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null
+  $global:LASTEXITCODE = -1
   & $tar.Source -xf $ZipPath -C $DestinationPath
-  if ($LASTEXITCODE -ne 0) {
+  $extractionExitCode = $global:LASTEXITCODE
+  if ($extractionExitCode -ne 0) {
     throw "tar.exe failed to extract the verified archive"
   }
 }
@@ -1545,15 +1707,24 @@ function Invoke-DcgMinisignVerification {
     return
   }
 
+  # Native processes update the global automatic variable. An unqualified
+  # reset/read here could instead see a caller's function-local LASTEXITCODE.
+  # Reset before launch so an executable that cannot start never inherits a
+  # previous success. Windows PowerShell 5.1 can report successful native
+  # stderr as NativeCommandError; the native exit status decides verification.
+  $savedErrorActionPreference = $ErrorActionPreference
   try {
+    $global:LASTEXITCODE = -1
+    $ErrorActionPreference = "Continue"
     & $minisign -Vm $ArtifactPath -x $signatureFile -P $minisignPublicKey
-    $verificationSucceeded = $?
-    $verificationExitCode = $LASTEXITCODE
-    if ((-not $verificationSucceeded) -or ($verificationExitCode -ne 0)) {
+    $verificationExitCode = $global:LASTEXITCODE
+    if ($verificationExitCode -ne 0) {
       throw "minisign exited with status $verificationExitCode"
     }
   } catch {
     throw "Minisign verification failed (expected key ID ${minisignKeyId}): $($_.Exception.Message)"
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
   }
 
   Write-Ok "Signature verified (minisign key $minisignKeyId)"
@@ -1642,11 +1813,13 @@ function Invoke-DcgSigstoreVerification {
   $savedErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = -1
     $versionOutput = (& $cosign.Source version --json 2>&1 | Out-String)
-    if (($LASTEXITCODE -ne 0) -or (-not (Get-DcgCosignReportedVersion -VersionOutput $versionOutput))) {
+    if (($global:LASTEXITCODE -ne 0) -or (-not (Get-DcgCosignReportedVersion -VersionOutput $versionOutput))) {
       # Builds without usable JSON still print a `GitVersion:` line.
+      $global:LASTEXITCODE = -1
       $versionOutput = (& $cosign.Source version 2>&1 | Out-String)
-      if ($LASTEXITCODE -ne 0) { $versionOutput = "" }
+      if ($global:LASTEXITCODE -ne 0) { $versionOutput = "" }
     }
   } finally {
     $ErrorActionPreference = $savedErrorActionPreference
@@ -1679,8 +1852,9 @@ function Invoke-DcgSigstoreVerification {
   $savedErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = -1
     $localKeyOutput = (& $cosign.Source @localKeyArgs 2>&1 | Out-String)
-    $localKeyExitCode = $LASTEXITCODE
+    $localKeyExitCode = $global:LASTEXITCODE
   } finally {
     $ErrorActionPreference = $savedErrorActionPreference
   }
@@ -1697,8 +1871,9 @@ function Invoke-DcgSigstoreVerification {
   )
   try {
     $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = -1
     $oidcOutput = (& $cosign.Source @oidcArgs 2>&1 | Out-String)
-    $oidcExitCode = $LASTEXITCODE
+    $oidcExitCode = $global:LASTEXITCODE
   } finally {
     $ErrorActionPreference = $savedErrorActionPreference
   }
@@ -1833,8 +2008,9 @@ function Get-DcgReportedVersion {
   $savedErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = -1
     $output = @(& $Path --version 2>&1)
-    $status = $LASTEXITCODE
+    $status = $global:LASTEXITCODE
   } finally {
     $ErrorActionPreference = $savedErrorActionPreference
   }
@@ -1863,7 +2039,7 @@ function Assert-DcgInstalledVersion {
       throw "Installed dcg version mismatch: expected $expected, got $reported"
     }
   }
-  Write-Ok "Installed version verified: $($reported.Substring(1))"
+  Write-Ok "Binary version verified: $($reported.Substring(1))"
 }
 
 function Invoke-DcgInstallSelfTest {
@@ -1891,8 +2067,9 @@ function Invoke-DcgInstallSelfTest {
       $savedErrorActionPreference = $ErrorActionPreference
       try {
         $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = -1
         $allowOutput = @(& $resolvedPath test --format json 'git status' 2>&1)
-        $allowStatus = $LASTEXITCODE
+        $allowStatus = $global:LASTEXITCODE
       } finally {
         $ErrorActionPreference = $savedErrorActionPreference
       }
@@ -1906,8 +2083,9 @@ function Invoke-DcgInstallSelfTest {
       $savedErrorActionPreference = $ErrorActionPreference
       try {
         $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = -1
         $denyOutput = @(& $resolvedPath test --format json 'rm -rf /' 2>&1)
-        $denyStatus = $LASTEXITCODE
+        $denyStatus = $global:LASTEXITCODE
       } finally {
         $ErrorActionPreference = $savedErrorActionPreference
       }
@@ -1928,6 +2106,112 @@ function Invoke-DcgInstallSelfTest {
   }
 
   Write-Ok "Self-test complete"
+}
+
+# Call only after the archive verification and layout checks. Qualify
+# exactly the staged bytes before making them live: a failed --version/-Verify
+# must never replace a working guard. The sibling stage keeps promotion on the
+# destination volume, and File.Replace preserves existing Windows access rules.
+function Install-DcgBinary {
+  param(
+    [string]$SourcePath,
+    [string]$DestinationPath,
+    [string]$ExpectedVersion,
+    [string]$ProbeRoot,
+    [switch]$Verify
+  )
+
+  $SourcePath = (Get-Item -LiteralPath $SourcePath -Force -ErrorAction Stop).FullName
+  $directory = Split-Path -Parent $DestinationPath
+  if ([string]::IsNullOrEmpty($directory)) { $directory = '.' }
+  if (-not (Test-Path -LiteralPath $directory)) {
+    New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop | Out-Null
+  }
+  $directory = (Get-Item -LiteralPath $directory -Force -ErrorAction Stop).FullName
+  $DestinationPath = Join-Path $directory (Split-Path -Leaf $DestinationPath)
+  $existing = Get-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
+  if ($null -ne $existing) {
+    if ($existing.PSIsContainer -or
+        ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      throw "Cannot safely replace a directory or linked dcg executable; leaving unchanged: $DestinationPath"
+    }
+    if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+      # Move-Item -Force can delete the old executable before its replacement
+      # succeeds. This policy cannot call the atomic ACL-preserving API, so
+      # refuse an update without changing the incumbent. Fresh installs below
+      # still use a no-overwrite rename and remain supported under this policy.
+      throw "Cannot atomically replace an existing dcg executable in ConstrainedLanguage; leaving unchanged: $DestinationPath"
+    }
+  }
+
+  $stage = Join-Path $directory ('.dcg-install-' + [Guid]::NewGuid().ToString('N') + '.exe')
+  $backup = $DestinationPath + '.bak.' + [Guid]::NewGuid().ToString('N')
+  $promoted = $false
+  try {
+    if ($null -ne $existing) {
+      # Keep the incumbent's restrictive Unix mode on the stage. Copy-Item of
+      # the candidate over it can replace that mode; streaming its bytes does
+      # not. Windows ACLs are retained by the final File.Replace operation.
+      Copy-Item -LiteralPath $DestinationPath -Destination $stage -ErrorAction Stop
+      $inputStream = [System.IO.File]::OpenRead($SourcePath)
+      try {
+        $outputStream = [System.IO.File]::Open($stage, [System.IO.FileMode]::Open,
+          [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+          $outputStream.SetLength(0)
+          $inputStream.CopyTo($outputStream)
+          $outputStream.Flush($true)
+        } finally {
+          $outputStream.Dispose()
+        }
+      } finally {
+        $inputStream.Dispose()
+      }
+    } else {
+      Copy-Item -LiteralPath $SourcePath -Destination $stage -ErrorAction Stop
+    }
+
+    # The stage has passed archive verification. Remove Mark-of-the-Web before
+    # its qualification probes; never unblock unchecked downloaded bytes.
+    if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
+      try { Unblock-File -LiteralPath $stage -ErrorAction SilentlyContinue } catch { }
+    }
+    Assert-DcgInstalledVersion -Path $stage -ExpectedVersion $ExpectedVersion
+    if ($Verify) {
+      Write-Info "Running self-test..."
+      Invoke-DcgInstallSelfTest -Path $stage -ProbeRoot $ProbeRoot
+    }
+
+    if ($null -ne $existing) {
+      [System.IO.File]::Replace($stage, $DestinationPath, $backup)
+    } else {
+      # No Force: a raced file or directory must not be silently overwritten.
+      Rename-Item -LiteralPath $stage -NewName (Split-Path -Leaf $DestinationPath) -ErrorAction Stop
+    }
+    $promoted = $true
+  } catch {
+    # ReplaceFile can move the old executable to its backup before failing.
+    # Recover only an absent destination; never overwrite a concurrent writer.
+    if (-not (Test-Path -LiteralPath $DestinationPath) -and
+        (Test-Path -LiteralPath $backup -PathType Leaf)) {
+      try {
+        Rename-Item -LiteralPath $backup -NewName (Split-Path -Leaf $DestinationPath) -ErrorAction Stop
+      } catch {
+        throw "dcg replacement failed; previous executable is preserved at: $backup. $_"
+      }
+    }
+    if (Test-Path -LiteralPath $backup -PathType Leaf) {
+      throw "dcg replacement failed; previous executable is preserved at: $backup. $_"
+    }
+    throw
+  } finally {
+    if (Test-Path -LiteralPath $stage -PathType Leaf) {
+      Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue
+    }
+    if ($promoted -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
+      Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    }
+  }
 }
 
 function Resolve-ChecksumToken {
@@ -2050,6 +2334,7 @@ function Detect-Agents {
     'Reasonix' = ((@($reasonixHomes | Where-Object {
           Test-Path -LiteralPath $_ -PathType Container -ErrorAction SilentlyContinue
         }).Count -gt 0) -or (_has 'reasonix'))
+    'Droid' = ((_dir '.factory') -or (_has 'droid'))
   }
 }
 
@@ -2057,7 +2342,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush', 'Reasonix')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush', 'Reasonix', 'Droid')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -2072,14 +2357,14 @@ if ($Help) {
 dcg PowerShell installer
 
 Usage:
-  irm https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/install.ps1 | iex
-  & ([scriptblock]::Create((irm "<install.ps1 URL>"))) -EasyMode -Verify
+  Authenticate a pinned release installer before executing the local file:
+  https://github.com/JJLiebig/destructive_command_guard#this-fork-ask-before-dcg-flagged-codex-commands
 
 Options:
   -Version vX.Y.Z   Install a specific version (default: latest GitHub release)
   -Dest DIR         Install to DIR (default: ~/.local/bin)
   -EasyMode         Add the install dir to PATH and force agent configuration
-  -Verify           Run a self-test after install
+  -Verify           Self-test the candidate before installing
   -RequireMinisign  Require a valid .minisig and the minisign verifier
   -MinisignSignatureUrl <url|file://>  Override the adjacent .minisig source
   -Force            Configure agent hooks even if the agent CLI isn't detected
@@ -2096,6 +2381,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Oh My Pi     (active profile's extensions/dcg-guard.ts via dcg install --omp)
   Crush        (~/.config/crush/crush.json hooks.PreToolUse via dcg install --crush)
   Reasonix     (%APPDATA%\reasonix\settings.json hooks.PreToolUse via dcg install --reasonix)
+  Factory Droid (~/.factory Execute PreToolUse via dcg install --droid)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2283,21 +2569,24 @@ if (-not (Test-Path -LiteralPath $binPath -PathType Leaf)) {
   exit 1
 }
 
-# Install
-if (-not (Test-Path $Dest)) {
-  New-Item -ItemType Directory -Force -Path $Dest | Out-Null
-}
+# Stage, qualify, then atomically install. No PATH or hook changes precede
+# successful qualification and promotion of the verified candidate.
 $installedExe = Join-Path $Dest "dcg.exe"
-Copy-Item $binPath $installedExe -Force
-# Strip Mark-of-the-Web (Zone.Identifier) so the freshly-installed binary does not
-# trip SmartScreen / "publisher could not be verified". Done only AFTER the
-# required checksum and, when a bundle and compatible cosign are available,
-# signature verification above, so unchecked bytes are never unblocked.
+try {
+  Install-DcgBinary -SourcePath $binPath -DestinationPath $installedExe `
+    -ExpectedVersion $Version -ProbeRoot $tmp -Verify:$Verify
+} catch {
+  Write-Err $_.Exception.Message
+  exit 1
+}
+# File.Replace can preserve the old file's alternate streams. Clear any inherited
+# Mark-of-the-Web (Zone.Identifier) after the verified stage is promoted, so the
+# new binary does not inherit a SmartScreen warning from the previous file.
 # Wrapped in try/catch because Unblock-File is present-but-unsupported on non-Windows
 # PowerShell (it throws "does not support Linux", which -ErrorAction can't suppress);
 # on Windows it works normally. Keeps the installer body hermetically testable.
 if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
-  try { Unblock-File -Path $installedExe -ErrorAction SilentlyContinue } catch { }
+  try { Unblock-File -LiteralPath $installedExe -ErrorAction SilentlyContinue } catch { }
 }
 Write-Ok "Installed to $Dest\dcg.exe"
 
@@ -2320,17 +2609,6 @@ if (-not (Test-UserPathContains -PathValue $path -PathToFind $Dest)) {
   } else {
     Write-Warn "Add $Dest to PATH to use dcg"
   }
-}
-
-try {
-  Assert-DcgInstalledVersion -Path $installedExe -ExpectedVersion $Version
-  if ($Verify) {
-    Write-Info "Running self-test..."
-    Invoke-DcgInstallSelfTest -Path $installedExe -ProbeRoot $tmp
-  }
-} catch {
-  Write-Err $_.Exception.Message
-  exit 1
 }
 
 }
@@ -2545,6 +2823,25 @@ if ($detectedAgents['Reasonix'] -or $forceConfig) {
   }
 } else {
   Write-Info "Reasonix not detected; re-run with -EasyMode to configure its hook anyway"
+}
+
+# Factory's hooks.json/settings.json precedence and JSON preservation belong
+# to the native installer, shared with `dcg install --droid` on every platform.
+if ($detectedAgents['Droid'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    & $dcgExe install --droid --force
+    if ($LASTEXITCODE -eq 0) {
+      Write-Ok "Configured Factory Droid Execute hook via 'dcg install --droid'"
+      Write-Info "Restart Droid and inspect /hooks. Nested Script coverage is unverified."
+    } else {
+      Write-Warn "'dcg install --droid' exited with code $LASTEXITCODE"
+    }
+  } catch {
+    Write-Warn "Factory Droid hook configuration failed: $_"
+  }
+} else {
+  Write-Info "Factory Droid not detected; re-run with -EasyMode to configure its hook anyway"
 }
 
 # Grok (xAI) and Antigravity (agy): configured via the dcg binary itself rather

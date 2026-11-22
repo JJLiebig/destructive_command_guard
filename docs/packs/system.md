@@ -68,7 +68,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `dd-discard` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dd[ \t]+(?:(?:(?:if\|ibs\|obs\|bs\|cbs\|skip\|iseek\|seek\|oseek\|count\|conv\|iflag\|oflag\|status)=(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|[0-9]*[<>]&(?:[0-9]+\|-)\|[0-9]*<[ \t]*(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|(?:[0-9]*(?:>>?\|>\\|)\|&>>?)[ \t]*(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)"\|(?!['"]?/dev/)(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")))[ \t]+)*(?:of=(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)")\|'of=/dev/(?:null\|zero\|full)'\|"of=/dev/(?:null\|zero\|full)")(?:[ \t]+(?:(?:(?:if\|ibs\|obs\|bs\|cbs\|skip\|iseek\|seek\|oseek\|count\|conv\|iflag\|oflag\|status)=(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|[0-9]*[<>]&(?:[0-9]+\|-)\|[0-9]*<[ \t]*(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|(?:[0-9]*(?:>>?\|>\\|)\|&>>?)[ \t]*(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)"\|(?!['"]?/dev/)(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")))\|(?:of=(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)")\|'of=/dev/(?:null\|zero\|full)'\|"of=/dev/(?:null\|zero\|full)")))*[ \t]*$` |
+| `dd-discard` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dd[ \t]+(?:(?:if="(?:[^"\\$`\r\n]\|\$(?:[A-Za-z_][A-Za-z0-9_]*\|\{[A-Za-z_][A-Za-z0-9_]*\}\|[0-9]))*"\|(?:if\|ibs\|obs\|bs\|cbs\|skip\|iseek\|seek\|oseek\|count\|conv\|iflag\|oflag\|status)=(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|[0-9]*[<>]&(?:[0-9]+\|-)\|[0-9]*<[ \t]*(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|(?:[0-9]*(?:>>?\|>\\|)\|&>>?)[ \t]*(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)"\|(?!['"]?/dev/)(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")))[ \t]+)*(?:of=(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)")\|'of=/dev/(?:null\|zero\|full)'\|"of=/dev/(?:null\|zero\|full)")(?:[ \t]+(?:(?:if="(?:[^"\\$`\r\n]\|\$(?:[A-Za-z_][A-Za-z0-9_]*\|\{[A-Za-z_][A-Za-z0-9_]*\}\|[0-9]))*"\|(?:if\|ibs\|obs\|bs\|cbs\|skip\|iseek\|seek\|oseek\|count\|conv\|iflag\|oflag\|status)=(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|[0-9]*[<>]&(?:[0-9]+\|-)\|[0-9]*<[ \t]*(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|(?:[0-9]*(?:>>?\|>\\|)\|&>>?)[ \t]*(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)"\|(?!['"]?/dev/)(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")))\|(?:of=(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)")\|'of=/dev/(?:null\|zero\|full)'\|"of=/dev/(?:null\|zero\|full)")))*[ \t]*$` |
 | `lsblk` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?lsblk(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
 | `blkid` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?blkid(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
 | `df` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?df(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
@@ -259,6 +259,8 @@ Commands containing these keywords are checked against this pack:
 - `upstart`
 - `shutdown`
 - `reboot`
+- `modprobe`
+- `rmmod`
 
 ### Safe Patterns (Allowed)
 
@@ -288,6 +290,9 @@ These patterns match potentially destructive commands:
 | `shutdown` | shutdown will power off or restart the system. | critical |
 | `reboot` | reboot will restart the system. | critical |
 | `init-level` | init 0 shuts down, init 6 reboots the system. | critical |
+| `modprobe-remove` | Unloading a kernel module on a running host can crash or wedge the kernel. | high |
+| `rmmod` | Unloading a kernel module on a running host can crash or wedge the kernel. | high |
+| `ssh-remote-module-unload` | Unloading a kernel module on a remote host can crash or wedge its kernel. | high |
 
 ### Allowlist Guidance
 

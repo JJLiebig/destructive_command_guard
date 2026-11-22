@@ -84,11 +84,12 @@ safe_patterns:                       # Patterns that explicitly allow
 ### Custom Denial Wording (redirect-style packs)
 
 By default a denial is titled "Destructive Command Detected", and the reason the
-agent reads ends with "ask the user for explicit permission and have them run the
-command manually". For a pack that *redirects*, where the command is fine but
-should go through a sanctioned route, both are wrong. The trailer is also
-actively misleading: it tells the agent to stop and ask a human instead of
-following your `explanation`.
+agent reads ends with a generic trailer: use a safer alternative if one reaches
+the same goal, do not reword the command to get past the guard, and otherwise ask
+the user to approve it (or run it by hand). For a pack that *redirects*, where the
+command is fine but should go through a sanctioned route, both are wrong. The
+generic trailer does not name your route, so the agent is likely to stop and ask
+a human instead of following your `explanation`.
 
 ```yaml
 id: example.hosted_ci
@@ -200,6 +201,98 @@ silently become broader or turn into a dead rule.
 | `pattern` | string | yes | fancy-regex pattern to match |
 | `description` | string | no | Why this command is allowed |
 
+### Command text and safe exemptions
+
+Safe patterns match the **original command segment**, including leading
+environment assignments, execution wrappers, executable paths, and
+redirections. Detection still uses normalized command text so a wrapper such
+as `env NAME=value` cannot hide a destructive operation. Custom destructive
+patterns also see the original, data-sanitized command, allowing a policy to
+require an assignment or wrapper in its match.
+
+For an exemption that authorizes one reviewed invocation, anchor both ends:
+
+```yaml
+safe_patterns:
+  - name: reviewed-check
+    pattern: '^/usr/bin/python3 -I /opt/tools/run_check\.py --check$'
+```
+
+This exemption does not cover `PATH=/somewhere` before the command, an `env`
+or `sudo` wrapper, or another executable with the same basename. An absolute
+interpreter path and Python's `-I` option do not pin the environment used by
+child processes. Any variable can matter to an application; dcg does not
+maintain a list of supposedly harmless variable names for exemptions.
+
+When a particular environment is intentional, include its exact spelling in
+the safe pattern:
+
+```yaml
+safe_patterns:
+  - name: reviewed-check-with-path
+    pattern: '^env PATH=/usr/bin:/bin /usr/bin/python3 -I /opt/tools/run_check\.py --check$'
+```
+
+Nested shell evaluation retains the enclosing execution context. Extracting
+the command from an environment-changing wrapper or shell does not give it a
+new bare-command exemption. A custom safe regex that matches the **complete
+original carrier as one shell segment** can authorize that carrier's nested
+commands for its own pack; it cannot exempt another pack or a sibling shell
+segment. Even a plain `bash -c 'reviewed-command'` needs an exemption for the
+complete carrier to transfer a custom safe grant to its extracted command.
+
+Earlier shell segments can change the context of a later command. dcg
+conservatively withholds a later segment's custom exemption unless every
+preceding top-level segment is provably neutral with respect to the parent
+shell's state. Examples include no-argument `true` and `false`, bare `:`,
+and literal executable paths with literal arguments when the shell dialect
+is known to be POSIX. The path proof does not apply to unknown dialects,
+PowerShell, or Cmd, where a script can change the current process's
+environment. For example, `FOO=1 true; reviewed-command` can retain the
+later command's exemption; `export PATH=/somewhere; reviewed-command` and
+`PATH=/somewhere :; reviewed-command` cannot. Standalone assignments,
+`unset`, unknown command names, and expansions do not establish a neutral
+context. Exempting an earlier command does not by itself prove that later
+commands retain their reviewed shell state.
+
+Unanchored patterns can intentionally permit additional prefixes or
+suffixes when the safe match also holds in the detection view. When a safe
+match exists only in the original text, it must cover the complete original
+segment; a substring in quoted data or removed wrapper text cannot supply a
+new exemption. Use anchors to constrain the command forms you authorize.
+Losing a safe match means destructive evaluation continues; it does not by
+itself deny a command that no destructive rule covers.
+
+### Substitutions inside prose arguments
+
+Custom destructive rules can recognize active POSIX command substitutions in
+registered data arguments, including `gh --body`, `git -m`/`--message`, and
+`br --description`. After checking each inner command, dcg keeps the active
+backtick or `$()` delimiters and their enclosing double quotes visible to
+custom patterns. The surrounding prose and checked inner body remain masked
+with spaces, preserving original byte offsets and false-positive protection.
+For example, the custom view of `gh pr comment 1 --body "see $(id)"` includes
+`--body "    $(  )"`.
+
+This rule rejects either substitution form in a double-quoted prose argument:
+
+```yaml
+keywords: [--body, --message, --description]
+destructive_patterns:
+  - name: substitution-in-prose
+    pattern: '--(?:body|message|description)(?:=|\s+)"(?:[^"\\`$]|\\.|\$(?!\())*(?:`|\$\()'
+    severity: high
+    description: A command substitution in this text argument would execute
+```
+
+Single-quoted text and escaped substitution markers remain inert. A separate
+rule for a destructive inner command still applies recursively, with its own
+rule ID and allowlist scope. A grant for `substitution-in-prose` does not grant
+permission for a destructive command inside it. Safe patterns continue to
+authorize the original command, including its actual prose and inner body.
+Commands outside the safe-string registry retain their existing matching
+behavior; this view does not add arbitrary flags to that registry.
+
 ## Severity Levels
 
 Severity determines the default decision mode when a command matches, and how
@@ -230,6 +323,41 @@ entirely, improving performance.
 - Include partial matches: `rm` instead of `rm -rf`
 - Omit keywords (forces evaluation on every command)
 
+### How keywords select a custom pack
+
+A custom pack is evaluated when one of its keywords appears in the command
+text, or when a program the command runs carries one. dcg resolves each
+segment's program the same way as `executables` scoping (wrappers stripped,
+quotes and escapes removed, path reduced to its basename, extension dropped),
+and also reads the operands of launchers such as `xargs`, `find -exec`,
+`flock` and `watch`, and of wrappers it could not strip. A pack keyed on
+`mytool` is therefore selected for `"mytool"`, `my''tool` and
+`xargs my\tool`.
+
+When some segment's program cannot be known from the text, dcg cannot show
+that a pack is irrelevant, so it evaluates every enabled custom pack. That
+covers a variable (`$TOOL`), a command substitution, a glob or extended glob,
+a brace expansion, an expansion inside the word (`my${x}tool`), Bash
+`$"..."` quoting, an option where the program should be, and a wrapper chain
+or command longer than dcg reads. Keywords never need to list shell
+metacharacters.
+
+Selection only decides which packs run; a rule still has to match:
+
+- A rule that spells the program name (`mytool\s+wipe`) cannot match
+  `$TOOL wipe`. A rule on the subcommand alone (`\bwipe\b`) can, once the pack
+  is selected.
+- A rule scoped with `executables` still does not fire on a dynamic program
+  name (see [Scoping a Rule to Its Executables](#scoping-a-rule-to-its-executables)).
+- Argument text stays argument text: `echo mytool wipe` runs `echo`.
+- In a shell known to be POSIX (an agent's Bash tool, or `--dialect posix`),
+  a plain word with quotes or escapes inside it (`wi''pe`, `w\ipe`) is
+  matched as the word the shell passes, `wipe`. Elsewhere a backslash may be
+  a Windows path separator, so the word is matched as written.
+
+This applies to POSIX and unknown-dialect commands. PowerShell and cmd.exe
+commands select custom packs by their text only.
+
 ## Regex Pattern Guidelines
 
 Patterns use [fancy-regex](https://docs.rs/fancy-regex) syntax, which supports:
@@ -245,6 +373,39 @@ dcg uses a dual regex engine:
 - **Backtracking engine**: For patterns requiring advanced features
 
 Simple patterns are faster. The validator reports which engine each pattern uses.
+
+### Diagnosing Incomplete Rule Evaluation
+
+A regex that cannot finish leaves safety evaluation **unverified**. Its failure
+is not a destructive-pattern match. When available, the diagnostic identifies
+the pack, pattern name, exhausted limit, and operation, for example:
+
+```text
+pattern test.slow_lookahead:slow exceeded its per-pattern regex backtracking limit of 100000 steps (operation: find_from)
+```
+
+The backtracking engine has a **100,000-step limit per regex operation**. This
+is a work limit, not a millisecond timeout. `dcg config` reports it under
+`Regex evaluation`; JSON reports `regex.backtrack_limit_steps`. The default
+50 ms shown under `Heredoc scanning` is the **extraction timeout**, reported as
+`heredoc.timeout_ms` in JSON. Increasing `hook_timeout_ms` does not change the
+regex work limit.
+
+If the hook deadline also expires, the diagnostic reports that deadline while
+retaining the known regex rule and work limit. The two limits are independent.
+
+Inspect the named rule for repeated whole-input lookaheads and broad searches.
+An unanchored expression can retry an expensive lookahead at many start
+positions. If the rule is intended to inspect the whole input from its start,
+an absolute `\A` anchor can avoid those retries. Narrow search ranges or pack
+keywords only when every intended destructive match remains covered. Verify
+both the original destructive cases and benign controls through `dcg test
+--stdin --dialect posix --format json` and the hook after changing a rule.
+
+Rule identifiers in failure diagnostics are bounded and sanitized; submitted
+commands, regex source, and match offsets are not included. See
+[Hook errors or timeouts](troubleshooting.md#hook-errors-or-timeouts) for other
+incomplete-analysis stages.
 
 ### Pattern Specificity
 

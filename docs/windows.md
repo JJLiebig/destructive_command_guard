@@ -8,17 +8,126 @@ Windows-specific behavior, paths, default protection, and honest limitations.
 
 ## Install / update / uninstall
 
-Install with PowerShell:
+For the Codex++ fork, use the Windows archive from the
+[fork's releases](https://github.com/JJLiebig/destructive_command_guard/releases).
+The Minisign installer and updater instructions below apply to upstream.
+
+### Verified release installation
+
+Install `minisign` from a trusted OS package manager before using this recipe.
+Establish the public key below from a trusted copy of this documentation or an
+independent maintainer channel. Do not download a replacement key beside the
+installer and assume it is trusted.
+
+Paste this function into **native Windows PowerShell**. It downloads the
+`v0.16.0` installer and signature into a fresh directory readable only by your
+Windows account, verifies the pinned Minisign key and fixed installer SHA256,
+then invokes the authenticated local script. No downloaded script executes
+before both checks succeed. The binary archive must then pass its own Minisign
+and SHA256 checks too.
+
+<!-- verified-release-install-powershell:begin -->
+```powershell
+function Install-DcgRelease {
+    [CmdletBinding()]
+    param([ValidateSet('Normal', 'Easy')][string]$Mode = 'Easy')
+
+    $ErrorActionPreference = 'Stop'
+    $tag = 'v0.16.0'
+    $expectedHash = 'f662ac7d34d2b7545a0e3ad7d5c7baff561fb6ccf96e75ee31d7f8b37fce7696'
+    $key = 'RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO'
+    $verifier = (Get-Command minisign -CommandType Application -ErrorAction Stop).Source
+
+    # Restrict access before writing any downloaded bytes.
+    $parent = [Environment]::GetFolderPath('LocalApplicationData')
+    if (-not $parent) { throw 'A private local application-data directory is required.' }
+    $work = Join-Path $parent ('dcg-install-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $work -ErrorAction Stop
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner($sid)
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+        $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'
+    )
+    $acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $work -AclObject $acl -ErrorAction Stop
+    Write-Host "Installer verification files: $work"
+
+    # Windows PowerShell 5.1 may otherwise default to TLS 1.0/1.1.
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $base = "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$tag"
+    $installer = Join-Path $work 'install.ps1'
+    $signature = Join-Path $work 'install.ps1.minisig'
+    foreach ($asset in @('install.ps1', 'install.ps1.minisig')) {
+        Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 `
+            -UserAgent 'destructive_command_guard-installer' `
+            -Uri "$base/$asset" -OutFile (Join-Path $work $asset) -ErrorAction Stop
+    }
+
+    # PowerShell 5.1 can wrap successful native stderr as NativeCommandError.
+    # Decide verification from the actual process exit code, including failure
+    # to start the verifier, rather than from stderr or a stale LASTEXITCODE.
+    # Native processes update the global automatic variable. An unqualified
+    # assignment here would shadow it in this function (PowerShell 5.1 and 7).
+    $global:LASTEXITCODE = -1
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $verifier -Vm $installer -x $signature -P $key
+        $signatureExit = $global:LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = 'Stop'
+    }
+    if ($signatureExit -ne 0) { throw 'Installer signature verification failed.' }
+    $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($actualHash.ToLowerInvariant() -cne $expectedHash) {
+        throw 'Installer does not match the pinned release; refusing execution.'
+    }
+
+    # Allow this authenticated file under RemoteSigned without changing policy.
+    Unblock-File -LiteralPath $installer -ErrorAction Stop
+    # A PS1 invoked in-process can leave an incidental native exit code behind
+    # (including the self-test's expected denial). A child -File invocation
+    # reports the script's completion, explicit exit, or terminating exception.
+    $powerShell = (Get-Process -Id $PID -ErrorAction Stop).Path
+    $installArgs = @('-NoProfile', '-File', ('"' + $installer + '"'),
+        '-Version', $tag, '-RequireMinisign', '-Verify')
+    if ($Mode -eq 'Easy') { $installArgs += '-EasyMode' }
+    $installProcess = Start-Process -FilePath $powerShell -ArgumentList $installArgs `
+        -Wait -PassThru -NoNewWindow -ErrorAction Stop
+    if ($null -eq $installProcess.ExitCode -or $installProcess.ExitCode -ne 0) {
+        throw "Installer failed with exit code $($installProcess.ExitCode)."
+    }
+}
+```
+<!-- verified-release-install-powershell:end -->
+
+Then choose one mode:
 
 ```powershell
-& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/install.ps1"))) -EasyMode -Verify
+Install-DcgRelease                 # Easy mode: configure hooks and add User PATH
+# Or: Install-DcgRelease -Mode Normal
 ```
+
+The installer runs in a child PowerShell process. After Easy mode completes,
+open a new terminal to pick up the updated User `PATH`.
+
+Missing verification tools or assets, invalid signatures, or a different
+installer digest stop installation. There is no unsigned installer or source
+fallback. Verification files remain in the private directory for inspection.
+The tag and digest are a fixed pair: upgrading this recipe requires independently
+verifying and pinning the new release's installer bytes. Do not substitute
+`main` or `latest`, edit only the version, or remove a verification check.
+
+The authenticated installer offers these options when invoked from a local file
+you have already verified:
 
 - `-EasyMode` adds the install directory (`%USERPROFILE%\.local\bin` by default)
   to your **User** `PATH` and makes `dcg` available in the current session.
 - `-Verify` runs a post-install self-test.
-- `-Version vX.Y.Z` pins a specific release; `-Dest <dir>` changes the install
-  location; `-ArtifactUrl <url|file://>` installs from a specific artifact.
+- `-Version vX.Y.Z` selects a release; keep it paired with the verified
+  installer release. `-Dest <dir>` changes the install location.
 - `-RequireMinisign` requires both the adjacent `.minisig` and the `minisign`
   verifier. `-MinisignSignatureUrl <url|file://>` overrides that sidecar source
   for mirrors and hermetic/offline installs.
@@ -26,23 +135,43 @@ Install with PowerShell:
 The installer auto-selects `dcg-x86_64-pc-windows-msvc.zip` or
 `dcg-aarch64-pc-windows-msvc.zip` from the host architecture, falling back to
 the x64 artifact under Windows-on-ARM emulation if an older release has no
-native ARM64 asset. It **verifies the SHA256 checksum** (required), verifies a
-present `.minisig` against the embedded release key (key ID
-`69B3955C8D2E62A8`) when `minisign` is on `PATH`, and independently verifies a
+native ARM64 asset. This recipe **requires both the SHA256 checksum and
+Minisign signature**, verified against the embedded release key (key ID
+`69B3955C8D2E62A8`). The installer independently verifies a
 **Sigstore/cosign** signature against the pinned local-release key or GitHub
-Actions OIDC identity when a patched `cosign` and trusted bundle are available.
+Actions OIDC identity when a patched `cosign` and trusted bundle are available;
+`v0.16.0` publishes Minisign signatures without Sigstore bundles.
 The retired minisign key `36B847D11BA5A0D0` is accepted only for v0.6.7. A
-present but invalid minisign signature is always fatal; by default a missing
-sidecar/tool warns and continues unless `-RequireMinisign` is supplied.
+missing verifier, unavailable signature, or invalid signature is fatal under
+the `-RequireMinisign` mode used above. Run the recipe as your normal user;
+it installs in your profile and does not request elevation.
 
-Update via the built-in updater (re-runs `install.ps1`):
+### Updating
+
+**For installed `v0.16.0` and older clients, use the
+[verified release installation recipe](#verified-release-installation).** The
+published `v0.16.0` binary predates the updater authentication change below; the
+recipe independently authenticates its explicitly pinned installer before
+execution.
+
+In builds containing the issue #638 correction, update with `minisign` installed
+from a trusted package manager:
 
 ```powershell
 dcg update
 ```
 
+Before running an installer or staging a deferred worker, the corrected updater
+requires the release's installer, SHA256 sidecar, and Minisign signature. It
+checks the digest and verifies the signature with the embedded project key,
+then checks that the signed DSR trusted comment names exactly
+`destructive_command_guard`, the selected release tag, and that installer
+digest. Missing tools/assets, a wrong signature or release identity, and older
+signatures without the DSR identity all refuse the update. Binary installation
+then runs with `-RequireMinisign` as well as mandatory archive checksum checks.
+
 Windows cannot overwrite the `dcg.exe` process that is currently running.
-`dcg update` therefore verifies and stages the pinned installer, launches a
+After authentication, `dcg update` stages the pinned installer, launches a
 worker through Windows process management, and returns. The worker survives
 shell/process-job teardown, waits for the original dcg process to exit, and only
 then replaces the binary. Progress and any installer error are appended as UTF-8
@@ -50,14 +179,20 @@ to `%LOCALAPPDATA%\dcg\update.log` (or the platform cache directory selected by
 Windows when it differs). Use `dcg update --verify --no-configure` to update only
 the binary while preserving all existing agent-hook wiring.
 
-Uninstall:
+### Uninstalling
+
+Use `dcg uninstall` to remove hooks with the binary already installed (see
+`dcg uninstall --help` for agent selection). For full removal, review
+`uninstall.ps1` in a local checkout whose provenance you trust, then run it:
 
 ```powershell
-irm https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/uninstall.ps1 | iex
+& .\uninstall.ps1
 ```
 
 `uninstall.ps1` removes `dcg.exe`, the exact User `PATH` entry the installer
 added, dcg-owned Claude Code and Codex hooks, and dcg config/history directories.
+The `v0.16.0` release does not publish signed uninstaller assets. Do not execute
+an uninstaller downloaded from a mutable branch.
 
 ## File locations on Windows
 
@@ -98,6 +233,25 @@ to the always-on `core.filesystem` / `core.git` and default-on `system.disk`):
   hallmark), `wbadmin delete catalog|backup|systemstatebackup` (backup
   recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`,
   `Initialize-Disk` / `Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`.
+
+These two defaults also apply to recognized Cmd/PowerShell **hook payloads on
+Linux/macOS**. An explicit `cmd`/`cmd.exe` or `powershell`/`pwsh` tool label supplies
+that signal. The hook can also recognize Windows command syntax in a mislabeled
+`Bash` request, such as `rmdir /s /q d:\` or `Remove-Item -Recurse C:\data`.
+Ordinary POSIX requests keep the base defaults, and an unknown tool label alone
+does not activate the Windows packs. Explicit `disabled = ["windows"]` or
+individual pack exclusions still apply.
+
+Keep shell metadata and quoting faithful when testing coverage. For example,
+`cmd /c "rmdir /s /q D:\"` is a Cmd command, but the final backslash escapes its
+closing quote in Bash, leaving an unterminated string. Evaluating those bytes as
+a `Bash` call on macOS does not test native Cmd execution. Use the actual agent's
+payload and execution platform. For an isolated CLI check, select the matching
+`dcg test --dialect cmd` or `--dialect ps`; `dcg test` and `dcg explain` activate
+the same Windows default packs for these dialects on every host. Their default
+`unknown` dialect activates them only when the command has recognized Windows
+syntax. Explicit exclusions still apply. Select packs explicitly when scanning
+Windows scripts from another platform.
 
 Opt-in (registered but off until enabled, on every platform):
 
@@ -238,6 +392,21 @@ PowerShell ports of the shell E2E suites run on `windows-latest` CI (and locally
 - **`tests/installer/*.ps1`** — per-function unit tests for the install/uninstall
   hook-merge logic (Claude/Codex/Gemini/Copilot/Cursor/Hermes, zip-slip, flags,
   local-source, checksum, agent detection, arch selection).
+- **`tests/install/test_verified_bootstrap.py`** — executes the documented
+  verified-install function and the fleet authentication/install blocks using
+  real Minisign signatures and child PowerShell processes. It covers native
+  exit status, function scoping, failed launches, invalid signatures/digests,
+  and installer failures. With Python 3 and Minisign on `PATH`, run
+  `python -B -m unittest discover -s tests/install -p test_verified_bootstrap.py -k PowerShell -v`.
+  It exercises both `powershell` and `pwsh` when available;
+  `DCG_TEST_POWERSHELL` can select an additional executable. Unix runs explicitly
+  omit Windows ACL/`Unblock-File` checks. On a native Windows release host, set
+  `DCG_TEST_NATIVE_WINDOWS_INSTALL=1` to also qualify the real public `v0.16.0`
+  installer in Normal mode with a scratch destination, `-NoConfigure`, and
+  self-healing disabled. An explicitly requested native check fails when
+  Windows or PowerShell is unavailable. Without that opt-in, published release
+  bytes can be authenticated using `DCG_TEST_RELEASE_ASSETS`, but are never
+  executed by the tests. Use the configured DSR host for native qualification.
 - **Real-Windows runtime stress (CI-gated):**
   `scripts/win_history_concurrency.ps1` (concurrent history-DB writers + killed-writer
   stale-lock recovery), `scripts/win_pending_exception_concurrency.ps1` (concurrent

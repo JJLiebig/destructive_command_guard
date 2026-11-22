@@ -1076,9 +1076,12 @@ fn time_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Optio
             index += 2;
             continue;
         }
+        // `-fFORMAT` / `-oFILE` carry their value. Only an option does: a
+        // program word whose second byte is `f` or `o` (`/opt/...`, `sort`)
+        // is the command, and skipping it handed the next word that role.
         if word.starts_with("--format=")
             || word.starts_with("--output=")
-            || word.len() > 2 && matches!(word.as_bytes()[1], b'f' | b'o')
+            || word.len() > 2 && word.starts_with('-') && matches!(word.as_bytes()[1], b'f' | b'o')
             || word.strip_prefix('-').is_some_and(|flags| {
                 !flags.is_empty()
                     && flags
@@ -1246,18 +1249,41 @@ fn timeout_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Op
             index += 1;
             continue;
         }
-        if word.strip_prefix('-').is_some_and(|flags| {
-            !flags.is_empty() && flags.bytes().all(|flag| matches!(flag, b'f' | b'p' | b'v'))
-        }) {
-            index += 1;
+        if let Some(consume_next) = timeout_flag_cluster(&word) {
+            if consume_next {
+                wrapper_word(command, tokens, index + 1)?;
+            }
+            index += 1 + usize::from(consume_next);
             continue;
         }
         break;
     }
-    wrapper_word(command, tokens, index)?;
+    // DURATION is a number with an optional unit, never an option word. Taking
+    // an option this parser does not model (a long-option abbreviation such as
+    // `--sig`, an unknown letter) for the duration made the real duration the
+    // program.
+    if wrapper_word(command, tokens, index)?.starts_with('-') {
+        return None;
+    }
     let command_index = index.checked_add(1)?;
     wrapper_word(command, tokens, command_index)?;
     Some(command_index)
+}
+
+/// A getopt cluster of `timeout` flags: `-f`/`-p`/`-v`, optionally ending in
+/// `-k` or `-s`, whose value is the rest of the word or, when the letter ends
+/// the word, the next word (returned as `Some(true)`). `None` when the word is
+/// not such a cluster.
+fn timeout_flag_cluster(word: &str) -> Option<bool> {
+    let flags = word.strip_prefix('-').filter(|flags| !flags.is_empty())?;
+    for (position, flag) in flags.bytes().enumerate() {
+        match flag {
+            b'f' | b'p' | b'v' => {}
+            b'k' | b's' => return Some(position + 1 == flags.len()),
+            _ => return None,
+        }
+    }
+    Some(false)
 }
 
 fn stdbuf_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
@@ -1384,7 +1410,9 @@ fn chrt_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Optio
         let command_index = index.checked_add(1)?;
         wrapper_word(command, tokens, command_index)?;
         Some(command_index)
-    } else if priority_optional {
+    } else if priority_optional && !first.starts_with('-') {
+        // An option word here is one the loop does not model (such as the
+        // `--fi` abbreviation of `--fifo`), not the program.
         Some(index)
     } else {
         None
@@ -1516,6 +1544,10 @@ pub(crate) fn is_posix_execution_frontend_basename(basename: &str) -> bool {
     matches!(
         basename,
         "exec"
+            | "builtin"
+            | "noglob"
+            | "nocorrect"
+            | "-"
             | "nohup"
             | "time"
             | "nice"
@@ -1537,6 +1569,28 @@ pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'s
     let mut filesystem_context_changed = false;
     let command_index = match basename {
         "exec" => exec_wrapper_command_index(trimmed, &tokens, &mut filesystem_context_changed)?,
+        // `builtin NAME …` runs the shell builtin NAME, and when NAME is
+        // `command`, `exec` or `builtin` the words after it execute. Not
+        // stripping it left `builtin command git reset --hard` an unknown
+        // program, allowed in POSIX (bd-builtin-wrapper-bypass-pbxa). A NAME
+        // that is no builtin makes the shell fail without running anything,
+        // so reading it as the executable can only add denials.
+        "builtin" => {
+            let word = wrapper_word(trimmed, &tokens, 1)?;
+            if word == "--" {
+                2
+            } else if word.starts_with('-') {
+                return None;
+            } else {
+                1
+            }
+        }
+        // zsh's precommand modifiers take no options: `noglob git reset
+        // --hard`, `nocorrect …` and `- …` run the command after them.
+        "noglob" | "nocorrect" | "-" => {
+            wrapper_word(trimmed, &tokens, 1)?;
+            1
+        }
         "nohup" => {
             let word = wrapper_word(trimmed, &tokens, 1)?;
             if word == "--" {
@@ -1563,6 +1617,10 @@ pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'s
         remaining,
         match basename {
             "exec" => "exec",
+            "builtin" => "builtin",
+            "noglob" => "noglob",
+            "nocorrect" => "nocorrect",
+            "-" => "zsh-dash",
             "nohup" => "nohup",
             "time" => "time",
             "nice" => "nice",
@@ -1615,7 +1673,23 @@ pub(crate) fn starts_with_shell_redirection(s: &str) -> bool {
 }
 
 #[must_use]
-pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
+pub fn consume_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
+    consume_word_token_inner(bytes, i, len, false)
+}
+
+/// Consume one POSIX argv word, excluding adjacent local redirections.
+/// Normalization deliberately keeps redirections in its token view; program
+/// extraction needs the argv boundary, but must use the same quote walker.
+pub(crate) fn consume_posix_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
+    consume_word_token_inner(bytes, i, len, true)
+}
+
+fn consume_word_token_inner(
+    bytes: &[u8],
+    mut i: usize,
+    len: usize,
+    stop_at_redirect: bool,
+) -> usize {
     while i < len {
         let b = bytes[i];
 
@@ -1633,7 +1707,14 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
             continue;
         }
 
+        if stop_at_redirect && matches!(b, b'<' | b'>') {
+            break;
+        }
+
         if b == b'&' && i + 1 < len && bytes[i + 1] == b'>' {
+            if stop_at_redirect {
+                break;
+            }
             i += 2;
             if i < len && bytes[i] == b'>' {
                 i += 1;
@@ -1646,6 +1727,32 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
         }
 
         match b {
+            b'$' if i + 1 < len && bytes[i + 1] == b'\'' => {
+                // ANSI-C quotes are one segment of the same word. An escaped
+                // apostrophe does not end that segment (issue #570).
+                i += 2;
+                while i < len && bytes[i] != b'\'' {
+                    i = if bytes[i] == b'\\' {
+                        (i + 2).min(len)
+                    } else {
+                        i + 1
+                    };
+                }
+                i = (i + 1).min(len);
+            }
+            b'`' => {
+                // Preserve a complete substitution for the fallible decoder;
+                // never pretend the prefix before its whitespace is static.
+                i += 1;
+                while i < len && bytes[i] != b'`' {
+                    i = if bytes[i] == b'\\' {
+                        (i + 2).min(len)
+                    } else {
+                        i + 1
+                    };
+                }
+                i = (i + 1).min(len);
+            }
             b'\\' => {
                 // Handle CRLF escape (consumes 3 bytes: \, \r, \n)
                 if i + 2 < len && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
@@ -1935,12 +2042,24 @@ enum PosixQuote {
 }
 
 pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
+    decode_posix_token(token, false).unwrap_or(Cow::Borrowed(token))
+}
+
+/// The value of a literal POSIX argv word. Unlike the syntax matching view,
+/// failure is explicit: expansions, translation, and malformed quoting must
+/// not be mistaken for a completely recovered inline program (issue #570).
+pub(crate) fn decode_posix_literal_word(token: &str) -> Option<Cow<'_, str>> {
+    decode_posix_token(token, true)
+}
+
+fn decode_posix_token(token: &str, literal_word: bool) -> Option<Cow<'_, str>> {
     if !token
         .as_bytes()
         .iter()
         .any(|byte| matches!(*byte, b'\'' | b'"' | b'\\' | b'$' | b'`' | b'<' | b'>'))
     {
-        return Cow::Borrowed(token);
+        return (!literal_word || !token.contains(['*', '?', '[', '{', '~']))
+            .then_some(Cow::Borrowed(token));
     }
 
     let mut output = String::with_capacity(token.len());
@@ -1964,9 +2083,7 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                     changed = true;
                 }
                 '\\' => {
-                    let Some(escaped) = chars.next() else {
-                        return Cow::Borrowed(token);
-                    };
+                    let escaped = chars.next()?;
                     match escaped {
                         '\n' => changed = true,
                         '\r' if chars.peek() == Some(&'\n') => {
@@ -1985,8 +2102,10 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                         }
                     }
                 }
-                '$' => return Cow::Borrowed(token),
-                '`' => return Cow::Borrowed(token),
+                '$' if literal_word && !posix_dollar_expands(chars.peek().copied()) => {
+                    output.push('$');
+                }
+                '$' | '`' => return None,
                 other => output.push(other),
             },
             PosixQuote::Unquoted => match ch {
@@ -1999,9 +2118,7 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                     changed = true;
                 }
                 '\\' => {
-                    let Some(escaped) = chars.next() else {
-                        return Cow::Borrowed(token);
-                    };
+                    let escaped = chars.next()?;
                     changed = true;
                     match escaped {
                         '\n' => {}
@@ -2014,11 +2131,14 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                 '$' if chars.peek() == Some(&'\'') => {
                     chars.next();
                     if decode_ansi_c_quoted(&mut chars, &mut output).is_err() {
-                        return Cow::Borrowed(token);
+                        return None;
                     }
                     changed = true;
                 }
                 '$' if chars.peek() == Some(&'"') => {
+                    if literal_word {
+                        return None; // The locale may replace the program.
+                    }
                     // Bash locale-translation quoting has double-quote shell
                     // semantics after translation. Literal option spellings
                     // are deterministic; nested expansions still fail open.
@@ -2026,23 +2146,36 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                     quote = PosixQuote::Double;
                     changed = true;
                 }
-                '$' => return Cow::Borrowed(token),
-                '`' => return Cow::Borrowed(token),
-                '<' | '>' if chars.peek() == Some(&'(') => return Cow::Borrowed(token),
+                '$' if literal_word && !posix_dollar_expands(chars.peek().copied()) => {
+                    output.push('$');
+                }
+                '$' | '`' => return None,
+                '<' | '>' if literal_word || chars.peek() == Some(&'(') => return None,
+                '*' | '?' | '[' | '{' | '~' if literal_word => return None,
                 other => output.push(other),
             },
         }
     }
 
     if quote != PosixQuote::Unquoted {
-        return Cow::Borrowed(token);
+        return None;
     }
 
     if changed {
-        Cow::Owned(output)
+        Some(Cow::Owned(output))
     } else {
-        Cow::Borrowed(token)
+        Some(Cow::Borrowed(token))
     }
+}
+
+pub(crate) fn posix_dollar_expands(next: Option<char>) -> bool {
+    next.is_some_and(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '_' | '(' | '{' | '[' | '$' | '?' | '!' | '#' | '@' | '*' | '-'
+            )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2553,19 +2686,34 @@ fn decode_powershell_pattern_view(command: &str) -> Cow<'_, str> {
 
     let mut replacements: Vec<(Range<usize>, String)> = Vec::new();
     let mut segment_has_command = false;
+    let mut quoted_invocation_target = false;
     for token in &tokens {
+        let Some(raw) = token.text(command) else {
+            return Cow::Borrowed(command);
+        };
         if token.kind == NormalizeTokenKind::Separator {
-            segment_has_command = false;
+            // A leading call operator invokes its next word. An ampersand
+            // after an existing command is the background operator instead;
+            // it does not turn the following string expression into a call.
+            quoted_invocation_target = !segment_has_command && raw == "&";
+            // A closing parenthesis completes an expression; a following
+            // ampersand is still backgrounding that completed command.
+            segment_has_command = raw == ")";
             continue;
         }
         if segment_has_command {
             continue;
         }
-        let Some(raw) = token.text(command) else {
-            return Cow::Borrowed(command);
-        };
+        if raw == "." {
+            // Dot sourcing, like the call operator, owns an executable
+            // operand rather than evaluating a standalone string expression.
+            quoted_invocation_target = true;
+            continue;
+        }
         segment_has_command = true;
-        if !raw.contains('`') {
+        let string_expression =
+            raw.starts_with(['\'', '"']) || raw.starts_with("@'") || raw.starts_with("@\"");
+        if (!quoted_invocation_target && string_expression) || !raw.contains('`') {
             continue;
         }
         let decoded = decode_powershell_executable_backticks(raw);
@@ -2674,7 +2822,7 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
     let mut literal_mode = false;
 
     while i < len {
-        i = skip_shell_horizontal_whitespace(bytes, i, len);
+        i = skip_powershell_header_whitespace(bytes, i, len);
         if i >= len {
             break;
         }
@@ -2764,6 +2912,18 @@ fn cmd_line_continuation_end(bytes: &[u8], i: usize, len: usize) -> Option<usize
 }
 
 fn tokenize_cmd_raw(command: &str) -> NormalizeTokens {
+    tokenize_cmd_word_view(command, false)
+}
+
+/// An additive Cmd view in which percent references own their complete raw
+/// names before word/statement splitting. Undefined variables can remain
+/// literal at a command prompt, so callers must retain the ordinary raw view
+/// as well; this must not replace `tokenize_for_shell_dialect(Cmd)`.
+pub(crate) fn tokenize_cmd_expansion_view(command: &str) -> NormalizeTokens {
+    tokenize_cmd_word_view(command, true)
+}
+
+fn tokenize_cmd_word_view(command: &str, expansion_names: bool) -> NormalizeTokens {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
@@ -2812,7 +2972,7 @@ fn tokenize_cmd_raw(command: &str) -> NormalizeTokens {
         }
 
         let start = i;
-        i = consume_cmd_word(bytes, i, len);
+        i = consume_cmd_word(bytes, i, len, expansion_names);
         if start == i {
             // Defensive progress guarantee for malformed or future syntax.
             i += 1;
@@ -2913,7 +3073,10 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize) -> usize {
         let byte = bytes[i];
         match quote {
             PowerShellQuote::Unquoted => {
-                if byte.is_ascii_whitespace() || powershell_separator_end(bytes, i, len).is_some() {
+                if byte.is_ascii_whitespace()
+                    || (!byte.is_ascii() && skip_powershell_header_whitespace(bytes, i, len) > i)
+                    || powershell_separator_end(bytes, i, len).is_some()
+                {
                     break;
                 }
                 match byte {
@@ -3072,17 +3235,62 @@ fn powershell_pipeline_end(bytes: &[u8], i: usize, len: usize) -> Option<usize> 
     })
 }
 
-fn consume_cmd_word(bytes: &[u8], mut i: usize, len: usize) -> usize {
+/// End of one Cmd expansion beginning at `start`, before quote/caret or word
+/// splitting. Environment-variable names may contain spaces and punctuation;
+/// those bytes belong to the expansion, not to the surrounding command.
+/// A closing delimiter takes precedence over a batch parameter (`%1%` names
+/// the variable `1`, whereas `%1` is one batch argument). Doubled delimiters
+/// and unterminated ordinary names remain literal here.
+pub(crate) fn cmd_expansion_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let delimiter = *bytes.get(start)?;
+    if !matches!(delimiter, b'%' | b'!') || bytes.get(start + 1) == Some(&delimiter) {
+        return None;
+    }
+    let close = bytes
+        .get(start + 1..)?
+        .iter()
+        .position(|byte| *byte == delimiter || matches!(*byte, b'\r' | b'\n'));
+    if let Some(close) = close {
+        let close = start + 1 + close;
+        if bytes[close] == delimiter {
+            return Some(close + 1);
+        }
+    }
+    (delimiter == b'%'
+        && bytes
+            .get(start + 1)
+            .is_some_and(|next| next.is_ascii_digit() || *next == b'*'))
+    .then_some(start + 2)
+}
+
+fn consume_cmd_word(bytes: &[u8], mut i: usize, len: usize, expansion_names: bool) -> usize {
     let mut in_double_quotes = false;
 
     while i < len {
         let byte = bytes[i];
+        if expansion_names
+            && byte == b'%'
+            && let Some(end) = cmd_expansion_end(bytes, i)
+        {
+            i = end;
+            continue;
+        }
         if !in_double_quotes {
             if byte.is_ascii_whitespace() || cmd_separator_end(bytes, i, len).is_some() {
                 break;
             }
             match byte {
-                b'^' => i = consume_shell_escape(bytes, i, len),
+                b'^' => {
+                    // Percent expansion precedes caret removal. In
+                    // `vssad^%name with spaces%min` the caret does not expose
+                    // the variable name's spaces as argument boundaries.
+                    i = if expansion_names && bytes.get(i + 1) == Some(&b'%') {
+                        cmd_expansion_end(bytes, i + 1)
+                            .unwrap_or_else(|| consume_shell_escape(bytes, i, len))
+                    } else {
+                        consume_shell_escape(bytes, i, len)
+                    };
+                }
                 b'"' => {
                     in_double_quotes = true;
                     i += 1;
@@ -3714,8 +3922,10 @@ fn looks_like_subcommand_word(token: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
+/// With `posix_quoting`, quotes and backslash escapes inside the word are
+/// also removed, as the POSIX shell the caller proved does.
 #[must_use]
-fn normalize_subcommand_token(token: &str) -> Option<String> {
+fn normalize_subcommand_token(token: &str, posix_quoting: bool) -> Option<String> {
     let mut out = token.to_string();
     // Strip line continuations (backslash + newline) anywhere in the token
     let mut changed = if out.contains("\\\n") || out.contains("\\\r\n") {
@@ -3752,7 +3962,301 @@ fn normalize_subcommand_token(token: &str) -> Option<String> {
         }
     }
 
+    // Quotes and escapes inside a word are removed by a POSIX shell exactly
+    // like quotes around it: `z''ap`, `z\ap` and `"z"ap` all pass `zap`. Read
+    // them the same way when the result is the same kind of plain word, or a
+    // rule (or a pack keyword) naming a subcommand, or a program a launcher
+    // runs, never sees it (#592). The shared literal-word decoder refuses any
+    // expansion or pattern, so those keep their quoting. Only for a proven
+    // POSIX shell: elsewhere `Files\git` may be a Windows path, and joining
+    // it would hide the `git` it names. That includes the generic pass that
+    // re-reads text a POSIX pass already normalized.
+    if posix_quoting
+        && out.contains(['\'', '"', '\\'])
+        && let Some(decoded) = decode_posix_literal_word(&out)
+        && looks_like_subcommand_word(&decoded)
+    {
+        out = decoded.into_owned();
+        changed = true;
+    }
+
     if changed { Some(out) } else { None }
+}
+
+/// Quote state at a source boundary in a literal dcg syntax token.
+///
+/// PowerShell control/Unicode escapes are not ordinary escaped letters. The
+/// shared syntax decoder intentionally retains its established matching view;
+/// this narrower CLI proof must not turn `--ro`bot` into `--robot`, for example.
+/// Returning `None` leaves those bytes opaque instead of inventing an option.
+fn dcg_syntax_quote_state(token: &str, dialect: ShellDialect) -> Option<(PosixQuote, bool)> {
+    let mut quote = PosixQuote::Unquoted;
+    let mut ansi_c_quote = false;
+    let mut chars = token.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quote == PosixQuote::Single && !ansi_c_quote {
+            if ch == '\'' {
+                if dialect == ShellDialect::PowerShell && chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    quote = PosixQuote::Unquoted;
+                }
+            }
+            continue;
+        }
+        if dialect == ShellDialect::PowerShell && ch == '`' {
+            let escaped = chars.next()?;
+            if matches!(
+                escaped,
+                '0' | 'a' | 'b' | 'e' | 'f' | 'n' | 'r' | 't' | 'u' | 'v'
+            ) {
+                return None;
+            }
+            continue;
+        }
+        if dialect == ShellDialect::Posix && ch == '\\' {
+            chars.next()?;
+            continue;
+        }
+        match (quote, ch) {
+            (PosixQuote::Unquoted, '$')
+                if dialect == ShellDialect::Posix && chars.peek() == Some(&'\'') =>
+            {
+                chars.next();
+                quote = PosixQuote::Single;
+                ansi_c_quote = true;
+            }
+            (PosixQuote::Unquoted, '\'') => quote = PosixQuote::Single,
+            (PosixQuote::Unquoted, '"') => quote = PosixQuote::Double,
+            (PosixQuote::Double, '"') => quote = PosixQuote::Unquoted,
+            (PosixQuote::Single, '\'') => {
+                quote = PosixQuote::Unquoted;
+                ansi_c_quote = false;
+            }
+            _ => {}
+        }
+    }
+    Some((quote, ansi_c_quote))
+}
+
+/// Canonicalize an inline --agent option without rewriting its opaque value.
+fn normalize_dcg_agent_assignment(raw: &str, dialect: ShellDialect) -> Option<String> {
+    let value_start = raw.find('=')? + 1;
+    let prefix = &raw[..value_start];
+    let (quote, ansi_c_quote) = dcg_syntax_quote_state(prefix, dialect)?;
+    let (closing_quote, value_quote) = match quote {
+        PosixQuote::Unquoted => ("", ""),
+        PosixQuote::Single if ansi_c_quote => ("'", "$'"),
+        PosixQuote::Single => ("'", "'"),
+        PosixQuote::Double => ("\"", "\""),
+    };
+    // A quote spanning the option/value boundary can be closed just for the
+    // syntax proof, then reopened in front of the unchanged value. Thus
+    // "--a`gent=two words" becomes --agent="two words", not two argv words.
+    let syntax = format!("{prefix}{closing_quote}");
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    if decoder.decode(&syntax, ShellTokenRole::Syntax).as_deref() != Some("--agent=") {
+        return None;
+    }
+    Some(format!("--agent={value_quote}{}", &raw[value_start..]))
+}
+
+pub(crate) fn dcg_global_option_has_no_value(word: &str) -> bool {
+    matches!(
+        word,
+        "--robot"
+            | "--verbose"
+            | "--quiet"
+            | "--legacy-output"
+            | "--no-color"
+            | "--no-suggestions"
+            | "-q"
+    ) || word
+        .strip_prefix('-')
+        .is_some_and(|flags| !flags.is_empty() && flags.bytes().all(|b| b == b'v'))
+}
+
+pub(crate) fn is_dcg_literal_agent_assignment(raw: &str, dialect: ShellDialect) -> bool {
+    dcg_literal_word_is_static(raw, dialect)
+        && normalize_dcg_agent_assignment(raw, dialect).is_some()
+}
+
+/// Recover one static CLI argv word without evaluating its source. The
+/// PowerShell proof is intentionally narrower than the generic syntax view:
+/// expressions, splats, control escapes and incomplete quoting remain opaque.
+pub(crate) fn decode_dcg_literal_word(raw: &str, dialect: ShellDialect) -> Option<Cow<'_, str>> {
+    match dialect {
+        ShellDialect::Posix => decode_posix_literal_word(raw),
+        ShellDialect::PowerShell => {
+            if !dcg_literal_word_is_static(raw, dialect)
+                || dcg_syntax_quote_state(raw, dialect)?.0 != PosixQuote::Unquoted
+            {
+                return None;
+            }
+            ShellTokenDecoder::new(dialect).decode(raw, ShellTokenRole::Syntax)
+        }
+        ShellDialect::Cmd if dcg_literal_word_is_static(raw, dialect) => {
+            ShellTokenDecoder::new(dialect).decode(raw, ShellTokenRole::Syntax)
+        }
+        ShellDialect::Cmd | ShellDialect::Unknown => None,
+    }
+}
+
+/// Whether a caller-tokenized CLI word has a fixed single-argument value.
+/// No value is evaluated or rewritten. Quoted/escaped punctuation remains
+/// data, while runtime expansion, splatting and expression syntax do not
+/// establish argv ownership for a destructive-action proof.
+pub(crate) fn dcg_literal_word_is_static(raw: &str, dialect: ShellDialect) -> bool {
+    if dialect == ShellDialect::Posix {
+        return decode_posix_literal_word(raw).is_some();
+    }
+    if dialect == ShellDialect::Cmd {
+        // Environment/delayed expansion and the native Windows argv parser's
+        // backslash-before-quote rules require a separate proof.
+        if raw.contains(['%', '!']) || raw.contains("\\\"") {
+            return false;
+        }
+        let mut quoted = false;
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '"' {
+                quoted = !quoted;
+            } else if ch == '^' && !quoted {
+                let Some(escaped) = chars.next() else {
+                    return false;
+                };
+                // Cmd removes this caret, but the native executable parses
+                // the resulting command line again. An unquoted space/tab
+                // still splits argv, and a quote can absorb later words.
+                if matches!(escaped, ' ' | '\t' | '"') {
+                    return false;
+                }
+            }
+        }
+        return !quoted;
+    }
+    if dialect != ShellDialect::PowerShell {
+        return false;
+    }
+    let mut quote = PosixQuote::Unquoted;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quote == PosixQuote::Single {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    quote = PosixQuote::Unquoted;
+                }
+            }
+            continue;
+        }
+        if ch == '`' {
+            if chars.next().is_none() {
+                return false;
+            }
+            continue;
+        }
+        match (quote, ch) {
+            (PosixQuote::Unquoted, '\'') => quote = PosixQuote::Single,
+            (PosixQuote::Unquoted, '"') => quote = PosixQuote::Double,
+            (PosixQuote::Double, '"') => quote = PosixQuote::Unquoted,
+            (_, '$') | (PosixQuote::Unquoted, '@' | '(' | ')' | '{' | '}' | '[' | ']' | ',') => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    quote == PosixQuote::Unquoted
+}
+
+/// Decode only dcg's CLI syntax following an already identified executable.
+///
+/// The general dequoting pass deliberately keeps the generic token stream for
+/// PowerShell, so subexpressions and here-string data are not promoted into
+/// command words. That stream cannot delimit PowerShell options containing a
+/// backtick: it treats the escape as POSIX command substitution and may absorb
+/// the rest of the command. Use the proven dialect for this bounded argv
+/// prefix instead, without changing how the executable itself was identified.
+/// Return the last consumed source offset so the general pass does not also
+/// rewrite these option values or create overlapping replacements.
+fn normalize_dcg_syntax_prefix(
+    command: &str,
+    start: usize,
+    dialect: ShellDialect,
+    replacements: &mut Vec<(Range<usize>, String)>,
+) -> usize {
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    let mut after_allowlist = false;
+    let mut agent_value = false;
+    let mut end = start;
+
+    for token in tokenize_for_shell_dialect(&command[start..], dialect) {
+        if token.kind == NormalizeTokenKind::Separator {
+            break;
+        }
+        let range = start + token.byte_range.start..start + token.byte_range.end;
+        let Some(raw) = command.get(range.clone()) else {
+            break;
+        };
+        end = range.end;
+        let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
+            // Do not normalize native argv after PowerShell's stop-parsing
+            // token, including when the token itself was quoted or escaped.
+            break;
+        };
+        let word = decoded.as_ref();
+        let literal_syntax = dcg_syntax_quote_state(raw, dialect).is_some();
+        let (may_replace, is_subcommand) = if std::mem::take(&mut agent_value) {
+            // --agent consumes one argv word, even if it resembles an option
+            // or a subcommand. Keep spaces, paths and runtime syntax opaque.
+            (literal_syntax && looks_like_subcommand_word(word), false)
+        } else if word == "--agent" {
+            agent_value = true;
+            (true, false)
+        } else if let Some(replacement) = normalize_dcg_agent_assignment(raw, dialect) {
+            if literal_syntax
+                && word
+                    .strip_prefix("--agent=")
+                    .is_some_and(|value| value.is_empty() || looks_like_subcommand_word(value))
+            {
+                (true, false)
+            } else {
+                if replacement != raw {
+                    replacements.push((range, replacement));
+                }
+                continue;
+            }
+        } else if let Some(value) = word.strip_prefix("--agent=") {
+            // An ANSI-C encoded equals sign may have no literal source '='.
+            // Keep the established whole-token proof for plain literal values.
+            (
+                literal_syntax && (value.is_empty() || looks_like_subcommand_word(value)),
+                false,
+            )
+        } else if dcg_global_option_has_no_value(word) {
+            (true, false)
+        } else if word == "allowlist" && !after_allowlist {
+            after_allowlist = true;
+            (true, false)
+        } else {
+            // The first non-option is the actual subcommand, not data. Decode
+            // its literal spelling too (`un`install`, `allowl`ist a`dd`), then
+            // stop before any arguments that subcommand owns. Unknown options
+            // and shell syntax terminate the prefix without being rewritten.
+            (
+                !word.starts_with('-') && looks_like_subcommand_word(word),
+                true,
+            )
+        };
+        if may_replace && literal_syntax && word != raw {
+            replacements.push((range, decoded.into_owned()));
+        }
+        if is_subcommand {
+            break;
+        }
+    }
+    end
 }
 
 /// Normalize wrapper/segment command words for matching.
@@ -3776,6 +4280,7 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
         .as_bytes()
         .iter()
         .any(|b| matches!(b, b'\'' | b'"' | b'\\' | b'<' | b'>'))
+        || (dialect == ShellDialect::PowerShell && command.contains('`'))
         || command.to_ascii_lowercase().contains(".exe");
 
     if !needs_normalization {
@@ -3802,12 +4307,23 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
     let mut segment_has_cmd = false;
     let mut current_cmd_word: Option<String> = None;
     let mut wrapper: NormalizeWrapper = NormalizeWrapper::None;
+    let mut dcg_syntax_end = None;
+    let mut dcg_native_tokens = None;
 
     for tok in &tokens {
+        // The generic tokenizer may mistake a backtick in a PowerShell
+        // option for command substitution and expose separators inside the
+        // option's quoted value. The native prefix already owns those bytes,
+        // including any such apparent separators; skip them before resetting
+        // the command state.
+        if dcg_syntax_end.is_some_and(|end| tok.byte_range.start < end) {
+            continue;
+        }
         if tok.kind == NormalizeTokenKind::Separator {
             segment_has_cmd = false;
             current_cmd_word = None;
             wrapper = NormalizeWrapper::None;
+            dcg_syntax_end = None;
             continue;
         }
 
@@ -3830,7 +4346,8 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
                 && token_text.starts_with('\'')
                 && token_text.ends_with('\'');
             if !cmd_single_quoted_data
-                && let Some(replacement) = normalize_subcommand_token(token_text)
+                && let Some(replacement) =
+                    normalize_subcommand_token(token_text, dialect == ShellDialect::Posix)
             {
                 replacements.push((tok.byte_range.clone(), replacement));
             }
@@ -3876,6 +4393,35 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
         let replacement = normalize_command_word_token_in_dialect(current, dialect);
         // Track the normalized command word for safe registry checks
         current_cmd_word = Some(replacement.clone().unwrap_or_else(|| current.to_string()));
+        if matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell)
+            && current_cmd_word.as_deref().is_some_and(|word| {
+                let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
+                name.eq_ignore_ascii_case("dcg") || name.eq_ignore_ascii_case("dcg.exe")
+            })
+            && (dialect != ShellDialect::PowerShell || {
+                // A generic token inside a quoted PowerShell subexpression
+                // can look like an executable after its opening quote was
+                // split off. Require an exact native source token before
+                // interpreting the following bytes as dcg's CLI syntax.
+                let native_tokens = dcg_native_tokens
+                    .get_or_insert_with(|| tokenize_for_shell_dialect(command, dialect));
+                native_tokens
+                    .binary_search_by_key(&tok.byte_range.start, |native| native.byte_range.start)
+                    .ok()
+                    .and_then(|index| native_tokens.get(index))
+                    .is_some_and(|native| {
+                        native.kind == NormalizeTokenKind::Word
+                            && native.byte_range == tok.byte_range
+                    })
+            })
+        {
+            dcg_syntax_end = Some(normalize_dcg_syntax_prefix(
+                command,
+                tok.byte_range.end,
+                dialect,
+                &mut replacements,
+            ));
+        }
 
         if let Some(repl) = replacement {
             replacements.push((tok.byte_range.clone(), repl));
@@ -4001,7 +4547,14 @@ fn decode_segment_command_words_in_dialect(command: &str, dialect: ShellDialect)
 
         segment_has_command = true;
         if word != raw {
-            replacements.push((token.byte_range.clone(), word.to_string()));
+            // A case-insensitive filesystem runs the same program for a name
+            // in any case, and the escapes can spell it in another one
+            // (`$'\x52\x4d'` is `RM`, which runs `rm`). Its base name is read
+            // in lower case, as the packs spell it.
+            let base = word.rfind('/').map_or(0, |slash| slash + 1);
+            let mut decoded = word.to_string();
+            decoded[base..].make_ascii_lowercase();
+            replacements.push((token.byte_range.clone(), decoded));
         }
     }
 
@@ -4116,6 +4669,218 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     normalize_command_in_dialect(cmd, ShellDialect::Unknown)
 }
 
+/// Program names dcg recognizes by their own analysis rather than by a pack
+/// keyword: wrappers and frontends that run the command after them, shells,
+/// interpreters and runners whose argument is a command or a program, and
+/// remote shells. Lower case.
+const STRUCTURAL_PROGRAM_NAMES: &[&str] = &[
+    // Wrappers and frontends.
+    "sudo",
+    "doas",
+    "su",
+    "sg",
+    "runuser",
+    "env",
+    "command",
+    "builtin",
+    "exec",
+    "eval",
+    "time",
+    "nohup",
+    "nice",
+    "ionice",
+    "setsid",
+    "timeout",
+    "stdbuf",
+    "chrt",
+    "busybox",
+    "xargs",
+    "parallel",
+    "watch",
+    "entr",
+    "flock",
+    "hyperfine",
+    "script",
+    "nix-shell",
+    "npx",
+    "mise",
+    "mise-exec",
+    "find",
+    // Shells and interpreters.
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "mksh",
+    "yash",
+    "ash",
+    "fish",
+    "csh",
+    "tcsh",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "nodejs",
+    "bun",
+    "deno",
+    "tclsh",
+    "wish",
+    "expect",
+    "julia",
+    "osascript",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "sed",
+    // Remote shells and copies.
+    "ssh",
+    "scp",
+    "sftp",
+    "mosh",
+    "rsync",
+];
+
+/// Interpreters that are also run by a versioned name (`python3.12`).
+const VERSIONED_INTERPRETER_NAMES: &[&str] = &[
+    "python", "pypy", "node", "ruby", "perl", "php", "lua", "luajit",
+];
+
+/// Whether lower-case `name` names a program that an enabled pack keys on or
+/// that dcg's own analysis recognizes.
+fn is_recognized_program_name(name: &[u8], enabled_keywords: &[&str]) -> bool {
+    let unversioned = {
+        let digits = name
+            .iter()
+            .rev()
+            .take_while(|byte| byte.is_ascii_digit() || **byte == b'.')
+            .count();
+        &name[..name.len() - digits]
+    };
+    STRUCTURAL_PROGRAM_NAMES
+        .iter()
+        .any(|known| known.as_bytes() == name)
+        || VERSIONED_INTERPRETER_NAMES
+            .iter()
+            .any(|known| known.as_bytes() == unversioned)
+        || enabled_keywords
+            .iter()
+            .any(|keyword| keyword.as_bytes().eq_ignore_ascii_case(name))
+}
+
+/// `command` with every program name it spells in a case other than lower
+/// case folded to lower case, or `None` when it spells none.
+///
+/// A case-insensitive filesystem (macOS by default, Windows) runs `/bin/rm`
+/// for `RM`, `Rm` or `/bin/RM`, and every name the packs and the shell
+/// analysis compare is a lower-case one, so `RM -rf ~` or `sSH host '…'`
+/// matched nothing. The evaluator also reads this view, on every platform:
+/// a name that is folded runs the same program in it.
+///
+/// A program name here is a word (a run of letters, digits and `._+-`, with
+/// quotes and backslashes inside it removed, as the shell removes them, and a
+/// `.exe` suffix ignored) whose lower-case form an enabled pack keys on or
+/// dcg's own analysis recognizes (see [`STRUCTURAL_PROGRAM_NAMES`]). The last
+/// part of a word a backslash splits counts too, as a Windows path ends in
+/// it. Arguments that are no program name keep their case: unlike program
+/// names, they mean what their case says. Heredoc bodies are left as they
+/// are: a body is data, or a script read on its own (where this applies
+/// again), and folding its words could only cost time. Only text that every
+/// shell reads as a body is left out (see
+/// [`crate::context::undisputed_heredoc_body_ranges`]): what one shell reads
+/// as a body may be commands to another.
+///
+/// Length preserving (ASCII case folding), so every range in the view is the
+/// same range in `command`.
+#[must_use]
+pub(crate) fn fold_program_name_case(command: &str, enabled_keywords: &[&str]) -> Option<String> {
+    let bytes = command.as_bytes();
+    if !bytes.iter().any(u8::is_ascii_uppercase) {
+        return None;
+    }
+    let is_name_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-');
+    let is_transparent = |byte: u8| matches!(byte, b'\'' | b'"' | b'\\');
+    let mut bodies = crate::context::undisputed_heredoc_body_ranges(command)
+        .into_iter()
+        .peekable();
+    let mut folded: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(body) = bodies.peek() {
+            if i >= body.end {
+                bodies.next();
+                continue;
+            }
+            if i >= body.start {
+                i = body.end;
+                continue;
+            }
+        }
+        if !is_name_byte(bytes[i]) && !is_transparent(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let limit = bodies.peek().map_or(bytes.len(), |body| body.start);
+        while i < limit && (is_name_byte(bytes[i]) || is_transparent(bytes[i])) {
+            i += 1;
+        }
+        let run = &bytes[start..i];
+        if !run.iter().any(u8::is_ascii_uppercase) {
+            continue;
+        }
+        // The word right after a `<<`/`<<-` heredoc operator is a delimiter,
+        // never a program name. Folding it (e.g. `PERL`/`SH`/`PHP`, which
+        // spell the recognized `perl`/`sh`/`php`) would desync the opening
+        // delimiter from its terminator, which sits in the body this view
+        // leaves alone, and the re-parse of the broken heredoc reads the body
+        // as top-level code. A here-string (`<<<`) carries data, not a
+        // delimiter, so it keeps folding as before.
+        let after_heredoc_operator = {
+            let mut p = start;
+            while p > 0 && matches!(bytes[p - 1], b' ' | b'\t') {
+                p -= 1;
+            }
+            if p > 0 && bytes[p - 1] == b'-' {
+                p -= 1;
+            }
+            p >= 2 && &bytes[p - 2..p] == b"<<" && !(p >= 3 && bytes[p - 3] == b'<')
+        };
+        if after_heredoc_operator {
+            continue;
+        }
+        let name_of = |part: &[u8]| -> Vec<u8> {
+            let mut name: Vec<u8> = part
+                .iter()
+                .filter(|byte| !is_transparent(**byte))
+                .map(u8::to_ascii_lowercase)
+                .collect();
+            if name.len() > 4 && name.ends_with(b".exe") {
+                name.truncate(name.len() - 4);
+            }
+            name
+        };
+        let fold = if is_recognized_program_name(&name_of(run), enabled_keywords) {
+            Some(start..i)
+        } else {
+            // A Windows path: the part after its last backslash.
+            run.iter()
+                .rposition(|byte| *byte == b'\\')
+                .map(|at| start + at + 1..i)
+                .filter(|last| {
+                    let name = name_of(&bytes[last.clone()]);
+                    !name.is_empty() && is_recognized_program_name(&name, enabled_keywords)
+                })
+        };
+        if let Some(range) = fold {
+            folded.get_or_insert_with(|| bytes.to_vec())[range].make_ascii_lowercase();
+        }
+    }
+    folded.map(|view| String::from_utf8(view).expect("ASCII case folding keeps UTF-8"))
+}
+
 /// Strip leading backslash from the first command token.
 ///
 /// This handles bash alias bypass: `\git` instead of `git`.
@@ -4159,6 +4924,25 @@ fn strip_leading_backslash(command: &str) -> Option<(String, StrippedWrapper)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_unicode_word_separators_preserve_quoted_data() {
+        for separator in ['\u{00a0}', '\u{2003}'] {
+            let source = format!("python3{separator}-{separator}'a{separator}b'");
+            let tokens = tokenize_for_shell_dialect(&source, ShellDialect::PowerShell);
+            let words: Vec<_> = tokens
+                .iter()
+                .filter(|token| token.kind == NormalizeTokenKind::Word)
+                .filter_map(|token| token.text(&source))
+                .collect();
+            let quoted = format!("'a{separator}b'");
+            assert_eq!(words, ["python3", "-", quoted.as_str()]);
+            for dialect in [ShellDialect::Posix, ShellDialect::Cmd] {
+                let other = tokenize_for_shell_dialect(&source, dialect);
+                assert_eq!(other.len(), 1, "{dialect:?}: {source:?}");
+            }
+        }
+    }
 
     fn raw_token_snapshot(
         command: &str,
@@ -4242,6 +5026,88 @@ mod tests {
                 "informational/process mode was treated as command execution: {command}"
             );
         }
+    }
+
+    /// Program names a pack keys on or the analysis recognizes are folded to
+    /// lower case wherever a word spells one, through quotes, backslashes, a
+    /// directory and a `.exe` suffix; flags, other words and heredoc bodies
+    /// keep their case, and the view keeps the command's length.
+    #[test]
+    fn program_names_fold_to_lower_case() {
+        let keywords = ["rm", "git", "dd"];
+        for (command, folded) in [
+            ("RM -rf ~", "rm -rf ~"),
+            ("Rm -rf ~", "rm -rf ~"),
+            ("/bin/RM -rf ~", "/bin/rm -rf ~"),
+            ("\"RM\" -rf ~", "\"rm\" -rf ~"),
+            ("R\\M -rf ~", "r\\m -rf ~"),
+            ("C:\\Tools\\RM.EXE -rf x", "C:\\Tools\\rm.exe -rf x"),
+            ("SUDO RM -rf ~", "sudo rm -rf ~"),
+            ("echo ~ | XARGS RM -rf", "echo ~ | xargs rm -rf"),
+            ("sSH host 'RM -rf ~'", "ssh host 'rm -rf ~'"),
+            ("Python3.12 -c 'x'", "python3.12 -c 'x'"),
+            ("DD if=/dev/zero of=/dev/sda", "dd if=/dev/zero of=/dev/sda"),
+            (
+                "cat <<'EOF' >notes\nRM -rf ~\nEOF\nRM x",
+                "cat <<'EOF' >notes\nRM -rf ~\nEOF\nrm x",
+            ),
+        ] {
+            let view = fold_program_name_case(command, &keywords);
+            assert_eq!(view.as_deref(), Some(folded), "{command:?}");
+            assert_eq!(folded.len(), command.len());
+        }
+        for command in [
+            "rm -RF ~",
+            "git branch -D Feature",
+            "RM_DIR=build make",
+            "LS -la",
+            "Get-ChildItem -Path C:\\",
+            "rm -rf ~",
+            "cat <<'EOF'\nRM -rf ~\nEOF",
+        ] {
+            assert_eq!(
+                fold_program_name_case(command, &keywords),
+                None,
+                "{command:?}"
+            );
+        }
+        // A command word spelled with escapes is read with its base name in
+        // lower case too.
+        for command in ["$'\\x52\\x4d' -rf ~", "/bin/$'\\x52M' -rf ~"] {
+            let normalized = normalize_command_in_dialect(command, ShellDialect::Posix);
+            assert!(
+                normalized.contains("rm -rf ~"),
+                "{command:?} -> {normalized:?}"
+            );
+        }
+    }
+
+    /// A heredoc delimiter is left alone even when it spells a program name
+    /// (`PERL`/`SH`/`PHP`). Folding only the opening delimiter desynced it from
+    /// its terminator in the body and corrupted the re-parse, so benign
+    /// quoted-heredoc programs read as top-level writes.
+    #[test]
+    fn heredoc_delimiters_are_not_folded_even_when_they_spell_a_program_name() {
+        // No other foldable word, so the whole command has nothing to fold.
+        for command in [
+            "perl <<'PERL'\nprint 1\nPERL",
+            "bash <<'SH'\nfor i in 1 2 3; do echo hi > \"/tmp/x/$i\"; done\nSH",
+            "cat <<'PHP' | php\n<?php echo 'x'; ?>\nPHP",
+            "cat <<-'RUBY'\n\tputs 1\n\tRUBY",
+            "cat << PERL\nhi\nPERL",
+        ] {
+            assert_eq!(fold_program_name_case(command, &[]), None, "{command:?}");
+        }
+        // The leading program word still folds; only the delimiter is spared.
+        assert_eq!(
+            fold_program_name_case("PERL <<'PERL'\nx\nPERL", &[]).as_deref(),
+            Some("perl <<'PERL'\nx\nPERL"),
+        );
+        // A here-string (`<<<`) carries data, not a delimiter, so it folds.
+        assert_eq!(
+            fold_program_name_case("x <<<SH", &[]).as_deref(),
+            Some("x <<<sh"),
+        );
     }
 
     #[test]
@@ -4728,6 +5594,41 @@ mod tests {
     }
 
     #[test]
+    fn cmd_expansion_view_owns_variable_names_without_replacing_raw_view() {
+        for executable in [
+            "vssad%NAME WITH SPACES%min",
+            "vssad^%NAME WITH SPACES%min",
+            "vssad%NAME&WITH|PUNCTUATION%min",
+            "vssad%NAME\\WITH\\SEPARATORS%min",
+        ] {
+            let command = format!("{executable} delete shadows /all");
+            let expanded = tokenize_cmd_expansion_view(&command);
+            assert_eq!(expanded.len(), 4, "{command}");
+            assert_eq!(expanded[0].text(&command), Some(executable));
+            assert!(
+                expanded
+                    .iter()
+                    .all(|token| token.kind == NormalizeTokenKind::Word)
+            );
+        }
+        let command = "echo %undefined & vssadmin delete shadows /all & tail%";
+        assert!(
+            tokenize_for_shell_dialect(command, ShellDialect::Cmd)
+                .iter()
+                .any(|token| {
+                    token.kind == NormalizeTokenKind::Separator && token.text(command) == Some("&")
+                }),
+            "undefined percent references must keep their raw interpretation"
+        );
+        assert!(
+            tokenize_cmd_expansion_view(command)
+                .iter()
+                .all(|token| { token.kind == NormalizeTokenKind::Word }),
+            "the additive expansion view owns punctuation in a defined variable name"
+        );
+    }
+
+    #[test]
     fn powershell_decoder_handles_bare_double_and_single_quoted_syntax() {
         let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
         let cases = [
@@ -5007,6 +5908,70 @@ mod tests {
             assert!(
                 !strip_wrapper_prefixes(command).was_normalized(),
                 "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn time_reads_attached_option_values_only_from_options() {
+        // `-fFORMAT` and `-oFILE` carry their value. A wrapped program whose
+        // second byte is `f` or `o` is still the program: it used to be skipped
+        // as an option, so the word after it became the command. Synthetic
+        // program names.
+        let cases = [
+            ("time zofftool shatter", "zofftool shatter"),
+            ("time -p zofftool shatter", "zofftool shatter"),
+            ("time /opt/bin/frobtool zap", "/opt/bin/frobtool zap"),
+            ("time /fs/frobtool zap", "/fs/frobtool zap"),
+            ("time -o t.txt zofftool shatter", "zofftool shatter"),
+            ("time -ot.txt zofftool shatter", "zofftool shatter"),
+            ("time -f%E zofftool shatter", "zofftool shatter"),
+            ("time --output=t.txt zofftool shatter", "zofftool shatter"),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                strip_wrapper_prefixes(command).normalized,
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_and_chrt_never_take_an_option_word_as_the_duration_or_program() {
+        // `timeout` clusters its flags getopt style, and the last letter of a
+        // cluster may be `-k`/`-s`, whose value is the rest of the word or the
+        // next word. Read as the DURATION, such a cluster made the real
+        // duration the program. Synthetic program names.
+        let stripped = [
+            ("timeout -vk 5 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -vk5 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -fs KILL 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -pvsKILL 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -k 5 -v 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -- 10 zofftool shatter", "zofftool shatter"),
+        ];
+        for (command, expected) in stripped {
+            assert_eq!(
+                strip_wrapper_prefixes(command).normalized,
+                expected,
+                "{command}"
+            );
+        }
+        // An option the parser does not model (a long-option abbreviation, an
+        // unknown letter) is never the duration, and a word the priority slot
+        // of `chrt` does not hold is never the program: the wrapper stays.
+        for command in [
+            "timeout --sig KILL 10 zofftool shatter",
+            "timeout -x 10 zofftool shatter",
+            "timeout -vx 10 zofftool shatter",
+            "chrt -o --fi 0 zofftool shatter",
+            "chrt --other -x zofftool shatter",
+        ] {
+            assert!(
+                !strip_wrapper_prefixes(command).was_normalized(),
+                "an option word was read as the duration or program: {command} -> {}",
+                strip_wrapper_prefixes(command).normalized
             );
         }
     }
@@ -5431,6 +6396,265 @@ mod tests {
     }
 
     #[test]
+    fn dcg_global_option_syntax_is_decoded_without_promoting_agent_data() {
+        for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            for (command, expected) in [
+                (
+                    "dcg --a'gent'=codex --ro'bot' uninstall",
+                    "dcg --agent=codex --robot uninstall",
+                ),
+                (
+                    "dcg --agent co'dex' --robot uninstall",
+                    "dcg --agent codex --robot uninstall",
+                ),
+                (
+                    "dcg allowlist --a'gent'=codex --no'-color' add rule",
+                    "dcg allowlist --agent=codex --no-color add rule",
+                ),
+                (
+                    "dcg --a'gent'= --robot uninstall",
+                    "dcg --agent= --robot uninstall",
+                ),
+                (
+                    "dcg '--agent=codex' --robot uninstall",
+                    "dcg --agent=codex --robot uninstall",
+                ),
+                (
+                    "dcg --a'gent'='two words' doctor",
+                    "dcg --agent='two words' doctor",
+                ),
+            ] {
+                assert_eq!(
+                    normalize_command_in_dialect(command, dialect),
+                    expected,
+                    "{dialect:?}: {command}"
+                );
+            }
+            for command in [
+                "dcg --agent='dcg --robot uninstall' doctor",
+                "dcg --agent 'dcg --robot uninstall' doctor",
+                "dcg --agent='$profile' doctor",
+                "dcg --agent '/tmp/profile' doctor",
+                "dcg --agent 'codex; rm -rf /' doctor",
+                "dcg --agent 'co`dex' doctor",
+                "dcg test --a'gent'=codex",
+                "dcg --unknown-option --a'gent'=codex uninstall",
+                "dcg -- --a'gent'=codex uninstall",
+                "other --a'gent'=codex --robot uninstall",
+                "printf '%s' \"dcg --a'gent'=codex --robot uninstall\"",
+            ] {
+                assert_eq!(
+                    normalize_command_in_dialect(command, dialect),
+                    command,
+                    "opaque arguments retain their structure: {dialect:?}: {command}"
+                );
+            }
+        }
+        assert_eq!(
+            normalize_command_in_dialect(
+                "dcg --a`gent=codex --robot uninstall",
+                ShellDialect::PowerShell,
+            ),
+            "dcg --agent=codex --robot uninstall"
+        );
+        for dialect in [ShellDialect::Cmd, ShellDialect::Unknown] {
+            let command = "dcg --a'gent'=codex --robot uninstall";
+            assert_eq!(normalize_command_in_dialect(command, dialect), command);
+        }
+        let stopped = "dcg --% --a'gent'=codex --robot uninstall";
+        assert_eq!(
+            normalize_command_in_dialect(stopped, ShellDialect::PowerShell),
+            stopped
+        );
+    }
+
+    #[test]
+    fn powershell_dcg_prefix_uses_native_words_and_preserves_opaque_values() {
+        for (command, expected) in [
+            (
+                "dcg --a`gent=codex --r`obot un`install",
+                "dcg --agent=codex --robot uninstall",
+            ),
+            (
+                "d`cg --a`gent co`dex --r`obot un`install",
+                "dcg --agent codex --robot uninstall",
+            ),
+            (
+                "dcg allowl`ist --a`gent=codex --no-c`olor a`dd rule",
+                "dcg allowlist --agent=codex --no-color add rule",
+            ),
+            (
+                "dcg --a`gent='two words' un`install",
+                "dcg --agent='two words' uninstall",
+            ),
+            (
+                "dcg --a`gent='two 'words un`install",
+                "dcg --agent='two 'words uninstall",
+            ),
+            (
+                "dcg \"--a`gent=two words\" un`install",
+                "dcg --agent=\"two words\" uninstall",
+            ),
+            (
+                "dcg --a`gent`='two words' un`install",
+                "dcg --agent='two words' uninstall",
+            ),
+            (
+                "dcg --a`gent=co`ndex un`install",
+                "dcg --agent=co`ndex uninstall",
+            ),
+            (
+                "dcg --a`gent='co`dex; dcg un`install' doctor",
+                "dcg --agent='co`dex; dcg un`install' doctor",
+            ),
+            (
+                "dcg --a`gent=$profile un`install",
+                "dcg --agent=$profile uninstall",
+            ),
+            (
+                "dcg --a`gent=/tmp/profile un`install",
+                "dcg --agent=/tmp/profile uninstall",
+            ),
+            (
+                "dcg --a`gent=`\r\ncodex un`install",
+                "dcg --agent=codex uninstall",
+            ),
+        ] {
+            assert_eq!(
+                normalize_command_in_dialect(command, ShellDialect::PowerShell),
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_executable_decoding_preserves_string_expression_ownership() {
+        for command in [
+            "\"dcg --a`gent=codex un`install\"",
+            "Write-Output $(\"dcg --a`gent=codex un`install\")",
+            "Write-Output $(\"d`cg --a`gent=codex un`install\")",
+            "Write-Output ready & \"dcg --a`gent=codex un`install\"",
+            "Write-Output $(Get-Date) & \"dcg --a`gent=codex un`install\"",
+            "Write-Output $(@\"\ndcg --a`gent=codex un`install\n\"@)",
+        ] {
+            assert_eq!(
+                decode_powershell_pattern_view(command),
+                command,
+                "a string expression is not an executable argv word: {command}"
+            );
+        }
+
+        for (command, expected) in [
+            ("d`cg uninstall", "dcg uninstall"),
+            (
+                "Write-Output $(d`cg un`install)",
+                "Write-Output $(dcg un`install)",
+            ),
+            ("& \"d`cg\" uninstall", "& \"dcg\" uninstall"),
+            (". \"d`cg\" uninstall", ". \"dcg\" uninstall"),
+            (
+                "Write-Output $(& \"d`cg\" uninstall)",
+                "Write-Output $(& \"dcg\" uninstall)",
+            ),
+            (
+                "Write-Output $(Get-Date); & \"d`cg\" uninstall",
+                "Write-Output $(Get-Date); & \"dcg\" uninstall",
+            ),
+        ] {
+            assert_eq!(
+                decode_powershell_pattern_view(command),
+                expected,
+                "executed command words still expose their literal spelling: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn dcg_prefix_does_not_promote_data_or_guess_shell_escape_semantics() {
+        for command in [
+            "dcg --agent 'uninstall' doctor",
+            "dcg --agent 'dcg --robot uninstall' doctor",
+            "dcg --a`gent='co`dex; dcg un`install' doctor",
+            "dcg --agent=$(Write-Output 'dcg un`install') doctor",
+            "dcg --% --a`gent=codex un`install",
+            "dcg '--%' --a`gent=codex un`install",
+            "dcg --unknown --a`gent=codex un`install",
+            "dcg doctor --a`gent=codex un`install",
+            "dcg --ro`bot uninstall",
+            "dcg \"--ro`bot\" uninstall",
+            "dcg --ag`ent=codex uninstall",
+            "other --a`gent=codex un`install",
+            "Write-Output 'dcg --a`gent=codex un`install'",
+            "Write-Output $(\"dcg --a`gent=codex un`install\")",
+            "Write-Output $(\"d`cg --a`gent=codex un`install\")",
+        ] {
+            let expected = match command {
+                "dcg --agent 'uninstall' doctor" => "dcg --agent uninstall doctor",
+                "dcg --a`gent='co`dex; dcg un`install' doctor" => {
+                    "dcg --agent='co`dex; dcg un`install' doctor"
+                }
+                _ => command,
+            };
+            assert_eq!(
+                normalize_command_in_dialect(command, ShellDialect::PowerShell),
+                expected,
+                "{command}"
+            );
+        }
+
+        for dialect in [
+            ShellDialect::Posix,
+            ShellDialect::Unknown,
+            ShellDialect::Cmd,
+        ] {
+            for command in [
+                "dcg --a`gent=codex --robot uninstall",
+                "dcg --agent=`printf '%s' codex` doctor",
+                "dcg --agent='co`dex' doctor",
+            ] {
+                assert_eq!(normalize_command_in_dialect(command, dialect), command);
+            }
+        }
+    }
+
+    #[test]
+    fn dcg_agent_assignment_keeps_the_original_value_quote_mode() {
+        for (command, expected) in [
+            (
+                "dcg --a'gent'=\"$profile\" uninstall",
+                "dcg --agent=\"$profile\" uninstall",
+            ),
+            (
+                "dcg '--a'gent='two 'words uninstall",
+                "dcg --agent='two 'words uninstall",
+            ),
+            (
+                "dcg \"--a'gent'=two words\" uninstall",
+                "dcg \"--a'gent'=two words\" uninstall",
+            ),
+            (
+                "dcg '--agent=two words' uninstall",
+                "dcg --agent='two words' uninstall",
+            ),
+            (
+                "dcg $'--agent=two\\nwords' uninstall",
+                "dcg --agent=$'two\\nwords' uninstall",
+            ),
+            (
+                "dcg --a'gent'='dcg --robot uninstall' doctor",
+                "dcg --agent='dcg --robot uninstall' doctor",
+            ),
+        ] {
+            assert_eq!(
+                normalize_command_in_dialect(command, ShellDialect::Posix),
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn test_normalize_preserves_nested_command_substitution_quotes() {
         let cmd = r#"echo "$(printf "%s" "<(docker system prune -a --volumes)")""#;
         assert_eq!(normalize_command(cmd).as_ref(), cmd);
@@ -5556,6 +6780,47 @@ mod tests {
             strip_posix_execution_frontend("mise exec --help -- foo"),
             None
         );
+    }
+
+    #[test]
+    fn strip_wrapper_prefixes_unwraps_builtin_and_zsh_precommand_chains() {
+        for (command, expected) in [
+            ("builtin command git reset --hard", "git reset --hard"),
+            ("builtin -- command git reset --hard", "git reset --hard"),
+            ("builtin command -p git reset --hard", "git reset --hard"),
+            (
+                "command builtin command git reset --hard",
+                "git reset --hard",
+            ),
+            (
+                "builtin builtin command git reset --hard",
+                "git reset --hard",
+            ),
+            ("builtin exec git reset --hard", "git reset --hard"),
+            ("builtin echo git reset --hard", "echo git reset --hard"),
+            ("noglob git reset --hard", "git reset --hard"),
+            ("nocorrect git reset --hard", "git reset --hard"),
+            ("- git reset --hard", "git reset --hard"),
+            (
+                "noglob builtin command git reset --hard",
+                "git reset --hard",
+            ),
+        ] {
+            let result = strip_wrapper_prefixes(command);
+            assert_eq!(result.normalized, expected, "{command:?}");
+        }
+        for command in [
+            "builtin",
+            "builtin -x command git",
+            "builtin >/tmp/out",
+            "noglob",
+            "-",
+        ] {
+            assert!(
+                !strip_wrapper_prefixes(command).was_normalized(),
+                "{command:?}"
+            );
+        }
     }
 
     #[test]

@@ -256,6 +256,11 @@ fn test_audit_backtracking_requirements() {
                 "docker-pull",
                 "docker-run",
                 "docker-stats",
+                // #548: the force flag must be an option word of this docker
+                // command. Atomic groups keep each shell word whole, and a
+                // lookahead ends the flag at a word boundary.
+                "rm-force",
+                "rmi-force",
             ]),
         ),
         (
@@ -269,6 +274,9 @@ fn test_audit_backtracking_requirements() {
                 "podman-ps",
                 "podman-pull",
                 "podman-run",
+                // #548: scoped to podman's own option words, as in docker.
+                "rm-force",
+                "rmi-force",
             ]),
         ),
         (
@@ -319,6 +327,9 @@ fn test_audit_backtracking_requirements() {
                 "find-exec-rm-tmp",
                 "find-exec-rm-var-tmp",
                 "ln-symlink-sensitive-then-delete",
+                // #550: `mv` must be a whole shell word, which takes a
+                // lookbehind and a lookahead around the command word.
+                "mv-dynamic-path",
                 "mv-relative-into-home",
                 "mv-sensitive-source-root-home",
                 "mv-tmp",
@@ -384,13 +395,15 @@ fn test_audit_backtracking_requirements() {
                 // `git rm -f` must not fire with `--cached` (worktree kept) or
                 // a dry run anywhere in the segment: a negative lookahead.
                 "rm-force",
-                // The clean rules walk from the subcommand to their flag over
-                // git's real option-parsing window, which ends at a bare `--`
-                // (#429, #434). "Not a bare `--`" is a negative lookahead, so
-                // these three moved off the linear engine.
+                // The clean and reset rules walk from the subcommand to their
+                // flag over git's real option-parsing window, which ends at a
+                // bare `--` (#429, #434). "Not a bare `--`" is a negative
+                // lookahead, so these rules run on the backtracking engine.
                 "clean-dry-run-long",
                 "clean-dry-run-short",
                 "clean-force",
+                "reset-hard",
+                "reset-merge",
                 "push-force-long",
                 "restore-staged-long",
                 "restore-staged-short",
@@ -1192,6 +1205,9 @@ fn test_audit_backtracking_requirements() {
                 "sfdisk-modify",
                 "sgdisk-modify",
                 "tee-device",
+                // #548: the force flag must be an option word of this umount
+                // command; atomic word groups and a word-end lookahead.
+                "umount-force",
             ]),
         ),
         (
@@ -1226,6 +1242,16 @@ fn test_audit_backtracking_requirements() {
                 "systemctl-reload",
                 "systemctl-show",
                 "systemctl-status",
+                // bd-w3l7: negative lookaheads exempt a dry run
+                // (`modprobe -n -r`), `rmmod --help`/`--version`, and ssh
+                // text that only prints an unload. Each lookahead starts at
+                // the verb and reads that command's own words: none crosses
+                // `;`, `&` or `|`. Each rule is scoped to its executable
+                // (modprobe, rmmod, ssh), and the pack runs only on its own
+                // keywords, which include modprobe and rmmod.
+                "modprobe-remove",
+                "rmmod",
+                "ssh-remote-module-unload",
             ]),
         ),
         (

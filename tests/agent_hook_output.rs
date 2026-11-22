@@ -586,24 +586,31 @@ fn test_hook_output_remediation_safe_alternative() {
 // Antigravity CLI (`agy`) end-to-end hook integration.
 //
 // Feeds the dcg binary the exact stdin envelope that `agy` passes to a
-// PreToolUse hook (captured empirically in a sandboxed $HOME) and asserts dcg
-// emits the block decision that `agy` honors. This is the live wire-format
-// contract: `agy` reads {"decision":"block","reason":...} from stdout (exit 0)
-// and aborts its `run_command` tool. A fully-interactive live-fire block (the
-// model actually being prevented from running the command) was verified
-// manually against the real `agy` binary in a sandbox HOME; that path needs an
-// authenticated, interactive `agy` session and is not reproducible in CI, so
-// here we lock down the byte-level request/response contract instead.
+// PreToolUse hook and checks the strict response contract from issue #573:
+// exactly {"decision":"deny","reason":...} on exit 0. Gemini metadata is
+// rejected by Antigravity 1.4.0, and an explicit allow can skip its ordinary
+// permission prompt. Safe and warning outcomes must therefore emit zero
+// stdout bytes. These tests pass commands as data; no command is executed.
 // ============================================================================
 
 /// Run dcg in hook mode with a raw JSON envelope (for non-Claude wire shapes).
 fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
+    run_hook_mode_raw_with_options(input, &[], &[])
+}
+
+fn run_hook_mode_raw_with_options(
+    input: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (String, String, i32) {
     let _guard = HOOK_PROCESS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut child_command = Command::new(dcg_binary());
     configure_isolated_hook_child(&mut child_command);
     let mut child = child_command
+        .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -625,62 +632,416 @@ fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
 }
 
 #[test]
-fn test_antigravity_envelope_produces_block_decision() {
-    // Exact agy stdin shape captured from a real `agy` PreToolUse hook run.
-    let input = r#"{
-        "artifactDirectoryPath":"/tmp/.gemini/brain/abc",
-        "conversationId":"a3bbcaba-0bb2-4e58-b614-49f42fa6f004",
-        "stepIdx":4,
-        "toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard","Cwd":"/work","WaitMsBeforeAsync":500}},
-        "transcriptPath":"/tmp/.gemini/brain/abc/transcript_full.jsonl",
-        "workspacePaths":["/work"]
-    }"#;
+fn test_stderr_only_warnings_preserve_exit_and_stdout_contracts() {
+    let command = "git stash drop stash@{0}";
+    let cases = [
+        (
+            "claude-code",
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}),
+            0,
+        ),
+        (
+            "cursor",
+            serde_json::json!({"tool_name": "shell", "tool_input": {"command": command}}),
+            0,
+        ),
+        (
+            "codex",
+            serde_json::json!({"turn_id": "warn-640", "tool_name": "Bash", "tool_input": {"command": command}}),
+            0,
+        ),
+        (
+            "copilot",
+            serde_json::json!({"event": "pre-tool-use", "toolName": "bash", "toolArgs": {"command": command}}),
+            0,
+        ),
+        (
+            "agy",
+            serde_json::json!({"toolCall": {"name": "run_command", "args": {"CommandLine": command}}}),
+            0,
+        ),
+        (
+            "reasonix",
+            serde_json::json!({"event": "PreToolUse", "toolName": "bash", "toolArgs": {"command": command}}),
+            1,
+        ),
+    ];
 
-    let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
+    for (agent, payload, expected_exit) in cases {
+        for explicit in [false, true] {
+            let mut input = payload.clone();
+            if explicit {
+                input["dcg_explicit_verdict"] = true.into();
+            }
+            let (stdout, stderr, exit_code) =
+                run_hook_mode_raw_with_options(&input.to_string(), &["--agent", agent], &[]);
+            assert_eq!(exit_code, expected_exit, "{agent}: {stderr}");
+            assert!(
+                stderr.contains("WARNING") && stderr.contains("core.git:stash-drop"),
+                "{agent} warning must remain visible: {stderr}"
+            );
+            if explicit && expected_exit == 0 {
+                let document: serde_json::Value = serde_json::from_str(&stdout)
+                    .unwrap_or_else(|error| panic!("{agent}: {error}; {stdout:?}; {stderr}"));
+                assert_eq!(document, serde_json::json!({"dcg_verdict": "allow"}));
+            } else {
+                // Native hosts did not request an acknowledgement. Reasonix
+                // communicates a non-blocking warning through exit 1 alone.
+                assert!(stdout.is_empty(), "{agent}: {stdout:?}; {stderr}");
+            }
+        }
+    }
+}
 
-    // `agy` only blocks on exit 0 + JSON (a non-zero exit is merely logged).
+#[test]
+fn test_structured_warnings_own_exactly_one_explicit_response() {
+    let command = "git stash drop stash@{0}";
+    let cases = [
+        (
+            "gemini",
+            serde_json::json!({"hook_event_name": "BeforeTool", "tool_name": "run_shell_command", "tool_input": {"command": command}}),
+            "systemMessage",
+            Some("allow"),
+        ),
+        (
+            "hermes",
+            serde_json::json!({"hook_event_name": "pre_tool_call", "tool_name": "terminal", "tool_input": {"command": command}}),
+            "context",
+            None,
+        ),
+        (
+            "grok",
+            serde_json::json!({"hookEventName": "pre_tool_use", "toolName": "run_terminal_cmd", "toolInput": {"command": command}}),
+            "reason",
+            Some("allow"),
+        ),
+        (
+            "crush",
+            serde_json::json!({"event": "PreToolUse", "tool_name": "bash", "tool_input": {"command": command}}),
+            "context",
+            None,
+        ),
+    ];
+
+    for (agent, mut input, warning_field, decision) in cases {
+        input["dcg_explicit_verdict"] = true.into();
+        let (stdout, stderr, exit_code) =
+            run_hook_mode_raw_with_options(&input.to_string(), &["--agent", agent], &[]);
+        assert_eq!(exit_code, 0, "{agent}: {stderr}");
+        // Parsing the entire byte stream rejects a second document appended
+        // by the explicit-allow fallback after a real warning response.
+        let document: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|error| panic!("{agent}: {error}; {stdout:?}; {stderr}"));
+        assert!(document.get("dcg_verdict").is_none(), "{agent}: {document}");
+        assert_eq!(
+            document["decision"].as_str(),
+            decision,
+            "{agent}: {document}"
+        );
+        assert!(
+            document[warning_field]
+                .as_str()
+                .is_some_and(|warning| warning.contains("git stash drop")),
+            "{agent} must preserve its structured warning: {document}"
+        );
+        assert!(stderr.contains("WARNING"), "{agent}: {stderr}");
+    }
+}
+
+/// Independent consumer schema: extra output fields must fail deserialization,
+/// rather than being ignored by `serde_json::Value`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AntigravityDenial {
+    decision: String,
+    reason: String,
+}
+
+fn decode_antigravity_denial(stdout: &str) -> Result<AntigravityDenial, serde_json::Error> {
+    let shape: serde_json::Value = serde_json::from_str(stdout)?;
+    if !shape.is_object() {
+        return Err(serde::de::Error::custom("agy denial must be an object"));
+    }
+    // Decode the original bytes, not the Value, so duplicate fields are
+    // rejected. String fields also reject Serde's alternate enum encodings.
+    let denial: AntigravityDenial = serde_json::from_str(stdout)?;
+    if denial.decision != "deny" {
+        return Err(serde::de::Error::custom("agy decision must be deny"));
+    }
+    Ok(denial)
+}
+
+fn assert_antigravity_denial(stdout: &str, stderr: &str, exit_code: i32) -> AntigravityDenial {
     assert_eq!(
         exit_code, 0,
-        "agy hook must exit 0 so the JSON block decision is honored\nstderr: {stderr}"
+        "agy must exit 0 for the JSON denial to be honored\nstderr: {stderr}"
     );
-    assert!(!stdout.is_empty(), "stdout must carry the block JSON");
-
-    let json: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("agy hook output must be valid JSON");
-
-    assert_eq!(
-        json["decision"], "block",
-        "agy block decision must use the \"block\" keyword"
+    let denial = decode_antigravity_denial(stdout).unwrap_or_else(|error| {
+        panic!(
+            "agy denial must satisfy its strict schema: {error}\nstdout: {stdout}\nstderr: {stderr}"
+        )
+    });
+    assert_eq!(denial.decision, "deny");
+    assert!(
+        !denial.reason.trim().is_empty(),
+        "agy denial must carry a nonempty reason"
     );
     assert!(
-        json["reason"].as_str().is_some_and(|r| !r.is_empty()),
-        "block must carry a non-empty reason, got: {}",
-        json["reason"]
+        !stderr.trim().is_empty(),
+        "agy denial must retain the operator-visible diagnostic"
     );
-    // Must NOT emit Claude's hookSpecificOutput envelope (agy uses decision/reason).
-    assert!(
-        json.get("hookSpecificOutput").is_none(),
-        "agy output must not use Claude's hookSpecificOutput shape"
-    );
+    denial
+}
+
+fn antigravity_payload(command: &str) -> String {
+    // Include the diagnostic metadata from a captured native request, not
+    // just the tool call; none of it belongs in the strict response schema.
+    serde_json::json!({
+        "artifactDirectoryPath": "/tmp/.gemini/brain/abc",
+        "conversationId": "a3bbcaba-0bb2-4e58-b614-49f42fa6f004",
+        "stepIdx": 4,
+        "toolCall": {
+            "name": "run_command",
+            "args": {"CommandLine": command, "Cwd": "/work", "WaitMsBeforeAsync": 500}
+        },
+        "transcriptPath": "/tmp/.gemini/brain/abc/transcript_full.jsonl",
+        "workspacePaths": ["/work"]
+    })
+    .to_string()
+}
+
+#[test]
+fn test_antigravity_strict_decoder_rejects_invalid_denials() {
+    for invalid in [
+        r#"{"decision":"deny","reason":"blocked","systemMessage":"blocked"}"#,
+        r#"{"decision":"deny","reason":"blocked","ruleId":"core.git:reset-hard"}"#,
+        r#"{"decision":"deny","reason":"blocked","remediation":{}}"#,
+        r#"{"decision":"block","reason":"blocked"}"#,
+        r#"{"decision":"allow","reason":"blocked"}"#,
+        r#"{"decision":"ask","reason":"blocked"}"#,
+        r#"{"decision":{"deny":null},"reason":"blocked"}"#,
+        r#"["deny","blocked"]"#,
+        r#"{"decision":"deny","reason":null}"#,
+        r#"{"decision":"deny"}"#,
+        r#"{"decision":"deny","decision":"allow","reason":"blocked"}"#,
+        r#"{"decision":"deny","reason":"blocked"} {"decision":"allow"}"#,
+    ] {
+        assert!(
+            decode_antigravity_denial(invalid).is_err(),
+            "strict agy denial decoder accepted an incompatible payload: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn test_antigravity_envelope_produces_strict_deny_with_review_details() {
+    let input = antigravity_payload("git reset --hard");
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+    let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+
+    for detail in [
+        "git reset --hard",
+        "core.git:reset-hard",
+        "dcg explain",
+        "dcg allow-once",
+    ] {
+        assert!(
+            denial.reason.contains(detail),
+            "agy reason must preserve review detail {detail:?}: {}",
+            denial.reason
+        );
+    }
 }
 
 #[test]
 fn test_antigravity_envelope_allows_safe_command() {
-    // A benign command must NOT block: agy gets an explicit allow (or no JSON
-    // block), and the tool proceeds.
-    let input = r#"{
-        "conversationId":"c1",
-        "stepIdx":1,
-        "toolCall":{"name":"run_command","args":{"CommandLine":"echo hello","Cwd":"/work"}},
-        "workspacePaths":["/work"]
-    }"#;
-
-    let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
+    let input = antigravity_payload("echo hello");
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
     assert_eq!(exit_code, 0, "safe command must exit 0\nstderr: {stderr}");
     assert!(
-        stdout.trim().is_empty(),
-        "safe agy hook output must be silent, got: {stdout}"
+        stdout.is_empty(),
+        "safe agy output must have zero bytes to preserve normal permissions, got: {stdout:?}"
     );
+}
+
+#[test]
+fn test_antigravity_warning_preserves_ordinary_permission_checks() {
+    // This medium-severity rule warns under the shipped policy. An explicit
+    // `allow` would let a successful hook pre-approve Antigravity's tool call.
+    let input = antigravity_payload("git stash drop");
+    let invocations: [&[&str]; 2] = [&[], &["--agent", "agy"]];
+    for args in invocations {
+        let (stdout, stderr, exit_code) = run_hook_mode_raw_with_options(&input, args, &[]);
+        assert_eq!(exit_code, 0, "agy warn must exit 0\nstderr: {stderr}");
+        assert!(
+            stdout.is_empty(),
+            "agy warn must emit zero stdout bytes, never pre-approve a command: {stdout:?}"
+        );
+        assert!(
+            stderr.contains("WARNING") && stderr.contains("git stash drop"),
+            "agy warn must remain visible to the operator\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_antigravity_command_keys_cannot_hide_a_destructive_native_command() {
+    for decoy in ["echo harmless", "git stash drop", "echo '", "echo \\"] {
+        let input = serde_json::json!({
+            "toolCall": {
+                "name": "run_command",
+                "args": {"command": decoy, "CommandLine": "git reset --hard"}
+            }
+        })
+        .to_string();
+        let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+        let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+        assert!(
+            denial.reason.contains("core.git:reset-hard"),
+            "a harmless, warning, or unfinished alias cannot hide the native command: {decoy:?}\n{}",
+            denial.reason
+        );
+    }
+}
+
+#[test]
+fn test_antigravity_displaced_tool_call_retains_all_command_keys() {
+    let input = serde_json::json!({
+        "tool_call": {"name": "run_command", "args": {"CommandLine": "echo primary"}},
+        "toolCall": {
+            "name": "run_command",
+            "args": {"command": "echo alias", "CommandLine": "git reset --hard"}
+        }
+    })
+    .to_string();
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+    let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+    assert!(denial.reason.contains("core.git:reset-hard"));
+}
+
+#[test]
+fn test_antigravity_benign_command_aliases_preserve_permissions() {
+    for args in [
+        serde_json::json!({"command": "echo first", "CommandLine": "git status"}),
+        serde_json::json!({"command": "git status", "CommandLine": "git status"}),
+        serde_json::json!({"command": "", "CommandLine": "git status"}),
+        serde_json::json!({"command": "echo 'git reset --hard'", "CommandLine": "git status"}),
+    ] {
+        let input =
+            serde_json::json!({"toolCall": {"name": "run_command", "args": args}}).to_string();
+        let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+        assert_eq!(exit_code, 0, "{input}\nstderr: {stderr}");
+        assert!(
+            stdout.is_empty(),
+            "benign aliases must not decide host permission: {stdout}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "benign aliases must remain silent: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_stringified_args_cannot_hide_command_aliases() {
+    let args =
+        serde_json::json!({"command": "echo harmless", "Command": "git reset --hard"}).to_string();
+    let cases = [
+        (
+            serde_json::json!({"toolCalls": [{"name": "bash", "args": args}]}),
+            "/hookSpecificOutput/permissionDecision",
+        ),
+        (
+            serde_json::json!({"event": "pre-tool-use", "toolName": "bash", "toolArgs": args}),
+            "/permissionDecision",
+        ),
+    ];
+    for (input, decision_pointer) in cases {
+        let (stdout, stderr, exit_code) = run_hook_mode_raw(&input.to_string());
+        assert_eq!(exit_code, 0, "{input}\nstderr: {stderr}");
+        let output: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|error| panic!("missing denial for {input}: {error}\n{stderr}"));
+        assert_eq!(
+            output
+                .pointer(decision_pointer)
+                .and_then(serde_json::Value::as_str),
+            Some("deny"),
+            "{output}"
+        );
+        assert!(stdout.contains("core.git:reset-hard"), "{output}");
+    }
+}
+
+#[test]
+fn test_antigravity_warning_does_not_mask_destructive_companion() {
+    let input = antigravity_payload("git stash drop; git reset --hard");
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+    let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+    assert!(
+        denial.reason.contains("core.git:reset-hard"),
+        "a warning cannot replace the destructive command's denial: {}",
+        denial.reason
+    );
+}
+
+#[test]
+fn test_antigravity_explicit_agent_fail_closed_uses_strict_denial() {
+    // Without a parseable envelope, --agent is the supported way to select
+    // the hook protocol. A parse failure must still deliver a usable denial.
+    let (stdout, stderr, exit_code) = run_hook_mode_raw_with_options(
+        "not a JSON hook payload",
+        &["--agent", "agy"],
+        &[("DCG_FAIL_CLOSED", "1")],
+    );
+    let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+    assert!(
+        denial.reason.contains("DCG_FAIL_CLOSED"),
+        "forced agy protocol must explain the fail-closed denial: {}",
+        denial.reason
+    );
+}
+
+#[test]
+fn test_antigravity_oversized_command_stays_denied_for_both_review_policies() {
+    let input = antigravity_payload(&format!(
+        "echo {}",
+        "x".repeat(destructive_command_guard::config::DEFAULT_MAX_COMMAND_BYTES)
+    ));
+    for policy in ["ask", "deny"] {
+        let (stdout, stderr, exit_code) =
+            run_hook_mode_raw_with_options(&input, &[], &[("DCG_UNVERIFIED_DECISION", policy)]);
+        let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+        assert!(
+            denial.reason.contains("exceeds limit") && denial.reason.contains("did not evaluate"),
+            "agy must deny an unverified oversized command under {policy}: {}",
+            denial.reason
+        );
+    }
+}
+
+#[test]
+fn test_gemini_retains_its_own_deny_and_warning_protocol() {
+    for (command, expected_decision) in [("git reset --hard", "deny"), ("git stash drop", "allow")]
+    {
+        let input = serde_json::json!({
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "tool_input": {"command": command}
+        })
+        .to_string();
+        let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+        assert_eq!(exit_code, 0, "Gemini must exit 0\nstderr: {stderr}");
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Gemini must retain its JSON response");
+        assert_eq!(json["decision"], expected_decision);
+        assert!(
+            json["systemMessage"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "the dedicated agy response must not remove Gemini's own metadata: {json}"
+        );
+        assert!(!stderr.is_empty(), "Gemini must retain its diagnostic");
+    }
 }
 
 // ============================================================================
@@ -732,5 +1093,293 @@ fn test_crush_envelope_allows_safe_command_silently() {
     assert!(
         stdout.trim().is_empty(),
         "safe Crush hook output must be silent, got: {stdout}"
+    );
+}
+
+// Factory's documented direct Execute hook contract (#617). These tests feed
+// the real dcg binary commands as JSON data; they never execute the commands
+// and do not establish that a live Droid Script invokes Execute hooks.
+fn droid_payload(command: &str) -> String {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "droid-session-617",
+        "transcript_path": "/home/user/.factory/sessions/session.jsonl",
+        "cwd": test_state_path("-home"),
+        "tool_name": "Execute",
+        "tool_input": {
+            "command": command,
+            "timeout": 90,
+            "riskLevel": "high",
+            "riskLevelReason": "User requested shell operation"
+        },
+        "tool_use_id": "call_execute_617"
+    })
+    .to_string()
+}
+
+fn assert_droid_denial(stdout: &str, stderr: &str, code: i32) -> serde_json::Value {
+    assert_eq!(code, 0, "Factory parses JSON on exit 0: {stderr}");
+    let output: serde_json::Value = serde_json::from_str(stdout).unwrap_or_else(|error| {
+        panic!("Droid must receive JSON denial: {error}; {stdout}; {stderr}")
+    });
+    let hook_output = &output["hookSpecificOutput"];
+    assert_eq!(hook_output["hookEventName"], "PreToolUse");
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output["permissionDecisionReason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+    );
+    output
+}
+
+#[test]
+fn test_droid_execute_denials_match_supported_bash_tools() {
+    for command in [
+        "git reset --hard HEAD",
+        "git status; git reset --hard HEAD",
+        "bash -c 'git reset --hard HEAD'",
+        "python3 - <<'PY'\nimport os\nos.system('git reset --hard HEAD')\nPY",
+    ] {
+        let (bash_stdout, bash_stderr, bash_code) = run_hook_mode_raw_with_options(
+            &serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}})
+                .to_string(),
+            &["--agent", "claude-code"],
+            &[],
+        );
+        let bash = assert_droid_denial(&bash_stdout, &bash_stderr, bash_code);
+        for args in [&[][..], &["--agent", "droid"][..]] {
+            let (stdout, stderr, code) =
+                run_hook_mode_raw_with_options(&droid_payload(command), args, &[]);
+            let droid = assert_droid_denial(&stdout, &stderr, code);
+            for field in ["permissionDecision", "ruleId", "packId", "severity"] {
+                assert_eq!(
+                    droid["hookSpecificOutput"][field], bash["hookSpecificOutput"][field],
+                    "{command}: {field}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_droid_execute_allows_safe_commands_without_preapproving_them() {
+    for command in [
+        "git status",
+        "git clean --dry-run",
+        "git diff --stat",
+        "printf '%s\\n' 'ordinary text'",
+    ] {
+        for args in [&[][..], &["--agent", "droid"][..]] {
+            let (stdout, stderr, code) =
+                run_hook_mode_raw_with_options(&droid_payload(command), args, &[]);
+            assert_eq!(code, 0, "{command}: {stderr}");
+            assert!(
+                stdout.is_empty(),
+                "an allowed command must not bypass Factory's own permission prompt: {stdout}"
+            );
+            assert!(stderr.is_empty(), "{command}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn test_droid_profile_applies_with_explicit_identity_and_native_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("droid-profile.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+        [packs]
+        enabled = ["core.git", "core.filesystem"]
+        [agents.droid]
+        extra_packs = ["database.postgresql"]
+        disabled_packs = ["core"]
+    "#,
+    )
+    .unwrap();
+    let env = [
+        ("DCG_CONFIG", config_path.to_str().unwrap()),
+        // A surrounding Claude terminal must not misattribute Execute.
+        ("CLAUDECODE", "1"),
+    ];
+    let command = "psql -c 'DROP TABLE users'";
+    for args in [
+        &[][..],
+        &["--agent", "droid"][..],
+        &["--agent", "factory-droid"][..],
+    ] {
+        let (stdout, stderr, code) =
+            run_hook_mode_raw_with_options(&droid_payload(command), args, &env);
+        let denial = assert_droid_denial(&stdout, &stderr, code);
+        assert_eq!(
+            denial["hookSpecificOutput"]["packId"],
+            "database.postgresql"
+        );
+        let (stdout, stderr, code) =
+            run_hook_mode_raw_with_options(&droid_payload("git reset --hard"), args, &env);
+        assert_droid_denial(&stdout, &stderr, code);
+    }
+    // Explicit overrides remain authoritative and optional Droid packs do
+    // not leak into another host's policy.
+    let (stdout, stderr, code) =
+        run_hook_mode_raw_with_options(&droid_payload(command), &["--agent", "claude-code"], &env);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+}
+
+#[test]
+fn test_droid_allowlist_profile_preserves_disabled_allowlist_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = "git reset --hard HEAD";
+    for disabled in [false, true] {
+        let config_path = temp.path().join(format!("droid-allowlist-{disabled}.toml"));
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+            [agents.droid]
+            additional_allowlist = ["{command}"]
+            disabled_allowlist = {disabled}
+        "#
+            ),
+        )
+        .unwrap();
+        let env = [("DCG_CONFIG", config_path.to_str().unwrap())];
+        let (stdout, stderr, code) =
+            run_hook_mode_raw_with_options(&droid_payload(command), &["--agent", "droid"], &env);
+        if disabled {
+            assert_droid_denial(&stdout, &stderr, code);
+        } else {
+            assert_eq!(code, 0, "{stderr}");
+            assert!(
+                stdout.is_empty(),
+                "configured exact command should be allowed: {stdout}"
+            );
+        }
+        let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+            &serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}})
+                .to_string(),
+            &["--agent", "claude-code"],
+            &env,
+        );
+        assert_droid_denial(&stdout, &stderr, code);
+    }
+}
+
+#[test]
+fn test_droid_configured_fail_closed_retains_claude_compatible_denial() {
+    let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+        "{ malformed Droid payload",
+        &["--agent", "droid"],
+        &[("DCG_FAIL_CLOSED", "1")],
+    );
+    assert_droid_denial(&stdout, &stderr, code);
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("invalid-config.toml");
+    std::fs::write(&config_path, "[packs]\nenabled = 7\n").unwrap();
+    let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+        &droid_payload("git status"),
+        &["--agent", "droid"],
+        &[("DCG_CONFIG", config_path.to_str().unwrap())],
+    );
+    assert_droid_denial(&stdout, &stderr, code);
+}
+
+#[test]
+fn test_droid_unverified_commands_preserve_ask_and_deny_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("command-limit.toml");
+    std::fs::write(&config_path, "[general]\nmax_command_bytes = 5\n").unwrap();
+    for decision in ["ask", "deny"] {
+        let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+            &droid_payload("git status"),
+            &["--agent", "droid"],
+            &[
+                ("DCG_CONFIG", config_path.to_str().unwrap()),
+                ("DCG_UNVERIFIED_DECISION", decision),
+            ],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], decision);
+    }
+}
+
+#[test]
+fn test_droid_payload_history_is_attributed_to_droid() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("history.db");
+    let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+        &droid_payload("git reset --hard"),
+        &[],
+        &[
+            ("DCG_HISTORY_DISABLED", "0"),
+            ("DCG_HISTORY_ENABLED", "1"),
+            ("DCG_HISTORY_DB", database.to_str().unwrap()),
+            ("CLAUDECODE", "1"),
+        ],
+    );
+    assert_droid_denial(&stdout, &stderr, code);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let agent: String = connection
+        .query_row(
+            "SELECT agent_type FROM commands ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(agent, "droid");
+}
+
+#[test]
+fn test_droid_hook_never_self_heals_unrelated_claude_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let claude_default = home.join(".claude/settings.json");
+    let claude_override_dir = home.join("claude-active");
+    let claude_override = claude_override_dir.join("settings.json");
+    let stale = r#"{"operatorSetting":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/stale/dcg"}]}]}}"#;
+    for path in [&claude_default, &claude_override] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, stale).unwrap();
+    }
+    let env = [
+        ("HOME", home.to_str().unwrap()),
+        ("USERPROFILE", home.to_str().unwrap()),
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CONFIG_DIR", claude_override_dir.to_str().unwrap()),
+        ("DCG_SELF_HEAL_HOOK", "1"),
+    ];
+    for args in [&[][..], &["--agent", "droid"][..]] {
+        let (stdout, stderr, code) =
+            run_hook_mode_raw_with_options(&droid_payload("git status"), args, &env);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        for path in [&claude_default, &claude_override] {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                stale,
+                "Droid changed unrelated {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_droid_script_payload_does_not_claim_nested_execute_coverage() {
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Script",
+        "tool_input": {"code": "await Execute({ command: 'git reset --hard HEAD' })"}
+    });
+    let (stdout, stderr, code) =
+        run_hook_mode_raw_with_options(&payload.to_string(), &["--agent", "droid"], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.is_empty(),
+        "Script source is not a shell command: {stdout}"
     );
 }

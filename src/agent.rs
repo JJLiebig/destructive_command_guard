@@ -41,6 +41,14 @@
 //! - Oh My Pi (`omp`): the generated OMP extension invokes dcg with the
 //!   explicit `--agent omp` flag (`dcg install --omp`). Exact `omp` and
 //!   `oh-my-pi` parent-process basenames are also recognized as a fallback.
+//! - Muse Code (Meta): runs hooks in a cleared environment, so `dcg install
+//!   --muse` writes the explicit `--agent muse` flag into the hook command
+//!   (#572). It is deliberately not inferred from a parent process name.
+//! - Amp: the generated plugin (`dcg install --amp`) passes `--agent amp`
+//!   (#577). No process name is consulted (`amp` is also an editor's name).
+//! - Factory Droid: `dcg install --droid` passes `--agent droid`; its documented
+//!   `FACTORY_PROJECT_DIR` hook variable and exact `droid` process basename
+//!   are fallbacks. Hook mode also recognizes the distinctive `Execute` tool.
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
 //! - Posit Assistant: `PA_PROJECT_DIR=<workspace root>` env var, set in every
@@ -132,6 +140,22 @@ pub enum Agent {
     /// "toolArgs":{"command":...}}` to the hook's stdin, and blocks on exit 2
     /// (#358). Identified from that wire shape; it sets no marker variable.
     Reasonix,
+    /// Muse Code, Meta's terminal coding agent
+    /// (<https://dev.meta.ai/docs/muse-code>). Reads `hooks.PreToolUse`
+    /// matcher groups from `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`
+    /// and pipes a Codex-shaped payload (`turn_id`, `tool_name: "shell"` or
+    /// `"exec_command"`) to the hook. Muse clears the hook environment, so the
+    /// installer writes `--agent muse` into the hook command (#572).
+    Muse,
+    /// Amp (<https://ampcode.com>). Guarded through a dcg-generated plugin
+    /// (`dcg install --amp`) whose `tool.call` handler runs `dcg --agent amp`
+    /// for every shell command (#577).
+    Amp,
+    /// Factory Droid (<https://docs.factory.com/harness/hooks>). Its `Execute`
+    /// tool sends Claude-compatible `PreToolUse` payloads. The installer pins
+    /// this identity with `--agent droid` so profiles also work when the hook
+    /// environment is cleared or the payload cannot be parsed (#617).
+    Droid,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -163,6 +187,9 @@ impl Agent {
             Self::Omp => "omp",
             Self::Crush => "crush",
             Self::Reasonix => "reasonix",
+            Self::Muse => "muse",
+            Self::Amp => "amp",
+            Self::Droid => "droid",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -190,6 +217,9 @@ impl Agent {
                 | Self::Omp
                 | Self::Crush
                 | Self::Reasonix
+                | Self::Muse
+                | Self::Amp
+                | Self::Droid
         )
     }
 
@@ -216,6 +246,9 @@ impl Agent {
     /// - `"omp"`, `"oh-my-pi"` -> `Omp`
     /// - `"crush"`, `"charm-crush"` -> `Crush`
     /// - `"reasonix"`, `"deepseek-reasonix"` -> `Reasonix`
+    /// - `"muse"`, `"muse-code"` -> `Muse`
+    /// - `"amp"`, `"ampcode"` -> `Amp`
+    /// - `"droid"`, `"factory-droid"`, `"factory"` -> `Droid`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -239,6 +272,9 @@ impl Agent {
             "omp" | "ohmypi" => Self::Omp,
             "crush" | "charmcrush" | "crushcli" => Self::Crush,
             "reasonix" | "deepseekreasonix" => Self::Reasonix,
+            "muse" | "musecode" | "metamuse" => Self::Muse,
+            "amp" | "ampcode" => Self::Amp,
+            "droid" | "factorydroid" | "factory" | "droidcli" => Self::Droid,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -265,6 +301,9 @@ impl fmt::Display for Agent {
             Self::Omp => write!(f, "Oh My Pi"),
             Self::Crush => write!(f, "Crush"),
             Self::Reasonix => write!(f, "Reasonix"),
+            Self::Muse => write!(f, "Muse Code"),
+            Self::Amp => write!(f, "Amp"),
+            Self::Droid => write!(f, "Factory Droid"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -705,6 +744,18 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Factory documents this variable for hooks. Like PA_PROJECT_DIR it
+    // describes a workspace and may be inherited by another agent, so keep
+    // existing identifying markers ahead of it. Installed hooks use the
+    // explicit --agent droid flag, which takes precedence over all env vars.
+    if std::env::var_os("FACTORY_PROJECT_DIR").is_some() {
+        return Some(DetectionResult::new(
+            Agent::Droid,
+            DetectionMethod::Environment,
+            Some("FACTORY_PROJECT_DIR".to_string()),
+        ));
+    }
+
     None
 }
 
@@ -912,6 +963,12 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "omp" | "oh-my-pi" => Some(Agent::Omp),
         "crush" => Some(Agent::Crush),
         "reasonix" => Some(Agent::Reasonix),
+        "droid" => Some(Agent::Droid),
+        // No "muse" entry: Muse Code is identified only by the explicit
+        // `--agent muse` its installed hook carries (#572). That identity
+        // changes the profile and the answer shape, so it must not follow an
+        // ancestor process (a Codex session started from a Muse shell, or
+        // the unrelated MusE sequencer binary).
         // "pa" is a dangerous prefix (pacman, pactl, pass, patch, ...); the
         // exact-match table is what keeps those from misclassifying.
         "pa" | "posit-assistant" => Some(Agent::PositAssistant),
@@ -1076,6 +1133,42 @@ mod tests {
         assert!(Agent::Omp.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
+    }
+
+    #[test]
+    fn test_droid_identity_mappings() {
+        assert_eq!(Agent::Droid.config_key(), "droid");
+        assert!(Agent::Droid.is_known());
+        assert_eq!(Agent::Droid.to_string(), "Factory Droid");
+        for name in [
+            "droid",
+            "Droid",
+            "factory-droid",
+            "factory_droid",
+            "factory",
+            "droid-cli",
+        ] {
+            assert_eq!(Agent::from_name(name), Agent::Droid, "{name}");
+        }
+        let explicit = explicit_agent_from_args(["dcg", "--agent", "droid"]);
+        assert_eq!(
+            from_explicit(explicit.as_deref().unwrap()).agent,
+            Agent::Droid
+        );
+        for process in [
+            "droid",
+            "/home/user/.local/bin/droid",
+            r"C:\tools\droid.exe",
+        ] {
+            assert_eq!(
+                agent_from_process_name(process),
+                Some(Agent::Droid),
+                "{process}"
+            );
+        }
+        for process in ["android", "droid-helper", "factory", "/tmp/droid-notes.txt"] {
+            assert_eq!(agent_from_process_name(process), None, "{process}");
+        }
     }
 
     #[test]
@@ -1408,6 +1501,7 @@ mod env_tests {
         "CRUSH",
         "PI_CODING_AGENT",
         "PA_PROJECT_DIR",
+        "FACTORY_PROJECT_DIR",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
@@ -1675,6 +1769,26 @@ mod env_tests {
     }
 
     #[test]
+    fn test_detect_droid_from_documented_hook_environment() {
+        with_env_var("FACTORY_PROJECT_DIR", "/work/project", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Droid);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value.as_deref(), Some("FACTORY_PROJECT_DIR"));
+        });
+    }
+
+    #[test]
+    fn test_droid_workspace_marker_preserves_existing_agent_priority() {
+        with_env_vars(
+            &[("FACTORY_PROJECT_DIR", "/work"), ("CLAUDECODE", "1")],
+            || {
+                assert_eq!(detect_agent_with_details().agent, Agent::ClaudeCode);
+            },
+        );
+    }
+
+    #[test]
     fn test_crush_env_beats_weak_posit_marker() {
         // PA_PROJECT_DIR describes the surrounding workspace; a hook that
         // names itself must win.
@@ -1718,6 +1832,43 @@ mod env_tests {
             Some(Agent::Reasonix)
         );
         assert_eq!(agent_from_process_name("reasonixd"), None);
+    }
+
+    /// #572: Muse Code clears the hook environment, so the explicit
+    /// `--agent muse` is what identifies it; a process name never does.
+    #[test]
+    fn test_muse_identity_mappings() {
+        assert_eq!(Agent::Muse.config_key(), "muse");
+        assert!(Agent::Muse.is_known());
+        assert!(!Agent::Muse.is_explicit());
+        for name in ["muse", "Muse", "muse-code", "muse_code", "meta-muse"] {
+            assert_eq!(Agent::from_name(name), Agent::Muse, "{name}");
+        }
+        assert_eq!(format!("{}", Agent::Muse), "Muse Code");
+        let explicit = explicit_agent_from_args(["dcg", "--agent", "muse"]);
+        assert_eq!(
+            from_explicit(explicit.as_deref().unwrap()).agent,
+            Agent::Muse
+        );
+        assert_eq!(agent_from_process_name("muse"), None);
+        assert_eq!(agent_from_process_name("/home/u/.local/bin/muse"), None);
+    }
+
+    /// #577: dcg's Amp plugin passes `--agent amp`, which selects `[agents.amp]`.
+    #[test]
+    fn test_amp_identity_mappings() {
+        assert_eq!(Agent::Amp.config_key(), "amp");
+        assert!(Agent::Amp.is_known());
+        for name in ["amp", "Amp", "ampcode", "AMP"] {
+            assert_eq!(Agent::from_name(name), Agent::Amp, "{name}");
+        }
+        assert_eq!(format!("{}", Agent::Amp), "Amp");
+        let explicit = explicit_agent_from_args(["dcg", "--agent", "amp"]);
+        assert_eq!(
+            from_explicit(explicit.as_deref().unwrap()).agent,
+            Agent::Amp
+        );
+        assert_eq!(agent_from_process_name("amp"), None);
     }
 
     #[test]

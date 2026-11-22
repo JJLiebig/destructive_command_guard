@@ -31,7 +31,7 @@
 //! it never turns incomplete analysis into a silent allow.
 //! This ensures dcg never blocks a user's workflow indefinitely.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -201,6 +201,248 @@ thread_local! {
     // An absent collector is the whole disabled path: no clock, environment
     // lookup, lock, or allocation is performed at an instrumented call site.
     static THREAD_PROFILE: RefCell<Option<ThreadProfile>> = const { RefCell::new(None) };
+    // The innermost phase open on this thread, kept with or without a
+    // collector (one thread-local write per phase boundary, no clock), so an
+    // exhausted budget can name the phase it ran out in (#571).
+    static CURRENT_PHASE: Cell<Option<ProfilePhase>> = const { Cell::new(None) };
+    static EXHAUSTION: Cell<BudgetExhaustion> = const { Cell::new(BudgetExhaustion::NONE) };
+}
+
+/// Maximum bytes retained from a rule identifier in an incomplete-analysis report.
+///
+/// Identifiers are metadata, not submitted commands or regular expressions.
+/// Keeping them bounded also prevents an external pack from constructing an
+/// unbounded diagnostic while the evaluator is already short of resources.
+pub const DIAGNOSTIC_ID_MAX_BYTES: usize = 96;
+
+/// A bounded, single-line rule identifier safe for text and terminal diagnostics.
+///
+/// Only ASCII letters, digits, dots, underscores and hyphens are retained.
+/// Other bytes become underscores, and a truncated identifier ends in `...`.
+/// The source text is never stored alongside this diagnostic representation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DiagnosticId {
+    bytes: [u8; DIAGNOSTIC_ID_MAX_BYTES],
+    len: u8,
+}
+
+impl DiagnosticId {
+    /// Retain a bounded, printable representation of an identifier.
+    #[must_use]
+    pub fn new(identifier: &str) -> Self {
+        let mut bytes = [0; DIAGNOSTIC_ID_MAX_BYTES];
+        let len = identifier.len().min(DIAGNOSTIC_ID_MAX_BYTES);
+        for (to, from) in bytes.iter_mut().zip(identifier.bytes()).take(len) {
+            *to = if from.is_ascii_alphanumeric() || matches!(from, b'.' | b'_' | b'-') {
+                from
+            } else {
+                b'_'
+            };
+        }
+        if identifier.len() > DIAGNOSTIC_ID_MAX_BYTES {
+            bytes[DIAGNOSTIC_ID_MAX_BYTES - 3..].copy_from_slice(b"...");
+        }
+        Self {
+            bytes,
+            // The fixed bound is below u8::MAX.
+            len: u8::try_from(len).expect("diagnostic identifier bound fits u8"),
+        }
+    }
+
+    /// The sanitized identifier, at most [`DIAGNOSTIC_ID_MAX_BYTES`] bytes.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Construction only writes ASCII, and the fields are private.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("diagnostic identifiers contain only ASCII")
+    }
+}
+
+impl std::fmt::Display for DiagnosticId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Debug for DiagnosticId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DiagnosticId").field(&self.as_str()).finish()
+    }
+}
+
+/// The regex operation which could not complete, without any input or pattern text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexOperation {
+    /// Lazy compilation of a rule.
+    Compile,
+    /// Boolean match evaluation.
+    Match,
+    /// Search for the first match.
+    Find,
+    /// Search beginning at an offset while retaining whole-input context.
+    FindFrom,
+    /// Replace one or more matches.
+    Replace,
+}
+
+impl RegexOperation {
+    /// Stable operation label used by incomplete-analysis diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compile => "compile",
+            Self::Match => "match",
+            Self::Find => "find",
+            Self::FindFrom => "find_from",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+/// Why regex evaluation failed. A work limit is distinct from a wall-clock budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexFailureCause {
+    /// The compiled engine's actual per-pattern backtracking work limit.
+    BacktrackLimit {
+        /// Maximum backtracking steps configured when this regex was compiled.
+        steps: usize,
+    },
+    /// A rule could not be compiled. No raw error or pattern text is retained.
+    CompileError,
+    /// Another engine error, for which no exhausted budget is known.
+    RuntimeError,
+}
+
+/// The first regex failure responsible for an incomplete evaluation (#643).
+///
+/// This value deliberately cannot contain command contents, raw patterns,
+/// engine error strings, paths, match offsets, or execution context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegexFailure {
+    /// Rule's pack, when the failing regex belongs to a known pack.
+    pub pack_id: Option<DiagnosticId>,
+    /// Rule identifier, when one is available.
+    pub pattern_id: Option<DiagnosticId>,
+    /// The operation which failed.
+    pub operation: RegexOperation,
+    /// The typed cause, including a known work limit.
+    pub cause: RegexFailureCause,
+}
+
+impl std::fmt::Display for RegexFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.pack_id, &self.pattern_id) {
+            (Some(pack), Some(pattern)) => write!(f, "pattern {pack}:{pattern}"),
+            (Some(pack), None) => write!(f, "unnamed pattern in pack {pack}"),
+            (None, Some(pattern)) => write!(f, "pattern {pattern}"),
+            (None, None) => f.write_str("regex evaluation"),
+        }?;
+        match self.cause {
+            RegexFailureCause::BacktrackLimit { steps } => write!(
+                f,
+                " exceeded its per-pattern regex backtracking limit of {steps} steps"
+            ),
+            RegexFailureCause::CompileError => f.write_str(" could not compile"),
+            RegexFailureCause::RuntimeError => {
+                f.write_str(" stopped because of a regex engine error")
+            }
+        }?;
+        write!(f, " (operation: {})", self.operation.as_str())
+    }
+}
+
+/// Where this thread's evaluation ran out of budget, for the indeterminate
+/// reason (#571). Each field keeps its first observation since the last
+/// [`take_budget_exhaustion`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BudgetExhaustion {
+    /// The phase open when an expired deadline (or a remaining budget too
+    /// small for the next step) was first observed. `Some(None)` means it was
+    /// observed outside every instrumented phase.
+    pub deadline: Option<Option<ProfilePhase>>,
+    /// The first bounded analysis that could not complete (a regex search
+    /// limit or an optional proof's own budget), and the phase it ran in.
+    pub incomplete: Option<(&'static str, Option<ProfilePhase>)>,
+    /// Provenance when the first incomplete step was a regex operation.
+    /// A later regex failure never takes credit for an earlier non-regex step.
+    pub regex_failure: Option<RegexFailure>,
+}
+
+impl BudgetExhaustion {
+    const NONE: Self = Self {
+        deadline: None,
+        incomplete: None,
+        regex_failure: None,
+    };
+}
+
+/// Record that evaluation on this thread stopped for lack of time.
+pub fn note_deadline_exhausted() {
+    EXHAUSTION.with(|cell| {
+        let mut note = cell.get();
+        if note.deadline.is_none() {
+            note.deadline = Some(CURRENT_PHASE.with(Cell::get));
+            cell.set(note);
+        }
+    });
+}
+
+/// Record that a bounded analysis step (`stage`) could not complete.
+pub fn note_incomplete_analysis(stage: &'static str) {
+    EXHAUSTION.with(|cell| {
+        let mut note = cell.get();
+        if note.incomplete.is_none() {
+            note.incomplete = Some((stage, CURRENT_PHASE.with(Cell::get)));
+            cell.set(note);
+        }
+    });
+}
+
+/// Record a typed regex failure only when it is the first incomplete step.
+pub fn note_regex_failure(failure: RegexFailure) {
+    EXHAUSTION.with(|cell| {
+        let mut note = cell.get();
+        if note.incomplete.is_none() {
+            note.incomplete = Some((failure.operation.as_str(), CURRENT_PHASE.with(Cell::get)));
+            note.regex_failure = Some(failure);
+            cell.set(note);
+        }
+    });
+}
+
+/// Return and clear this thread's budget-exhaustion notes.
+pub fn take_budget_exhaustion() -> BudgetExhaustion {
+    EXHAUSTION.with(|cell| cell.replace(BudgetExhaustion::NONE))
+}
+
+/// The diagnostic name of a phase, as `DCG_PROFILE` reports it.
+#[must_use]
+pub fn phase_name(phase: ProfilePhase) -> &'static str {
+    PROFILE_PHASES[phase as usize].1
+}
+
+/// User plus system CPU time this process has used, where the platform
+/// reports it. Wall time alone cannot tell a slow input from a process the
+/// host barely scheduled (#571).
+#[must_use]
+pub fn process_cpu_time() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let usage =
+            nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_SELF).ok()?;
+        let micros = |time: nix::sys::time::TimeVal| {
+            u64::try_from(time.tv_sec())
+                .ok()?
+                .checked_mul(1_000_000)?
+                .checked_add(u64::try_from(time.tv_usec()).ok()?)
+        };
+        let total = micros(usage.user_time())?.checked_add(micros(usage.system_time())?)?;
+        Some(Duration::from_micros(total))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -211,13 +453,17 @@ fn duration_ns(duration: Duration) -> u64 {
 #[must_use = "dropping the guard ends the measurement"]
 pub struct PhaseGuard {
     active: Option<(Arc<Mutex<ProfileMeasurements>>, usize)>,
+    // The phase this guard's phase nested in, restored on drop.
+    outer: Option<ProfilePhase>,
     // A span must end on the thread whose stack it entered.
     _thread_bound: PhantomData<Rc<()>>,
 }
 
-/// Measure a phase only when hook profiling is active on this thread.
+/// Enter a phase: always as this thread's current phase, and as a measured
+/// span only when hook profiling is active on this thread.
 #[inline]
 pub fn phase(phase: ProfilePhase) -> PhaseGuard {
+    let outer = CURRENT_PHASE.with(|current| current.replace(Some(phase)));
     let active = THREAD_PROFILE.with(|slot| {
         let mut slot = slot.borrow_mut();
         let profile = slot.as_mut()?;
@@ -226,12 +472,14 @@ pub fn phase(phase: ProfilePhase) -> PhaseGuard {
     });
     PhaseGuard {
         active,
+        outer,
         _thread_bound: PhantomData,
     }
 }
 
 impl Drop for PhaseGuard {
     fn drop(&mut self) {
+        CURRENT_PHASE.with(|current| current.set(self.outer));
         let Some((shared, depth)) = self.active.as_ref() else {
             return;
         };
@@ -573,7 +821,11 @@ impl Deadline {
     pub fn is_exceeded(&self) -> bool {
         // `>=` so a zero-duration deadline is exceeded immediately even when
         // the monotonic clock has not advanced between construction and check.
-        self.start.elapsed() >= self.max_duration
+        let exceeded = self.start.elapsed() >= self.max_duration;
+        if exceeded {
+            note_deadline_exhausted();
+        }
+        exceeded
     }
 
     /// Get the remaining time before the deadline, or None if exceeded.
@@ -585,7 +837,12 @@ impl Deadline {
         // construction and this call (the checked_sub form returned Some(0)
         // in that window, contradicting both the doc contract and
         // `is_exceeded`, and made the zero-duration test flaky).
-        (elapsed < self.max_duration).then(|| self.max_duration.saturating_sub(elapsed))
+        let remaining =
+            (elapsed < self.max_duration).then(|| self.max_duration.saturating_sub(elapsed));
+        if remaining.is_none() {
+            note_deadline_exhausted();
+        }
+        remaining
     }
 
     /// Get the elapsed time since the deadline started.
@@ -765,6 +1022,170 @@ mod tests {
             worker,
             stack: Vec::new(),
         }
+    }
+
+    #[test]
+    fn budget_exhaustion_names_the_innermost_open_phase_issue_571() {
+        // Each test runs on its own thread, so these thread-locals start clean.
+        assert_eq!(take_budget_exhaustion(), BudgetExhaustion::default());
+        {
+            let _evaluation = phase(ProfilePhase::Evaluation);
+            {
+                let _rules = phase(ProfilePhase::PatternRules);
+                let _compile = phase(ProfilePhase::RegexCompile);
+                assert!(Deadline::new(Duration::ZERO).is_exceeded());
+            }
+            // Later observations do not replace the first one.
+            assert!(Deadline::new(Duration::ZERO).remaining().is_none());
+            note_incomplete_analysis("interpreter_literal_recovery");
+            note_incomplete_analysis("match");
+            assert_eq!(
+                CURRENT_PHASE.with(Cell::get),
+                Some(ProfilePhase::Evaluation)
+            );
+        }
+        assert_eq!(CURRENT_PHASE.with(Cell::get), None);
+        assert_eq!(
+            take_budget_exhaustion(),
+            BudgetExhaustion {
+                deadline: Some(Some(ProfilePhase::RegexCompile)),
+                incomplete: Some((
+                    "interpreter_literal_recovery",
+                    Some(ProfilePhase::Evaluation)
+                )),
+                regex_failure: None,
+            }
+        );
+        // Taking clears; an expiry outside every phase is still recorded.
+        assert_eq!(take_budget_exhaustion(), BudgetExhaustion::default());
+        assert!(Deadline::new(Duration::ZERO).is_exceeded());
+        assert_eq!(
+            take_budget_exhaustion(),
+            BudgetExhaustion {
+                deadline: Some(None),
+                incomplete: None,
+                regex_failure: None,
+            }
+        );
+        // A deadline that has not passed records nothing.
+        assert!(!Deadline::new(Duration::from_secs(3600)).is_exceeded());
+        assert!(
+            Deadline::new(Duration::from_secs(3600))
+                .remaining()
+                .is_some()
+        );
+        assert_eq!(take_budget_exhaustion(), BudgetExhaustion::default());
+        assert_eq!(phase_name(ProfilePhase::RegexCompile), "regex_compile");
+        assert_eq!(phase_name(ProfilePhase::HistoryFlush), "history_flush");
+    }
+
+    #[test]
+    fn regex_provenance_only_describes_the_first_incomplete_step_issue_643() {
+        let _ = take_budget_exhaustion();
+        let first = RegexFailure {
+            pack_id: Some(DiagnosticId::new("test.first")),
+            pattern_id: Some(DiagnosticId::new("slow")),
+            operation: RegexOperation::FindFrom,
+            cause: RegexFailureCause::BacktrackLimit { steps: 123 },
+        };
+        let second = RegexFailure {
+            pack_id: Some(DiagnosticId::new("test.second")),
+            operation: RegexOperation::Match,
+            ..first
+        };
+        {
+            let _phase = phase(ProfilePhase::RegexMatch);
+            note_regex_failure(first);
+        }
+        note_regex_failure(second);
+        note_incomplete_analysis("interpreter_literal_recovery");
+        let record = take_budget_exhaustion();
+        assert_eq!(record.regex_failure, Some(first));
+        assert_eq!(
+            record.incomplete,
+            Some(("find_from", Some(ProfilePhase::RegexMatch)))
+        );
+
+        note_incomplete_analysis("interpreter_literal_recovery");
+        note_regex_failure(first);
+        let record = take_budget_exhaustion();
+        assert_eq!(
+            record.incomplete,
+            Some(("interpreter_literal_recovery", None))
+        );
+        assert_eq!(record.regex_failure, None);
+        assert_eq!(take_budget_exhaustion(), BudgetExhaustion::default());
+    }
+
+    #[test]
+    fn regex_diagnostic_identifiers_are_bounded_and_terminal_safe_issue_643() {
+        let normal = DiagnosticId::new("test.slow_lookahead-1");
+        assert_eq!(normal.as_str(), "test.slow_lookahead-1");
+        let hostile = DiagnosticId::new("rule\n\r\t\u{1b}[31m/雪");
+        assert!(
+            hostile
+                .as_str()
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') })
+        );
+        assert!(!hostile.to_string().contains('\n'));
+        let long = DiagnosticId::new(&"x".repeat(10_000));
+        assert_eq!(long.as_str().len(), DIAGNOSTIC_ID_MAX_BYTES);
+        assert!(long.as_str().ends_with("..."));
+        let failure = RegexFailure {
+            pack_id: Some(long),
+            pattern_id: Some(hostile),
+            operation: RegexOperation::FindFrom,
+            cause: RegexFailureCause::BacktrackLimit { steps: 100 },
+        };
+        let text = failure.to_string();
+        assert!(text.len() < DIAGNOSTIC_ID_MAX_BYTES * 2 + 160);
+        assert!(text.contains("100 steps (operation: find_from)"));
+        assert!(!text.contains("ms"));
+        assert!(!text.contains("hook"));
+    }
+
+    #[test]
+    fn regex_failure_descriptions_do_not_invent_unknown_limits_or_rule_ids_issue_643() {
+        let anonymous = RegexFailure {
+            pack_id: None,
+            pattern_id: None,
+            operation: RegexOperation::Compile,
+            cause: RegexFailureCause::CompileError,
+        };
+        assert_eq!(
+            anonymous.to_string(),
+            "regex evaluation could not compile (operation: compile)"
+        );
+        let runtime = RegexFailure {
+            pack_id: Some(DiagnosticId::new("test.pack")),
+            operation: RegexOperation::Match,
+            cause: RegexFailureCause::RuntimeError,
+            ..anonymous
+        };
+        let text = runtime.to_string();
+        assert!(text.contains("unnamed pattern in pack test.pack"));
+        assert!(text.contains("regex engine error (operation: match)"));
+        assert!(!text.contains("limit"));
+        assert!(!text.contains("timeout"));
+    }
+
+    #[test]
+    fn process_cpu_time_is_reported_on_unix_issue_571() {
+        let cpu = process_cpu_time();
+        #[cfg(unix)]
+        {
+            // Burn a little CPU so a coarse clock cannot read zero.
+            let started = Instant::now();
+            let mut x = 0_u64;
+            while started.elapsed() < Duration::from_millis(20) {
+                x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+            }
+            let later = process_cpu_time().expect("getrusage succeeds");
+            assert!(later > cpu.expect("getrusage succeeds"));
+        }
+        #[cfg(not(unix))]
+        assert!(cpu.is_none());
     }
 
     #[test]
@@ -1178,7 +1599,7 @@ mod tests {
     /// #351/#353: the release fleet gate must fail if the tag-pinned installer
     /// or archive is unverified, or if any probe silently skips verification.
     #[test]
-    fn fleet_install_gate_requires_installer_checksums_and_sigstore_on_every_platform() {
+    fn fleet_install_gate_requires_installer_checksums_and_minisign_on_every_platform() {
         let fleet = include_str!("../scripts/e2e_fleet_install.sh");
         let unix_probe = fleet
             .split("unix_probe() {")
@@ -1197,26 +1618,37 @@ mod tests {
             .expect("fleet gate must retain its probe completeness contract");
 
         assert!(
-            unix_probe.contains("--verify --no-configure"),
-            "Unix fleet installs must verify the release artifact"
+            unix_probe.contains("--require-minisign --verify --no-configure"),
+            "Unix fleet installs must require a valid minisign signature"
         );
         assert!(
-            windows_probe.contains("-Verify -NoConfigure"),
-            "Windows fleet installs must verify the release artifact"
+            windows_probe.contains("'-RequireMinisign', '-Verify', '-NoConfigure'")
+                && windows_probe.contains("-ArgumentList $installerArguments")
+                && windows_probe.contains("-Wait -PassThru"),
+            "Windows fleet installs must require a valid minisign signature and wait for the child installer"
         );
+        // #638: the installer is the selected release's own asset, checked
+        // against that release's checksum and Minisign signature before it runs.
         assert!(
-            unix_probe.contains("$REPO_RAW/$VERSION/install.sh")
-                && unix_probe.contains("$REPO_RELEASE/$VERSION/install.sh.sha256")
-                && windows_probe.contains("$RepoRaw/$Version/install.ps1")
-                && windows_probe.contains("$RepoRelease/$Version/install.ps1.sha256"),
+            unix_probe.contains("\"$REPO_RELEASE/$VERSION/install.sh\"")
+                && unix_probe.contains("\"$REPO_RELEASE/$VERSION/install.sh.sha256\"")
+                && unix_probe.contains("\"$REPO_RELEASE/$VERSION/install.sh.minisig\"")
+                && windows_probe.contains("\"$RepoRelease/$Version/install.ps1\"")
+                && windows_probe.contains("\"$RepoRelease/$Version/install.ps1.sha256\"")
+                && windows_probe.contains("\"$RepoRelease/$Version/install.ps1.minisig\""),
             "fleet installs must verify the exact tag-pinned installer before execution"
         );
         assert!(
-            expected_cases.contains("installer_checksum_verified"),
+            !unix_probe.contains("REPO_RAW") && !windows_probe.contains("RepoRaw"),
+            "fleet installs must not fetch the installer outside the signed release assets"
+        );
+        assert!(
+            expected_cases.contains("installer_checksum_verified")
+                && expected_cases.contains("installer_signature_verified"),
             "a truncated probe must not pass without reporting installer verification"
         );
         assert!(
-            expected_cases.contains("signature_verified"),
+            expected_cases.contains("minisign_verified"),
             "a truncated probe must not pass without reporting signature verification"
         );
         assert!(
@@ -1226,13 +1658,13 @@ mod tests {
             "fleet probes must require exact clean-tag provenance, not semver alone"
         );
         assert!(
-            unix_probe.contains("Signature verified (cosign")
-                && windows_probe.contains("Signature verified \\(cosign"),
-            "fleet probes must certify the fork's Sigstore verification"
+            unix_probe.contains("Signature verified (minisign key ")
+                && windows_probe.contains("Signature verified \\(minisign key "),
+            "fleet probes must certify minisign verification specifically, not a different signature mechanism"
         );
         assert!(
-            !unix_probe.contains("RESULT:signature_verified:SKIP")
-                && !windows_probe.contains("Emit 'signature_verified' 'SKIP'"),
+            !unix_probe.contains("RESULT:minisign_verified:SKIP")
+                && !windows_probe.contains("Emit 'minisign_verified' 'SKIP'"),
             "release probes must fail rather than skip missing signature evidence"
         );
     }

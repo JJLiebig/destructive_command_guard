@@ -43,10 +43,27 @@ macro_rules! dd_literal_word {
     };
 }
 
+// The input operand alone may also name its file through a plain parameter
+// expansion inside double quotes (`if="$f"`, `if="${dir}/$name.img"`, #633).
+// Inside double quotes an expansion is never field-split or globbed, so the
+// whole word stays ONE argv operand that starts with `if=`: it selects what dd
+// reads and cannot smuggle in an `of=`. Only `$name`, `${name}` and `$N` are
+// accepted. `"$@"` expands to one word per positional parameter even inside
+// quotes (`"$*"` is refused with it), and `$(…)`, backticks, `${x:-…}` forms
+// and backslashes are left to the evaluator. An unquoted
+// `if=$f` stays denied because field splitting can produce a second operand.
+macro_rules! dd_dynamic_input_operand {
+    () => {
+        r#"if="(?:[^"\\$`\r\n]|\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\}|[0-9]))*""#
+    };
+}
+
 macro_rules! dd_non_output_operand {
     () => {
         concat!(
-            r"(?:(?:if|ibs|obs|bs|cbs|skip|iseek|seek|oseek|count|conv|iflag|oflag|status)=",
+            r"(?:",
+            dd_dynamic_input_operand!(),
+            r"|(?:if|ibs|obs|bs|cbs|skip|iseek|seek|oseek|count|conv|iflag|oflag|status)=",
             dd_literal_word!(),
             r"|[0-9]*[<>]&(?:[0-9]+|-)|[0-9]*<[ \t]*",
             dd_literal_word!(),
@@ -227,9 +244,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // regular file or /dev/null, but do not mistake an input redirect for
         // an output. Quote capture keeps "/dev/null extra" from being exempted.
         // Pseudo-device names are exact; /dev/shm paths cannot escape via `..`.
+        // `/dev/kmsg` is the kernel log: each write() appends one record to
+        // the printk ring buffer and O_TRUNC does nothing to a character
+        // device, so tee into it changes no file or disk (#603). It is NOT
+        // in copy-to-device's list below: mv and install replace the
+        // destination node instead of writing through it.
         destructive_pattern!(
             "tee-device",
-            r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+(['"]?)/dev/(?!(?:(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx)|(?:fd|pts)/\d+)\1(?:\s|$|[|<>])|shm/(?!(?:[^\s'"]*/)?\.\.(?:/|\1(?:\s|$)))[^\s'"]*\1(?:\s|$|[|<>]))"#,
+            r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+(['"]?)/dev/(?!(?:(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx|kmsg)|(?:fd|pts)/\d+)\1(?:\s|$|[|<>])|shm/(?!(?:[^\s'"]*/)?\.\.(?:/|\1(?:\s|$)))[^\s'"]*\1(?:\s|$|[|<>]))"#,
             "tee/sponge into a device will OVERWRITE that device, exactly as dd would. Extremely dangerous!"
         ),
         // cp/mv/install write their LAST argument, so the device has to be in
@@ -372,10 +394,38 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // agent can run directly: `mke2fs` (ext2/3/4), `mkdosfs`, `mkntfs`,
         // `mkexfatfs`, and macOS `newfs_*`. `mke2fs /dev/sdb1` reached this
         // pack through `/dev/` and matched no rule, so it was allowed.
+        //
+        // These three rules are scoped to the program that runs (#600): a
+        // formatter's name anywhere on the line made `which mkfs.vfat
+        // mkfs.ext4`, `man mkswap wipefs` and `ls /sbin/mkfs.ext4 x` formats.
+        // The scope follows wrappers and launchers (`sudo`, `find -exec`,
+        // `xargs`, ...), so every spelling that runs the tool is still
+        // judged. It also names the programs that run a command line on
+        // another host or in a container (`ssh host mkfs.ext4 …`, `docker
+        // exec c wipefs …`) and `toybox`, which the unscoped rules covered.
         destructive_pattern!(
             "mkfs",
             r"(?:mkfs(?:\.[a-z0-9]+)?|mke2fs|mkdosfs|mkntfs|mkexfatfs|newfs(?:_[a-z0-9]+)?)\s+",
-            "mkfs formats a partition/device and ERASES all existing data."
+            "mkfs formats a partition/device and ERASES all existing data.",
+            executables = [
+                "mkfs",
+                "mkfs.*",
+                "mke2fs",
+                "mkdosfs",
+                "mkntfs",
+                "mkexfatfs",
+                "newfs",
+                "newfs_*",
+                "ssh",
+                "toybox",
+                "docker",
+                "podman",
+                "nerdctl",
+                "kubectl",
+                "oc",
+                "lxc",
+                "incus"
+            ]
         ),
         // mkswap (format as swap area). Same blast radius as mkfs: overwrites
         // any existing data on the target device. Shipped as its own rule
@@ -383,13 +433,21 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "mkswap",
             r"mkswap\s+",
-            "mkswap formats a partition as a swap area, ERASING any existing data."
+            "mkswap formats a partition as a swap area, ERASING any existing data.",
+            executables = [
+                "mkswap", "ssh", "toybox", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc",
+                "incus"
+            ]
         ),
         // wipefs
         destructive_pattern!(
             "wipefs",
             r"wipefs\s+",
-            "wipefs removes filesystem signatures. Use with extreme caution."
+            "wipefs removes filesystem signatures. Use with extreme caution.",
+            executables = [
+                "wipefs", "ssh", "toybox", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc",
+                "incus"
+            ]
         ),
         // mount with potentially dangerous options
         destructive_pattern!(
@@ -397,10 +455,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r#"mount\s+.*--bind\s+.*\s+['"]?/(?:$|[^a-z])"#,
             "mount --bind to root directory can have system-wide effects."
         ),
-        // umount -f (force)
+        // umount -f (force). The flag must be an option word of this umount
+        // command (#548): one shell word per `[ \t]+`-separated token, ended by
+        // an unquoted `;`, `&`, `|` or newline, and the flag must start a word,
+        // so `-f` inside an operand (`/mnt/drill-f`) or a later command's word
+        // (`; ip netns delete drill-firewall-test`) no longer counts.
         destructive_pattern!(
             "umount-force",
-            r"umount\s+.*-[a-z]*f",
+            r#"\bumount(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+(?:\$?['"])?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
             "umount -f force unmounts which may cause data loss if device is in use."
         ),
         // losetup can be dangerous
@@ -1427,6 +1489,32 @@ mod tests {
     }
 
     #[test]
+    fn umount_force_flag_must_belong_to_the_umount_command_548() {
+        let pack = create_pack();
+        for command in [
+            "sudo umount /mnt/x",
+            "sudo umount /mnt/x; sudo ip netns delete drill-firewall-test",
+            "umount /mnt/drill-f",
+            "umount /mnt/x && grep -f patterns.txt file.txt",
+            "umount /mnt/x\ngrep -f patterns.txt file.txt",
+        ] {
+            assert_allows(&pack, command);
+        }
+        for command in [
+            "sudo umount -f /mnt/x",
+            "umount --force /mnt/x",
+            "umount -lf /mnt/x",
+            "umount /mnt/x -f",
+            "umount -Rf /mnt",
+            "ls; umount -f /mnt/x",
+            "umount $'-f' /mnt/x",
+            "umount $\"-lf\" /mnt/x",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "umount-force");
+        }
+    }
+
+    #[test]
     fn umount_force_still_reachable_after_mount_keyword_swap_issue_441() {
         // `umount` contains `mount`, and keyword matching is substring-based,
         // so replacing the row's `umount` entry with `mount` kept #323's rule
@@ -1476,12 +1564,49 @@ mod tests {
         // requires `mkswap\s+` so a hyphenated/embedded mention does not match.
         assert_no_match(&pack, "cat mkswap-readme.md");
         assert_no_match(&pack, "ls /usr/share/doc/mkswap");
-        // Note: `echo mkswap is dangerous` matches at the raw-pack level
-        // because the regex sees `mkswap ` (the space is the second token
-        // separator). The evaluator's echo/printf args-data sanitize layer
-        // masks that text before pack evaluation, so the full pipeline still
-        // allows the command — exercised in
-        // scripts/e2e_destructive_equivalents.sh::scenario_system_disk_default.
+        // The rule is scoped to the mkswap program (#600), so the pack itself
+        // no longer reads `mkswap ` in echoed text as the command.
+        assert_no_match(&pack, "echo mkswap is dangerous");
+    }
+
+    /// #600: the formatter rules matched a tool's name anywhere on the line,
+    /// so a lookup naming two tools, a manual page or a directory listing was
+    /// refused as a format. They now judge the program that runs, through the
+    /// wrappers and launchers that run it.
+    #[test]
+    fn formatter_rules_judge_the_program_that_runs_issue_600() {
+        let pack = create_pack();
+        for command in [
+            "which mkfs.vfat mkfs.ext4",
+            "type mkfs.ext4 mkswap",
+            "whereis wipefs mkfs.ext4",
+            "man mkswap wipefs",
+            "ls /sbin/mkfs.vfat /sbin/mkfs.ext4",
+            "cat mkfs.ext4 notes.txt",
+            "tool --no-mkfs /tmp/x",
+        ] {
+            assert_no_match(&pack, command);
+        }
+        for (command, rule) in [
+            ("mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("sudo mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("/sbin/mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("mkfs -t ext4 /dev/sdb1", "mkfs"),
+            ("mke2fs /dev/sdb1", "mkfs"),
+            ("newfs_hfs /dev/disk2s1", "mkfs"),
+            ("find /dev -name 'sd?' -exec mkfs.ext4 {} \\;", "mkfs"),
+            ("ssh host mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("docker run --privileged alpine mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("busybox mkfs.ext2 /dev/sdb1", "mkfs"),
+            ("mkswap /dev/sdb2", "mkswap"),
+            ("toybox mkswap /dev/sdb2", "mkswap"),
+            ("timeout 60 mkswap /dev/sdb2", "mkswap"),
+            ("wipefs -a /dev/sdb", "wipefs"),
+            ("printf '/dev/sdb\\n' | xargs wipefs -a", "wipefs"),
+            ("kubectl exec pod -- wipefs -a /dev/sdb", "wipefs"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
     }
 
     #[test]
@@ -1630,6 +1755,57 @@ mod tests {
     }
 
     #[test]
+    fn dd_discard_accepts_a_quoted_parameter_input_issue_633() {
+        let pack = create_pack();
+        // A double-quoted parameter expansion is one argv word that starts
+        // with `if=`: it chooses what dd reads, never where it writes.
+        for command in [
+            r#"dd if="$f" of=/dev/null bs=4M"#,
+            r#"dd if="$f" of=/dev/null bs=4M count=100"#,
+            r#"dd if="${f}" of=/dev/null"#,
+            r#"dd if="$dir/${name}.img" of=/dev/null status=progress"#,
+            r#"dd if="$1" of=/dev/null"#,
+            r#"dd of=/dev/null if="$f""#,
+            r#"sudo dd if="$DEV" of=/dev/null bs=1M count=10"#,
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+        // Everything that could add an operand, run code, or move the
+        // dynamic word to the output side keeps the deny.
+        for command in [
+            // Unquoted: field splitting can yield a second `of=`.
+            "dd if=$f of=/dev/null",
+            "dd if=${f} of=/dev/null",
+            // `"$@"` expands to one word per parameter even inside quotes;
+            // `"$*"` is refused with it.
+            r#"dd if="$@" of=/dev/null"#,
+            r#"dd if="$*" of=/dev/null"#,
+            // Command substitution and backticks run code.
+            r#"dd if="$(pick)" of=/dev/null"#,
+            r#"dd if="`pick`" of=/dev/null"#,
+            // Operator expansions are left to the evaluator.
+            r#"dd if="${f:-/dev/sda}" of=/dev/null"#,
+            // A dynamic word anywhere but `if=` is not accepted.
+            r#"dd if=/dev/zero of="$f""#,
+            r#"dd if="$f" of="$g""#,
+            r#"dd bs="$bs" if=x of=/dev/null"#,
+            // A real device output after the discard target still denies.
+            r#"dd if="$f" of=/dev/null of=/dev/sda"#,
+            r#"dd if="$f" of=/dev/sda"#,
+        ] {
+            assert!(!pack.matches_safe(command), "exempted: {command}");
+        }
+        for command in [
+            r#"dd if="$f" of=/dev/sda"#,
+            r#"dd if="$f" of=/dev/null of=/dev/sda"#,
+            r#"dd if="$f" of="/dev/disk2""#,
+        ] {
+            assert_blocks_with_pattern(&pack, command, "dd-device");
+        }
+    }
+
+    #[test]
     fn pseudo_devices_do_not_hide_other_writer_targets_issue_444() {
         let pack = create_pack();
         for command in [
@@ -1662,6 +1838,42 @@ mod tests {
             "cp file /dev/shm/buffer",
         ] {
             assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn tee_into_kernel_log_is_allowed_issue_603() {
+        let pack = create_pack();
+        // A tee into the kernel log appends a printk record; it overwrites
+        // no device the way dd would.
+        for command in [
+            "printf x | sudo tee /dev/kmsg",
+            "printf '<4>x\\n' | sudo tee /dev/kmsg >/dev/null",
+            "printf x | tee -a /dev/kmsg",
+            "printf x | tee '/dev/kmsg'",
+            "printf x | tee out.log /dev/kmsg",
+        ] {
+            assert_allows(&pack, command);
+        }
+        // The carve-out is the exact name only, and does not shield another
+        // device operand on the same tee.
+        for command in [
+            "printf x | tee /dev/kmsg /dev/sda",
+            "printf x | tee /dev/kmsg.bak",
+            "printf x | tee /dev/kmsgx",
+            "printf x | tee '/dev/kmsg extra'",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "tee-device");
+        }
+        // mv/install replace the node rather than write through it, so the
+        // copy rule keeps kmsg out of its pseudo-device list, and dd stays
+        // gated as before.
+        for (command, rule) in [
+            ("mv file /dev/kmsg", "copy-to-device"),
+            ("install file /dev/kmsg", "copy-to-device"),
+            ("printf x | sudo dd of=/dev/kmsg", "dd-device"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
         }
     }
 

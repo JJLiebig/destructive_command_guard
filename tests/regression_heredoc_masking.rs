@@ -143,6 +143,10 @@ EOF";
             // These assert semantics and rule ownership. The process-per-hook
             // performance harness exercises the shipped budgets separately.
             .env("DCG_AST_TIMEOUT_MS", "5000")
+            // Heredoc extraction has its own 50 ms wall clock, and the AST
+            // budget does not cover it; under load it answered
+            // `heredoc.shell:incomplete-analysis` (bd-e1xl).
+            .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
             .current_dir(temporary.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -328,6 +332,142 @@ EOF";
     }
 
     #[test]
+    fn written_script_arguments_cannot_skip_python_and_node_safety_checks() {
+        for (body, consumer, expected_rule) in [
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 /tmp/program argument",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 -I /tmp/program",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 -IuB -- /tmp/program --argument",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 /tmp/program \"$USER\"",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 -I /tmp/program \"$@\" $1",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node /tmp/program argument",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node -- /tmp/program --eval",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node --no-warnings /tmp/program argument",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node /tmp/program \"${USER}\"",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node -- /tmp/program *.txt",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+        ] {
+            for writer in [
+                "tee /tmp/program <<'EOF' >/dev/null",
+                "cat >/tmp/program <<'EOF'",
+            ] {
+                let command = format!("{writer}\n{body}\nEOF\n{consumer}");
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(
+                    decision, "deny",
+                    "script arguments cannot hide source: {command:?}"
+                );
+                assert_eq!(
+                    rule, expected_rule,
+                    "typed safety check required: {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn written_script_arguments_preserve_safe_programs_and_document_data() {
+        for command in [
+            "tee /tmp/program <<'EOF' >/dev/null\nprint('hello')\nEOF\npython3 -I /tmp/program argument",
+            "cat >/tmp/program <<'EOF'\nprint('hello')\nEOF\npython3 -- /tmp/program --argument",
+            "tee /tmp/program <<'EOF' >/dev/null\nconsole.log('hello');\nEOF\nnode -- /tmp/program argument",
+            "tee /tmp/program <<'EOF' >/dev/null\nconsole.log('hello');\nEOF\nnode --no-warnings /tmp/program argument",
+            "tee /tmp/program <<'EOF' >/dev/null\nprint('hello')\nEOF\npython3 /tmp/program \"$USER\"",
+            "tee /tmp/program <<'EOF' >/dev/null\nconsole.log('hello');\nEOF\nnode /tmp/program \"$@\"",
+            "tee /tmp/program <<'EOF' >/dev/null\nimport shutil\nshutil.rmtree('/home/user')\nEOF\ncat /tmp/program",
+            "tee /tmp/program <<'EOF' >/dev/null\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF\nwc -l /tmp/program",
+            "tee /tmp/program <<'EOF' >/dev/null\nimport shutil\nshutil.rmtree('/home/user')\nEOF\npython3 -c 'print(1)' /tmp/program \"$USER\"",
+            "tee /tmp/program <<'EOF' >/dev/null\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF\nnode -e 'console.log(1)' /tmp/program \"$USER\"",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "allow", "{command:?}: {rule}");
+        }
+    }
+
+    #[test]
+    fn written_script_arguments_keep_executed_substitutions_visible() {
+        for (body, consumer) in [
+            (
+                "print('hello')",
+                "python3 /tmp/program \"$(git reset --hard)\"",
+            ),
+            (
+                "console.log('hello');",
+                "node -- /tmp/program \"$(git reset --hard)\"",
+            ),
+        ] {
+            let command = format!("tee /tmp/program <<'EOF' >/dev/null\n{body}\nEOF\n{consumer}");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "deny", "{command:?}: {rule}");
+            assert_eq!(rule, "core.git:reset-hard", "{command:?}");
+        }
+    }
+
+    #[test]
+    fn written_script_arguments_keep_print_and_execution_roles_distinct() {
+        for consumer in [
+            "node /tmp/program.js argument",
+            "node --no-warnings -- /tmp/program.js argument",
+            "node /tmp/program.js \"$USER\"",
+        ] {
+            for (body, expected) in [
+                ("console.log('git reset --hard');", "allow"),
+                (
+                    "require('child_process').execSync('git reset --hard');",
+                    "deny",
+                ),
+                (
+                    "console.log('git reset --hard');\nrequire('fs').rmSync('/home/user', {recursive: true});",
+                    "deny",
+                ),
+            ] {
+                let command =
+                    format!("tee /tmp/program.js <<'EOF' >/dev/null\n{body}\nEOF\n{consumer}");
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(decision, expected, "{command:?}: {rule}");
+            }
+        }
+    }
+
+    #[test]
     fn issue_540_literal_tee_output_paths_keep_their_interpreter_identity() {
         for (writer, consumer) in [
             ("tee /tmp/program.py <<'PY'", "python3 /tmp/program.py"),
@@ -451,6 +591,38 @@ EOF";
                 decision, "deny",
                 "real shell evidence must survive: {command:?}: {rule}"
             );
+        }
+    }
+
+    /// #583 row 4: the consumer chained with `&&` on the heredoc line runs
+    /// the written program exactly like a consumer on the next line.
+    #[test]
+    fn issue_583_heredoc_line_consumer_runs_the_written_program() {
+        for command in [
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nconst label = (u) => `${u.name}`;\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nconst label = 'name';\nEOF",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "allow", "{command:?}: {rule}");
+        }
+        for command in [
+            "cat > /tmp/x/a.sh <<'EOF' && bash /tmp/x/a.sh\nrm -rf /home/user\nEOF",
+            "cat > /tmp/x/a.sh <<'EOF' && bash /tmp/x/a.sh\necho bad > $TARGET\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' || node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' | node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js && bash /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF\nbash /tmp/x/a.js",
+            "cat > /tmp/x/a.js <<'EOF' && node $F\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nrequire('child_process').execSync('echo bad > /etc/passwd');\nEOF",
+            // Allowed unseen before: the written program never reached its
+            // language's checks in this shape.
+            "cat > /tmp/x/a.py <<'EOF' && python3 /tmp/x/a.py\nimport shutil\nshutil.rmtree('/home/user')\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "deny", "must deny {command:?}: {rule}");
+            assert!(!rule.is_empty(), "denial must name its rule: {command:?}");
         }
     }
 
@@ -600,6 +772,32 @@ EOF";
                 );
             }
         }
+    }
+
+    /// A quoted `<<` earlier in the command swallowed the real operator into
+    /// the extractor's delimiter, so the program the heredoc runs was never
+    /// read: allowed by 0.16.0, denied by 0.15.3.
+    #[test]
+    fn quoted_operator_text_before_an_interpreter_heredoc_stays_denied() {
+        for (program, body) in [
+            (
+                "python3",
+                "import subprocess\nsubprocess.run('git reset --hard', shell=True)",
+            ),
+            (
+                "node",
+                "require('child_process').execSync('git reset --hard');",
+            ),
+        ] {
+            for prefix in ["echo '<<'; ", "grep -c '<<' notes.txt; ", "x='<<'; "] {
+                let command = format!("{prefix}{program} - <<'EOF'\n{body}\nEOF");
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(decision, "deny", "{command:?}: {rule}");
+            }
+        }
+        let command = "echo '<<'; python3 - <<'EOF'\nprint('hello')\nEOF";
+        let (decision, rule) = hook_decision(command);
+        assert_eq!(decision, "allow", "{command:?}: {rule}");
     }
 
     #[test]
@@ -1031,14 +1229,23 @@ EOF";
 
     #[test]
     fn issue_544_tagged_templates_do_not_invent_cooked_shell_commands() {
-        for (body, expected) in [
+        for (body, expected, denying_rule) in [
             (
                 r"const s = String.raw`echo \`git branch -d x\``; require('child_process').execSync(s);",
                 "allow",
+                "",
             ),
             (
                 r"const s = `echo \`git branch -d x\``; require('child_process').execSync(s);",
                 "deny",
+                "core.git:branch-delete",
+            ),
+            // Without an escape a tag's raw and cooked pieces are identical,
+            // and a shell tag (zx's or Bun's `$`) runs exactly those bytes.
+            (
+                "const {$} = require('zx'); $`echo $(git reset --hard)`;",
+                "deny",
+                "core.git:reset-hard",
             ),
         ] {
             let command = format!("node - <<'JS'\n{body}\nJS");
@@ -1048,7 +1255,33 @@ EOF";
                 "raw and ordinary templates produce different shell values: {command:?}: {rule}"
             );
             if expected == "deny" {
-                assert_eq!(rule, "core.git:branch-delete", "{command:?}");
+                assert_eq!(rule, denying_rule, "{command:?}");
+            }
+        }
+        // The inline program reaches only this recovery: the outer shell sees
+        // one single-quoted word. Both denials were ALLOWED while every
+        // tagged template was skipped, escaped or not.
+        for (command, expected, denying_rule) in [
+            (
+                r#"node -e 'const {$} = require("zx"); $`echo $(git reset --hard)`'"#,
+                "deny",
+                "core.git:reset-hard",
+            ),
+            (
+                "node -e 'tag`echo $(git reset --hard)`'",
+                "deny",
+                "core.git:reset-hard",
+            ),
+            (
+                r#"node -e 'const s = String.raw`echo \`git branch -d x\``; require("child_process").execSync(s);'"#,
+                "allow",
+                "",
+            ),
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, expected, "{command:?}: {rule}");
+            if expected == "deny" {
+                assert_eq!(rule, denying_rule, "{command:?}");
             }
         }
     }
@@ -1384,6 +1617,121 @@ EOF";
                         assert_eq!(rule, "heredoc.python:shutil_rmtree", "{command:?}");
                     }
                 }
+            }
+        }
+    }
+
+    /// A heredoc body is raw text to the shell: a quote, substitution or
+    /// expansion it leaves open ends with it, and the lines after its
+    /// terminator run as commands. An apostrophe in a body line (`it's`) used
+    /// to read as a quote running to the end of the input, which hid every
+    /// later command; a body that is only data keeps what follows allowed.
+    #[test]
+    fn an_open_quote_in_a_heredoc_body_hides_no_later_command() {
+        let config = Config::default();
+        for body in [
+            "echo it's",
+            "We don't need this.",
+            "say \"hi",
+            "run `make",
+            "path ${HOME",
+        ] {
+            for (opener, terminator) in [
+                ("cat > notes.md <<'EOF'", "EOF"),
+                ("cat > notes.md <<\"EOF\"", "EOF"),
+                ("tee notes.md <<'EOF' >/dev/null", "EOF"),
+                ("cat > notes.md <<-'EOF'", "\tEOF"),
+                ("cat >a <<'A'; cat >b <<'B'\nx's\nA", "B"),
+                ("x=$(cat <<'EOF'", "EOF\n)"),
+            ] {
+                for (tail, denied) in [
+                    ("rm -rf ~", true),
+                    ("git reset --hard", true),
+                    ("ls -la", false),
+                ] {
+                    let command = format!("{opener}\n{body}\n{terminator}\n{tail}");
+                    let result = evaluate_detailed(&command, &config).result;
+                    assert_eq!(result.is_denied(), denied, "{command:?}: {result:?}");
+                }
+            }
+        }
+        for command in [
+            "cat > notes.md <<'EOF'\necho it's\nEOF\nrm -rf ~",
+            "cat > notes.md <<'EOF'\nWe don't need this.\nEOF\ngit reset --hard",
+        ] {
+            assert_eq!(hook_decision(command).0, "deny", "{command:?}");
+        }
+        assert_eq!(
+            hook_decision("cat > notes.md <<'EOF'\nWe don't need this.\nEOF\ngit status").0,
+            "allow"
+        );
+    }
+
+    /// With an unquoted delimiter, bash and zsh end a heredoc body at a line
+    /// they join across a backslash-newline (`E\` followed by `OF` ends an
+    /// `EOF` body), and run the lines after it as commands, up to and past a
+    /// raw `EOF` line. The parse tree and the heredoc extractor used to read
+    /// the body on to that raw line, which hid them. A quoted delimiter joins
+    /// no lines.
+    #[test]
+    fn a_terminator_joined_across_a_line_continuation_ends_the_body() {
+        let config = Config::default();
+        for (tail, denied) in [
+            ("rm -rf ~", true),
+            ("git reset --hard", true),
+            ("ls -la", false),
+        ] {
+            for (command, runs) in [
+                (format!("cat <<EOF >notes.md\nE\\\nOF\n{tail}\nEOF"), true),
+                (format!("cat <<EOF\nE\\\nOF\n{tail}\nEOF"), true),
+                (
+                    format!("tee notes.md <<EOF >/dev/null\nE\\\nOF\n{tail}\nEOF"),
+                    true,
+                ),
+                (
+                    format!("cat <<'EOF' >notes.md\nE\\\nOF\n{tail}\nEOF"),
+                    false,
+                ),
+            ] {
+                let result = evaluate_detailed(&command, &config).result;
+                assert_eq!(
+                    result.is_denied(),
+                    denied && runs,
+                    "{command:?}: {result:?}"
+                );
+            }
+        }
+        assert_eq!(
+            hook_decision("cat <<EOF >notes.md\nE\\\nOF\nrm -rf ~\nEOF").0,
+            "deny"
+        );
+    }
+
+    /// Bodies nested in bodies that bash and dash end at different lines
+    /// double the readers' work at every level, so past a few levels they
+    /// stop. An apostrophe in such a body must still hide no command after
+    /// the last terminator line, however deep the nesting.
+    #[test]
+    fn nested_disputed_bodies_hide_no_later_command_at_any_depth() {
+        use std::fmt::Write as _;
+        let config = Config::default();
+        for levels in [2usize, 8, 12, 40] {
+            let mut nested = String::new();
+            for level in 0..levels {
+                let _ = writeln!(nested, "cat <<$'L{level}'");
+            }
+            nested.push_str("echo it's\n");
+            for level in (0..levels).rev() {
+                let _ = writeln!(nested, "L{level}\n$L{level}");
+            }
+            for (tail, denied) in [("rm -rf ~", true), ("ls -la", false)] {
+                let command = format!("{nested}{tail}");
+                let result = evaluate_detailed(&command, &config).result;
+                assert_eq!(
+                    result.is_denied(),
+                    denied,
+                    "{levels} levels, {tail:?}: {result:?}"
+                );
             }
         }
     }

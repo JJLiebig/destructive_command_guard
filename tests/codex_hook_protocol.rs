@@ -197,6 +197,18 @@ fn build_claude_payload(command: &str) -> String {
     )
 }
 
+/// Point a payload's `cwd` at a directory that exists.
+///
+/// Allow-once codes and pending records are scoped to the payload `cwd`, and
+/// dcg fails closed (a deny with no code and no record) when that `cwd` is not
+/// a real directory (#387). Tests of the allow-once flow therefore cannot use
+/// the builders' fixed `/tmp/test-workdir`, which exists only by accident.
+fn with_payload_cwd(payload: &str, cwd: &std::path::Path) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(payload).expect("hook payload");
+    payload["cwd"] = serde_json::json!(cwd);
+    payload.to_string()
+}
+
 /// Build a complete Gemini CLI `BeforeTool` payload for `run_shell_command`.
 fn build_gemini_payload(command: &str) -> String {
     let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
@@ -483,6 +495,12 @@ fn codex_ask_capability_selects_decision() {
         );
     }
 
+    let mut safe_payload: serde_json::Value =
+        serde_json::from_str(&build_codex_payload("git status")).unwrap();
+    safe_payload["permission_decision_ask_supported"] = true.into();
+    let outcome = run_hook_raw(&serde_json::to_vec(&safe_payload).unwrap(), &[]);
+    assert!(outcome.is_allow_shape(), "safe Codex++ command\n{outcome}");
+
     let big_command = "echo ".to_string() + &"A".repeat(70 * 1024);
     let mut payload: serde_json::Value =
         serde_json::from_str(&build_codex_payload(&big_command)).unwrap();
@@ -549,6 +567,54 @@ fn smoke_claude_destructive_command_blocked() {
         outcome.is_claude_block_shape(),
         "destructive command via Claude should produce exit 0 + hookSpecificOutput JSON\n{outcome}"
     );
+}
+
+/// The native Bash hook keeps the caller's POSIX quoting. Pack-only tests did
+/// not catch the path where raw quoted argv0 skipped both unlink rules (#550).
+#[test]
+fn claude_hook_quoted_unlink_keeps_destructive_commands_blocked_issue_550() {
+    for command in [
+        "'unlink' /home/user/notes.txt",
+        "\"unlink\" /etc/passwd",
+        "u'n'l'i'n'k' /etc/passwd",
+        "'/usr/bin/unlink' /etc/passwd",
+        "sudo 'unlink' /etc/passwd",
+        "'unlink' /tmp/scratch; 'unlink' /etc/passwd",
+    ] {
+        let outcome = run_claude_hook(command);
+        assert!(
+            outcome.is_claude_block_shape(),
+            "quoted unlink must deny {command:?}\n{outcome}"
+        );
+        let json = outcome.stdout_json();
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{command:?}\n{outcome}"
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["ruleId"], "core.filesystem:unlink-root-home",
+            "the unlink rule must run, not merely exhaust the budget: {command:?}\n{outcome}"
+        );
+    }
+}
+
+#[test]
+fn claude_hook_quoted_unlink_keeps_data_and_literal_temp_exceptions_issue_550() {
+    for command in [
+        "ob sync-unlink --path /home/user/vault",
+        "foo --unlink /tmp/x",
+        "cat unlink /tmp/x",
+        "'unlink' /tmp/scratch",
+        "u'n'l'i'n'k' -- /var/tmp/cache",
+        "'unlink' '/tmp/file with spaces'",
+        "'unlink' --help",
+    ] {
+        let outcome = run_claude_hook(command);
+        assert!(
+            outcome.is_allow_shape(),
+            "data or a literal temp/help unlink must remain allowed: {command:?}\n{outcome}"
+        );
+    }
 }
 
 /// Regression for #125 (part b, dcg-side): on Windows, Codex executes shell
@@ -1191,7 +1257,12 @@ fn claude_deny_matrix_multiple_destructive_commands() {
     ];
 
     for (cmd, expected_pack_fragment) in commands {
-        let outcome = run_claude_hook(cmd);
+        let workdir = tempfile::tempdir().expect("tempdir");
+        let payload = with_payload_cwd(&build_claude_payload(cmd), workdir.path());
+        let outcome = run_hook_raw(
+            payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        );
         assert_eq!(
             outcome.exit_code, 0,
             "Claude deny must exit 0 for '{cmd}'\n{outcome}"
@@ -1621,7 +1692,8 @@ fn claude_allow_once_round_trip() {
     let home_path = home.path().to_path_buf();
     let system_path = std::env::var("PATH").unwrap_or_default();
 
-    let deny_payload = build_claude_payload("git reset --hard HEAD~1");
+    let deny_payload =
+        with_payload_cwd(&build_claude_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -1688,7 +1760,8 @@ fn claude_allow_once_round_trip() {
     );
 
     // Step 3: Retry the same command — should now be allowed
-    let retry_payload = build_claude_payload("git reset --hard HEAD~1");
+    let retry_payload =
+        with_payload_cwd(&build_claude_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -2552,6 +2625,23 @@ fn codex_allow_once_unknown_dialect_round_trip() {
 }
 
 #[test]
+fn codex_allow_once_unknown_computed_command_round_trip() {
+    // Only the concrete PowerShell replay resolves this callee. Its derived
+    // command spelling must neither borrow nor consume the original grant.
+    assert_codex_allow_once_round_trip(
+        "launch-process",
+        "& ('gi'+'t') reset --hard HEAD~1",
+        &[
+            "& ('gi'+'t') reset --hard HEAD~2",
+            "& 'git' reset --hard HEAD~1",
+            "git reset --hard HEAD~1",
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
+#[test]
 fn codex_allow_once_preserves_raw_diagnostic_prefix() {
     // Diagnostic text is masked during rule matching. The grant still binds
     // to the entire raw input, including the inert diagnostic arguments.
@@ -3257,7 +3347,13 @@ fn redirected_home_receives_every_hook_write() {
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(build_claude_payload("git reset --hard HEAD~1").as_bytes())
+        .write_all(
+            with_payload_cwd(
+                &build_claude_payload("git reset --hard HEAD~1"),
+                home.path(),
+            )
+            .as_bytes(),
+        )
         .unwrap();
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

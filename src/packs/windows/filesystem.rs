@@ -33,7 +33,10 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 const MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES: usize = 64 * 1024;
-const MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS: usize = 128;
+// #647: long scripts with quoted filesystem words still need their segments
+// analyzed. Admit up to 512 without changing the byte/word limits or the
+// existing incomplete-analysis fallback above the segment bound.
+const MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS: usize = 512;
 const MAX_WINDOWS_FILESYSTEM_SEMANTIC_TOKENS: usize = 512;
 
 pub(crate) const WINDOWS_FILESYSTEM_UNVERIFIED_RULE: &str =
@@ -45,12 +48,23 @@ const WINDOWS_FILESYSTEM_UNVERIFIED_REASON: &str = "The Windows filesystem comma
 /// `Unverified` is intentionally distinct from `NoMatch`: the former means a
 /// protected executable or destructive option can be produced only after
 /// runtime shell expansion, so the evaluator must fail closed.
+///
+/// `Incomplete` is distinct from both: the whole-command size or statement
+/// bound stopped the pass before it inspected every statement, so it found
+/// neither a protected role nor proof of its absence. That is an incomplete
+/// analysis, not evidence about any rule, and attributing it to
+/// `windows-filesystem-semantic-unverified` named a finding that did not
+/// exist (#569: 29 lines of quoted Python tuples crossed the statement bound
+/// where 28 did not). The evaluator still runs this pack's patterns, so a
+/// visible destructive spelling denies under its own rule, and otherwise
+/// returns the configured incomplete-analysis outcome (`Indeterminate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowsFilesystemSemanticDecision {
     NoMatch,
     Safe,
     Destructive(&'static str),
     Unverified,
+    Incomplete,
 }
 
 #[derive(Debug, Default)]
@@ -60,9 +74,14 @@ struct PowerShellCallOperatorAnalysis {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WindowsFilesystemWord {
-    decoded: String,
-    dynamic: bool,
+pub(super) struct WindowsFilesystemWord {
+    pub(super) decoded: String,
+    pub(super) dynamic: bool,
+    pub(super) may_split: bool,
+    // Cmd expands percent references before quote/caret processing. Retain
+    // their source-owned holes so later matching cannot mistake a quoted
+    // caret or an escaped exclamation mark for another runtime expansion.
+    cmd_fragments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -221,8 +240,9 @@ const POWERSHELL_PROTECTED_EXECUTABLES: &[&str] = &[
 /// accelerator spelling) with a literally-true second argument, anchored to the
 /// start of a word token by the semantic caller. PowerShell type literals are
 /// case-insensitive and tolerate whitespace around `[`, `]`, and `::`.
+/// Literal single- or double-quoted method names invoke the same member.
 static DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION: LazyCompiledRegex = LazyCompiledRegex::new(
-    r#"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
+    r#"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*(?:delete|'delete'|"delete")\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
 );
 
 /// Any `[System.IO.Directory]::Delete(...)` call, anchored to a word start.
@@ -230,15 +250,16 @@ static DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION: LazyCompiledRegex = LazyCom
 /// whose second argument is dynamic — PowerShell coerces any truthy value
 /// (including every non-empty string) to `$true`, so an unresolved flag must
 /// still be reviewed.
-static DOTNET_DIRECTORY_DELETE_EXPRESSION: LazyCompiledRegex =
-    LazyCompiledRegex::new(r"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\(");
+static DOTNET_DIRECTORY_DELETE_EXPRESSION: LazyCompiledRegex = LazyCompiledRegex::new(
+    r#"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*(?:delete|'delete'|"delete")\s*\("#,
+);
 
 /// `<DirectoryInfo>.Delete($true)` instance-method spelling, for example
 /// `(Get-Item $path).Delete($true)` or a `[System.IO.DirectoryInfo]` variable.
 /// `$true` is required so that unrelated `.delete(...)` member calls in inline
 /// scripts of other languages do not match.
 static DIRECTORYINFO_DELETE_RECURSIVE_MEMBER: LazyCompiledRegex =
-    LazyCompiledRegex::new(r"(?i)\.\s*delete\s*\(\s*\$true\s*\)");
+    LazyCompiledRegex::new(r#"(?i)\.\s*(?:delete|'delete'|"delete")\s*\(\s*\$true\s*\)"#);
 
 fn syntax_is_incomplete(raw: &str, dialect: ShellDialect) -> bool {
     let mut chars = raw.chars().peekable();
@@ -335,7 +356,71 @@ fn decode_syntax_word(
         .map(|decoded| WindowsFilesystemWord {
             decoded: decoded.into_owned(),
             dynamic,
+            may_split: false,
+            cmd_fragments: None,
         })
+}
+
+/// Share the Windows symbolic-word matcher with native recovery commands while
+/// retaining Cmd expansion provenance from the raw word. Percent expansion
+/// precedes caret removal, and variable names themselves are opaque text.
+pub(super) fn decode_cmd_symbolic_word(
+    decoder: &mut ShellTokenDecoder,
+    raw: &str,
+) -> Option<WindowsFilesystemWord> {
+    let mut word = decode_syntax_word(decoder, raw, ShellDialect::Cmd)?;
+    let (fragments, may_split) = cmd_symbolic_fragments(raw);
+    word.dynamic |= fragments.len() > 1;
+    word.may_split = may_split;
+    word.cmd_fragments = Some(fragments);
+    Some(word)
+}
+
+fn cmd_symbolic_fragments(raw: &str) -> (Vec<String>, bool) {
+    let mut fragments = vec![String::new()];
+    let mut chars = raw.char_indices().peekable();
+    let mut double = false;
+    let mut may_split = false;
+    while let Some((index, ch)) = chars.next() {
+        if let Some(end) = crate::normalize::cmd_expansion_end(raw.as_bytes(), index) {
+            may_split |= !double;
+            fragments.push(String::new());
+            while chars.peek().is_some_and(|(at, _)| *at < end) {
+                chars.next();
+            }
+            continue;
+        }
+        match ch {
+            '"' => double = !double,
+            '^' if !double => {
+                let Some((escaped_at, escaped)) = chars.next() else {
+                    fragments.push(String::new());
+                    break;
+                };
+                if escaped == '%'
+                    && let Some(end) =
+                        crate::normalize::cmd_expansion_end(raw.as_bytes(), escaped_at)
+                {
+                    may_split = true;
+                    fragments.push(String::new());
+                    while chars.peek().is_some_and(|(at, _)| *at < end) {
+                        chars.next();
+                    }
+                } else if escaped == '\n' {
+                } else if escaped == '\r' && chars.peek().is_some_and(|(_, next)| *next == '\n') {
+                    chars.next();
+                } else if let Some(fragment) = fragments.last_mut() {
+                    fragment.push(escaped);
+                }
+            }
+            _ => {
+                if let Some(fragment) = fragments.last_mut() {
+                    fragment.push(ch);
+                }
+            }
+        }
+    }
+    (fragments, may_split)
 }
 
 fn dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
@@ -421,7 +506,7 @@ fn dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
     }
 }
 
-fn symbolic_word_may_equal(
+pub(super) fn symbolic_word_may_equal(
     word: &WindowsFilesystemWord,
     dialect: ShellDialect,
     candidate: &str,
@@ -429,9 +514,16 @@ fn symbolic_word_may_equal(
     if !word.dynamic {
         return word.decoded.eq_ignore_ascii_case(candidate);
     }
-    let decoded = word.decoded.to_ascii_lowercase();
     let candidate = candidate.to_ascii_lowercase();
-    let fragments = dynamic_fragments(&decoded, dialect);
+    let fragments = word.cmd_fragments.as_ref().map_or_else(
+        || dynamic_fragments(&word.decoded.to_ascii_lowercase(), dialect),
+        |fragments| {
+            fragments
+                .iter()
+                .map(|fragment| fragment.to_ascii_lowercase())
+                .collect()
+        },
+    );
     let Some(first) = fragments.first() else {
         return true;
     };
@@ -455,16 +547,56 @@ fn symbolic_word_may_equal(
     offset <= candidate.len().saturating_sub(last.len())
 }
 
-fn executable_word(word: WindowsFilesystemWord, dialect: ShellDialect) -> WindowsFilesystemWord {
+pub(super) fn executable_word(
+    word: WindowsFilesystemWord,
+    dialect: ShellDialect,
+) -> WindowsFilesystemWord {
     let decoded = if dialect == ShellDialect::Cmd {
         word.decoded.trim_start_matches('@')
     } else {
         word.decoded.as_str()
     };
-    let basename = decoded.rsplit(['/', '\\']).next().unwrap_or(decoded);
+    // A path separator inside an expansion is part of a variable's name, not
+    // evidence that argv0 has changed directories. Keep the symbolic spelling
+    // intact until a literal path separator establishes its basename.
+    let basename = if dialect == ShellDialect::Cmd && word.cmd_fragments.is_some() {
+        let bytes = decoded.as_bytes();
+        let mut start = 0usize;
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if let Some(end) = crate::normalize::cmd_expansion_end(bytes, index) {
+                index = end;
+            } else {
+                if matches!(bytes[index], b'/' | b'\\') {
+                    start = index + 1;
+                }
+                index += 1;
+            }
+        }
+        &decoded[start..]
+    } else {
+        decoded.rsplit(['/', '\\']).next().unwrap_or(decoded)
+    };
+    let cmd_fragments = word.cmd_fragments.map(|mut fragments| {
+        if let Some(first) = fragments.first_mut() {
+            *first = first.trim_start_matches('@').to_string();
+        }
+        let last_separator = fragments
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, fragment)| fragment.rfind(['/', '\\']).map(|at| (index, at + 1)));
+        if let Some((index, start)) = last_separator {
+            fragments[index] = fragments[index][start..].to_string();
+            fragments.drain(..index);
+        }
+        fragments
+    });
     WindowsFilesystemWord {
         decoded: basename.to_string(),
         dynamic: word.dynamic,
+        may_split: word.may_split,
+        cmd_fragments,
     }
 }
 
@@ -1092,6 +1224,30 @@ fn powershell_dotnet_directory_delete_rule(
     segment: &str,
     tokens: &[NormalizeToken],
 ) -> Option<&'static str> {
+    powershell_dotnet_directory_delete_rule_with_member_search(segment, tokens, |start| {
+        DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(segment, start)
+    })
+}
+
+fn powershell_dotnet_directory_delete_rule_with_member_search(
+    segment: &str,
+    tokens: &[NormalizeToken],
+    mut find_member: impl FnMut(usize) -> Option<(usize, usize)>,
+) -> Option<&'static str> {
+    // All three expressions require an ASCII dot and a contiguous Delete
+    // spelling. Prove only that this .NET surface cannot match before paying
+    // for context classification and suffix searches on ordinary cmdlets.
+    // Keep the checks separate: the member syntax permits `. Delete(...)`.
+    // Callers must still inspect statements and enforce their semantic bounds.
+    if !segment.as_bytes().contains(&b'.')
+        || !segment
+            .as_bytes()
+            .windows(b"delete".len())
+            .any(|window| window.eq_ignore_ascii_case(b"delete"))
+    {
+        return None;
+    }
+
     // The intact-command caller uses this detector before PowerShell's
     // structural parentheses are split. Preserve that benefit without
     // reinterpreting examples inside comments, quoted arguments, or
@@ -1117,6 +1273,13 @@ fn powershell_dotnet_directory_delete_rule(
         })
         .map(|token| token.byte_range.clone())
         .collect();
+    // Word starts advance monotonically. The first member match in a suffix
+    // remains the first match until a later word starts beyond it. Cache its
+    // data-context verdict as well as its position, and remember a miss so
+    // dense prefixes do not repeatedly search or classify the same suffix.
+    // Search lazily below the static checks to retain their per-token priority.
+    let mut next_member = None;
+    let mut member_search_exhausted = false;
     for token in tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
@@ -1142,15 +1305,20 @@ fn powershell_dotnet_directory_delete_rule(
                 return Some("dotnet-directory-delete");
             }
         }
-        if let Some((match_start, _)) = DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find(tail) {
-            let absolute = token.byte_range.start.saturating_add(match_start);
-            if !quoted_word_ranges
-                .iter()
-                .any(|range| range.contains(&absolute))
-                && !inert_ranges.iter().any(|range| range.contains(&absolute))
-            {
-                return Some("directoryinfo-delete-recursive");
-            }
+        if !member_search_exhausted
+            && next_member.is_none_or(|(start, _)| start < token.byte_range.start)
+        {
+            next_member = find_member(token.byte_range.start).map(|(start, _)| {
+                let executable = !quoted_word_ranges
+                    .iter()
+                    .any(|range| range.contains(&start))
+                    && !inert_ranges.iter().any(|range| range.contains(&start));
+                (start, executable)
+            });
+            member_search_exhausted = next_member.is_none();
+        }
+        if next_member.is_some_and(|(_, executable)| executable) {
+            return Some("directoryinfo-delete-recursive");
         }
     }
     None
@@ -1785,6 +1953,7 @@ fn powershell_call_operator_analysis(command: &str) -> PowerShellCallOperatorAna
     let mut saw_word_in_statement = false;
     let mut saw_safe = false;
     let mut saw_unverified = false;
+    let mut saw_incomplete = false;
     let mut inert_target_spans = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
@@ -1855,6 +2024,7 @@ fn powershell_call_operator_analysis(command: &str) -> PowerShellCallOperatorAna
                             };
                         }
                         WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+                        WindowsFilesystemSemanticDecision::Incomplete => saw_incomplete = true,
                         WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
                         WindowsFilesystemSemanticDecision::NoMatch => {}
                     }
@@ -1866,6 +2036,8 @@ fn powershell_call_operator_analysis(command: &str) -> PowerShellCallOperatorAna
 
     let decision = if saw_unverified {
         Some(WindowsFilesystemSemanticDecision::Unverified)
+    } else if saw_incomplete {
+        Some(WindowsFilesystemSemanticDecision::Incomplete)
     } else if saw_safe {
         Some(WindowsFilesystemSemanticDecision::Safe)
     } else {
@@ -1954,6 +2126,10 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
         if decisions.contains(&WindowsFilesystemSemanticDecision::Unverified) {
             return WindowsFilesystemSemanticDecision::Unverified;
         }
+        // A view that gave up cannot be cleared by a view that finished.
+        if decisions.contains(&WindowsFilesystemSemanticDecision::Incomplete) {
+            return WindowsFilesystemSemanticDecision::Incomplete;
+        }
         return if decisions.contains(&WindowsFilesystemSemanticDecision::Safe) {
             WindowsFilesystemSemanticDecision::Safe
         } else {
@@ -1963,9 +2139,11 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
 
     if command.len() > MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES {
         // Do not allocate or tokenize an attacker-controlled oversized shell
-        // program.  Callers invoke this pass only for the enabled Windows pack;
-        // failing closed is the only sound bounded result.
-        return WindowsFilesystemSemanticDecision::Unverified;
+        // program.  Callers invoke this pass only for the enabled Windows pack,
+        // and an unanalyzed program is never a clean one: the evaluator turns
+        // this into the configured incomplete-analysis outcome unless one of
+        // the pack's own patterns denies first.
+        return WindowsFilesystemSemanticDecision::Incomplete;
     }
 
     if dialect == ShellDialect::PowerShell {
@@ -2021,20 +2199,25 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
 
     let segments = crate::packs::split_command_segments_in_dialect(command, dialect);
     if segments.len() > MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS {
+        // The statement bound stops the pass before any statement is read, so
+        // a protected spelling or dialect escape somewhere in the text is only
+        // a reason the analysis was needed, not a finding (#569).
         return if has_dialect_syntax || has_literal_keyword {
-            WindowsFilesystemSemanticDecision::Unverified
+            WindowsFilesystemSemanticDecision::Incomplete
         } else {
             WindowsFilesystemSemanticDecision::NoMatch
         };
     }
     let mut saw_safe = false;
     let mut saw_unverified = false;
+    let mut saw_incomplete = false;
     let call_analysis = if dialect == ShellDialect::PowerShell {
         let analysis = powershell_call_operator_analysis(command);
         if let Some(decision) = analysis.decision {
             match decision {
                 decision @ WindowsFilesystemSemanticDecision::Destructive(_) => return decision,
                 WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+                WindowsFilesystemSemanticDecision::Incomplete => saw_incomplete = true,
                 WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
                 WindowsFilesystemSemanticDecision::NoMatch => {}
             }
@@ -2099,12 +2282,15 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
         match decision {
             decision @ WindowsFilesystemSemanticDecision::Destructive(_) => return decision,
             WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+            WindowsFilesystemSemanticDecision::Incomplete => saw_incomplete = true,
             WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
             WindowsFilesystemSemanticDecision::NoMatch => {}
         }
     }
     if saw_unverified {
         WindowsFilesystemSemanticDecision::Unverified
+    } else if saw_incomplete {
+        WindowsFilesystemSemanticDecision::Incomplete
     } else if saw_safe {
         WindowsFilesystemSemanticDecision::Safe
     } else {
@@ -2349,7 +2535,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // recursive call reports the more specific id and severity.
         destructive_pattern!(
             "dotnet-directory-delete-recursive",
-            r#"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
+            r#"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*(?:delete|'delete'|"delete")\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
             "[System.IO.Directory]::Delete with a true recursive flag deletes an entire directory tree.",
             Critical,
             "`[System.IO.Directory]::Delete($path, $true)` (or the `[IO.Directory]` accelerator \
@@ -2365,7 +2551,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === .NET: [System.IO.Directory]::Delete(...) — any other call ===
         destructive_pattern!(
             "dotnet-directory-delete",
-            r"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\(",
+            r#"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*(?:delete|'delete'|"delete")\s*\("#,
             "[System.IO.Directory]::Delete removes a directory outside the Recycle Bin.",
             High,
             "`[System.IO.Directory]::Delete` permanently removes the target directory. With a \
@@ -2380,7 +2566,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === .NET: <DirectoryInfo>.Delete($true) instance-method spelling ===
         destructive_pattern!(
             "directoryinfo-delete-recursive",
-            r"(?i)\.\s*delete\s*\(\s*\$true\s*\)",
+            r#"(?i)\.\s*(?:delete|'delete'|"delete")\s*\(\s*\$true\s*\)"#,
             ".Delete($true) on a DirectoryInfo object recursively deletes the directory tree.",
             Critical,
             "`<DirectoryInfo>.Delete($true)` — for example `(Get-Item $path).Delete($true)` or a \
@@ -2486,6 +2672,9 @@ mod tests {
             r#"[System.IO.Directory]::Delete($root, "true")"#,
             r"[ System.IO.Directory ] :: Delete ($repo, $true)",
             r"[System.IO.Directory]::Delete((Join-Path $root 'sub'), $true)",
+            r"[IO.Directory]::'Delete'('C:\src', $true)",
+            r#"[IO.Directory]::"Delete"('C:\src', $true)"#,
+            r#"[ System.IO.Directory ] :: "dElEtE" ($repo, 1)"#,
         ];
         for command in checks {
             assert_blocks_with_pattern(&pack, command, "dotnet-directory-delete-recursive");
@@ -2501,6 +2690,10 @@ mod tests {
         for command in [
             r"[System.IO.Directory]::Delete($path, $flag)",
             r"[IO.Directory]::Delete('C:\obsolete-empty')",
+            r"[IO.Directory]::'Delete'('C:\obsolete-empty')",
+            r#"[IO.Directory]::"Delete"('C:\obsolete-empty')"#,
+            r"[System.IO.Directory]::'Delete'($path, $flag)",
+            r#"[System.IO.Directory]::"Delete"($path, $flag)"#,
         ] {
             assert_blocks_with_pattern(&pack, command, "dotnet-directory-delete");
             assert_blocks_with_severity(&pack, command, Severity::High);
@@ -2515,6 +2708,9 @@ mod tests {
             r"(Get-Item 'C:\tmp\scratch').Delete($true)",
             r"([System.IO.DirectoryInfo]'C:\src').Delete($true)",
             r"(New-Object System.IO.DirectoryInfo 'C:\src').Delete( $true )",
+            r"$dir.'Delete'($true)",
+            r#"$dir."Delete"($true)"#,
+            r#"(Get-Item 'C:\src'). "dElEtE" ( $true )"#,
         ];
         for command in checks {
             assert_blocks_with_pattern(&pack, command, "directoryinfo-delete-recursive");
@@ -2534,6 +2730,105 @@ mod tests {
         // rule's target (a $false flag is the non-recursive one-arg form).
         assert_no_match(&pack, r"$dir.Delete($false)");
         assert_no_match(&pack, r"$queue.Delete($item)");
+        assert_no_match(&pack, r"$dir.'Delete'($false)");
+        assert_no_match(&pack, r#"$dir."Delete"($false)"#);
+        assert_no_match(&pack, r#"$dir.'Delete"($true)"#);
+        assert_no_match(&pack, r#"$dir."Delete'($true)"#);
+        assert_no_match(&pack, r#"[IO.Directory]::'Delete"($path, $true)"#);
+        assert_no_match(&pack, r#"[IO.Directory]::"Delete'($path, $true)"#);
+    }
+
+    #[test]
+    fn powershell_semantic_detects_literal_quoted_dotnet_method_names() {
+        for count in [0, 400] {
+            let prefix = "Write-Output 'rm x'; ".repeat(count);
+            for (tail, expected) in [
+                (
+                    r"[IO.Directory]::'Delete'('C:\src', $true)",
+                    "dotnet-directory-delete-recursive",
+                ),
+                (
+                    r#"[IO.Directory]::"Delete"('C:\src', $true)"#,
+                    "dotnet-directory-delete-recursive",
+                ),
+                (
+                    r"[IO.Directory]::'Delete'('C:\src')",
+                    "dotnet-directory-delete",
+                ),
+                (
+                    r#"[IO.Directory]::"Delete"($path, $flag)"#,
+                    "dotnet-directory-delete",
+                ),
+                (r"$dir.'Delete'($true)", "directoryinfo-delete-recursive"),
+                (
+                    r#"$dir. "dElEtE" ($true)"#,
+                    "directoryinfo-delete-recursive",
+                ),
+            ] {
+                let command = format!("{prefix}{tail}");
+                for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                    assert_eq!(
+                        windows_filesystem_semantic_decision_in_dialect(&command, dialect),
+                        WindowsFilesystemSemanticDecision::Destructive(expected),
+                        "{dialect:?}, {count} safe statements before {tail}",
+                    );
+                }
+            }
+            for inert in [
+                r#"Write-Output '[IO.Directory]::"Delete"($path, $true)'"#,
+                r#"Write-Output "[IO.Directory]::'Delete'($path, $true)""#,
+                r#"Write-Output '$dir."Delete"($true)'"#,
+                r#"Write-Output "$dir.'Delete'($true)""#,
+                r#"Write-Output ok # [IO.Directory]::"Delete"($path, $true)"#,
+                r"<# $dir.'Delete'($true) #> Write-Output ok",
+                "$text = @'\n$dir.\"Delete\"($true)\n'@\nWrite-Output $text",
+            ] {
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        &format!("{prefix}{inert}"),
+                        ShellDialect::PowerShell,
+                    ),
+                    WindowsFilesystemSemanticDecision::NoMatch,
+                    "{count} safe statements before inert example {inert}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_dotnet_method_patterns_cover_semantically_incomplete_input() {
+        let pack = create_pack();
+        let prefix = "x ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES / 2);
+        for (tail, expected) in [
+            (
+                r"[IO.Directory]::'Delete'($path, $true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                r#"[IO.Directory]::"Delete"($path, $true)"#,
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                r"[IO.Directory]::'Delete'($path)",
+                "dotnet-directory-delete",
+            ),
+            (
+                r#"[IO.Directory]::"Delete"($path)"#,
+                "dotnet-directory-delete",
+            ),
+            (r"$dir.'Delete'($true)", "directoryinfo-delete-recursive"),
+            (r#"$dir."Delete"($true)"#, "directoryinfo-delete-recursive"),
+        ] {
+            let command = format!("{prefix}; {tail}");
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(&command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Incomplete,
+                "the byte bound must remain enforced",
+            );
+            // Incomplete semantic analysis falls back to the pack patterns.
+            // Those patterns must cover every newly recognized literal name.
+            assert_blocks_with_pattern(&pack, &command, expected);
+        }
     }
 
     #[test]
@@ -2552,6 +2847,11 @@ mod tests {
                 "dotnet-directory-delete",
             ),
             (r"$dir.Delete($true)", "directoryinfo-delete-recursive"),
+            (r"$dir. DeLeTe($true)", "directoryinfo-delete-recursive"),
+            (
+                r"[ſystem.IO.Directory]::DeLeTe($path, $true)",
+                "dotnet-directory-delete-recursive",
+            ),
             (
                 r"(Get-Item 'C:\tmp\scratch').Delete($true)",
                 "directoryinfo-delete-recursive",
@@ -2610,6 +2910,246 @@ mod tests {
                     WindowsFilesystemSemanticDecision::Destructive(_)
                 ),
                 "an inert example must not hide a later executable delete: {active_after_inert:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotnet_member_cache_preserves_legacy_traversal_and_attribution() {
+        // Keep the uncached traversal as an oracle for search order and data
+        // context. It deliberately shares the current patterns: support for
+        // literal quoted method names is a separate semantic improvement.
+        fn uncached_rule(segment: &str, tokens: &[NormalizeToken]) -> Option<&'static str> {
+            let inert_ranges: Vec<_> = crate::context::classify_command(segment)
+                .spans()
+                .iter()
+                .filter(|span| {
+                    matches!(
+                        span.kind,
+                        crate::context::SpanKind::Argument
+                            | crate::context::SpanKind::Data
+                            | crate::context::SpanKind::Comment
+                    )
+                })
+                .map(|span| span.byte_range.clone())
+                .collect();
+            let quoted_ranges: Vec<_> = tokens
+                .iter()
+                .filter(|token| {
+                    token.kind == NormalizeTokenKind::Word
+                        && token.text(segment).is_some_and(powershell_wholly_quoted)
+                })
+                .map(|token| token.byte_range.clone())
+                .collect();
+            for token in tokens
+                .iter()
+                .filter(|token| token.kind == NormalizeTokenKind::Word)
+            {
+                let Some(raw) = token.text(segment) else {
+                    continue;
+                };
+                if powershell_wholly_quoted(raw) {
+                    continue;
+                }
+                let Some(tail) = segment.get(token.byte_range.start..) else {
+                    continue;
+                };
+                for (expression, rule) in [
+                    (
+                        &DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION,
+                        "dotnet-directory-delete-recursive",
+                    ),
+                    (
+                        &DOTNET_DIRECTORY_DELETE_EXPRESSION,
+                        "dotnet-directory-delete",
+                    ),
+                ] {
+                    if let Some((start, _)) = expression.find(tail) {
+                        let absolute = token.byte_range.start.saturating_add(start);
+                        if !inert_ranges.iter().any(|range| range.contains(&absolute)) {
+                            return Some(rule);
+                        }
+                    }
+                }
+                if let Some((start, _)) = DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find(tail) {
+                    let absolute = token.byte_range.start.saturating_add(start);
+                    if !quoted_ranges.iter().any(|range| range.contains(&absolute))
+                        && !inert_ranges.iter().any(|range| range.contains(&absolute))
+                    {
+                        return Some("directoryinfo-delete-recursive");
+                    }
+                }
+            }
+            None
+        }
+
+        for (command, expected) in [
+            (
+                "[IO.Directory]::Delete($p, $true); $dir.Delete($true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                "Write-Output ok; [IO.Directory]::Delete($p, $true); $dir.Delete($true)",
+                "directoryinfo-delete-recursive",
+            ),
+        ] {
+            let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+            assert_eq!(
+                powershell_dotnet_directory_delete_rule(command, &tokens),
+                Some(expected),
+                "the existing per-token priority must remain stable",
+            );
+        }
+
+        for prefix in [
+            "",
+            "Write-Output ok; ",
+            "'quoted prefix'; ",
+            "# $dir.Delete($true)\n",
+            "<# $dir.'Delete'($true) #> ",
+            "Write-Output '$dir.Delete($true)'; ",
+            "$text = @'\n$dir.Delete($true)\n'@\n",
+            "Write-Output α; ",
+        ] {
+            for tail in [
+                "[IO.Directory]::Delete($p, $true); $dir.Delete($true)",
+                "[IO.Directory]::Delete($p); $dir.Delete($true)",
+                r#"[IO.Directory]::"Delete"($p, $true); $dir.'Delete'($true)"#,
+                "$dir.Delete($true); [IO.Directory]::Delete($p, $true)",
+                "Write-Output '$dir.Delete($true)'; [IO.Directory]::Delete($p)",
+                "Write-Output '$dir.Delete($true)'; $dir.Delete($true)",
+                r#"Write-Output "$dir.'Delete'($true)"; $dir."Delete"($true)"#,
+                "$dir.\u{2003}'Delete'(\t$true\t)",
+                "$dir.Delete($false)",
+                r#"$dir.'Delete"($true)"#,
+                "Write-Output 'delete-marker.'",
+                "",
+            ] {
+                let command = format!("{prefix}{tail}");
+                let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+                assert_eq!(
+                    powershell_dotnet_directory_delete_rule(&command, &tokens),
+                    uncached_rule(&command, &tokens),
+                    "cached traversal diverged for {command:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dotnet_member_cache_bounds_searches_across_dense_prefixes() {
+        let prefix = format!("Write-Output {}", "word ".repeat(4096));
+        for (label, tail, expected, expected_searches) in [
+            ("quoted member", "'$dir.Delete($true)'", None, 1),
+            ("no member match", "$dir.Delete($false)", None, 1),
+            ("no dot", "delete-marker", None, 0),
+            ("no delete", "harmless.", None, 0),
+            (
+                "active member",
+                "; $dir.Delete($true)",
+                Some("directoryinfo-delete-recursive"),
+                1,
+            ),
+            (
+                "active quoted name after inert example",
+                "'$dir.Delete($true)'; $dir.'Delete'($true)",
+                Some("directoryinfo-delete-recursive"),
+                2,
+            ),
+        ] {
+            let command = format!("{prefix}{tail}");
+            let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+            let mut searches = 0;
+            assert_eq!(
+                powershell_dotnet_directory_delete_rule_with_member_search(
+                    &command,
+                    &tokens,
+                    |start| {
+                        searches += 1;
+                        DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(&command, start)
+                    },
+                ),
+                expected,
+                "{label}",
+            );
+            assert_eq!(searches, expected_searches, "{label}");
+        }
+
+        // A failed search after a quoted candidate is cached too, even when
+        // thousands of eligible word starts remain after that candidate.
+        let command = format!("Write-Output '$dir.Delete($true)'; {prefix}");
+        let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+        let mut searches = 0;
+        assert_eq!(
+            powershell_dotnet_directory_delete_rule_with_member_search(
+                &command,
+                &tokens,
+                |start| {
+                    searches += 1;
+                    DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(&command, start)
+                },
+            ),
+            None,
+        );
+        assert_eq!(searches, 2);
+    }
+
+    #[test]
+    fn dotnet_member_cache_advances_once_per_candidate_and_stays_lazy() {
+        for (tail, expected) in [
+            ("Write-Output ok", None),
+            (
+                r#"$dir."Delete"($true)"#,
+                Some("directoryinfo-delete-recursive"),
+            ),
+        ] {
+            let command = format!(
+                "{}{tail}",
+                "Write-Output '$dir.Delete($true)'; ".repeat(256)
+            );
+            let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+            let mut searches = 0;
+            assert_eq!(
+                powershell_dotnet_directory_delete_rule_with_member_search(
+                    &command,
+                    &tokens,
+                    |start| {
+                        searches += 1;
+                        DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(&command, start)
+                    },
+                ),
+                expected,
+            );
+            assert_eq!(searches, 257, "each candidate is searched once");
+        }
+
+        for (head, expected) in [
+            (
+                "[IO.Directory]::'Delete'($path, $true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                r#"[IO.Directory]::"Delete"($path)"#,
+                "dotnet-directory-delete",
+            ),
+        ] {
+            let command = format!("{head}; {}$dir.Delete($true)", "word ".repeat(4096));
+            let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+            let mut searches = 0;
+            assert_eq!(
+                powershell_dotnet_directory_delete_rule_with_member_search(
+                    &command,
+                    &tokens,
+                    |start| {
+                        searches += 1;
+                        DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(&command, start)
+                    },
+                ),
+                Some(expected),
+            );
+            assert_eq!(
+                searches, 0,
+                "an immediate static denial needs no member scan"
             );
         }
     }
@@ -3540,6 +4080,273 @@ mod tests {
             ),
             WindowsFilesystemSemanticDecision::Destructive("clear-content"),
             "an inert call target must not hide a later destructive statement",
+        );
+    }
+
+    #[test]
+    fn issue_647_dotnet_scan_preserves_late_execution_and_quoted_data() {
+        for count in [400, 511] {
+            let prefix = "Write-Output 'rm x'; ".repeat(count);
+            for (tail, expected) in [
+                (
+                    "$directory. DeLeTe($true)",
+                    WindowsFilesystemSemanticDecision::Destructive(
+                        "directoryinfo-delete-recursive",
+                    ),
+                ),
+                (
+                    "Write-Output '$directory. DeLeTe($true)'",
+                    WindowsFilesystemSemanticDecision::NoMatch,
+                ),
+            ] {
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        &format!("{prefix}{tail}"),
+                        ShellDialect::PowerShell,
+                    ),
+                    expected,
+                    ".NET spelling after {count} safe statements: {tail}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_647_unverified_final_statement_is_incomplete_above_the_bound() {
+        let prefix = "Write-Output 'rm x'; ".repeat(511);
+        for tail in [
+            "Remove`-Item @parameters C:\\important",
+            "Remove`-Item -Re`curse C:\\important -Fo`rce`",
+            "& $command -Recurse C:\\important",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(
+                    &format!("{prefix}{tail}"),
+                    ShellDialect::PowerShell,
+                ),
+                WindowsFilesystemSemanticDecision::Unverified,
+                "an inspected unresolved final statement remains unverified: {tail}",
+            );
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(
+                    &format!("{prefix}Write-Output 'rm x'; {tail}"),
+                    ShellDialect::PowerShell,
+                ),
+                WindowsFilesystemSemanticDecision::Incomplete,
+                "an unread unresolved tail must not become safe: {tail}",
+            );
+        }
+    }
+
+    #[test]
+    fn issue_647_safe_powershell_statements_up_to_512_are_fully_analyzed() {
+        // The issue's quoted keyword must select the semantic pass without
+        // becoming an executable. Exercise the old and new boundaries as
+        // well as the reported 300-statement input.
+        for separator in ["; ", "\n", "\r\n"] {
+            for count in [128, 129, 300, 512] {
+                let command = vec!["Write-Output 'rm x'"; count].join(separator);
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        &command,
+                        ShellDialect::PowerShell,
+                    ),
+                    WindowsFilesystemSemanticDecision::NoMatch,
+                    "{count} statements separated by {separator:?}",
+                );
+            }
+            let command = vec!["Write-Output 'rm x'"; 513].join(separator);
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(&command, ShellDialect::PowerShell),
+                WindowsFilesystemSemanticDecision::Incomplete,
+                "513 statements separated by {separator:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn issue_647_late_powershell_destruction_is_not_hidden_by_safe_statements() {
+        for (safe_statement, safe_count) in [
+            ("Get-Location", 400),
+            ("Write-Output 'rm x'", 400),
+            ("Write-Output 'rm x'", 511),
+        ] {
+            for destructive in [
+                r"Remove-Item C:\example -Recurse -Force",
+                // Requires shell decoding; a raw Remove-Item regex cannot
+                // stand in for inspecting this statement.
+                r"Re`move-Item C:\example -Recurse -Force",
+            ] {
+                let command = format!(
+                    "{}{destructive}",
+                    format!("{safe_statement}; ").repeat(safe_count),
+                );
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        &command,
+                        ShellDialect::PowerShell,
+                    ),
+                    WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+                    "destructive statement {}: {destructive}",
+                    safe_count + 1,
+                );
+            }
+        }
+
+        let command = format!(
+            "{}Remove-Item C:\\example -Recurse -Force",
+            "Remove-Item C:\\preview -Recurse -Force -WhatIf; ".repeat(511),
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&command, ShellDialect::PowerShell),
+            WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+            "an earlier Safe decision must not exempt the final statement",
+        );
+    }
+
+    #[test]
+    fn issue_647_cmd_statements_share_the_bounded_scan() {
+        let safe = vec!["echo rd"; 512].join(" & ");
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&safe, ShellDialect::Cmd),
+            WindowsFilesystemSemanticDecision::NoMatch,
+        );
+        let destructive = format!("{}r^d /s /q C:\\example", "echo rd & ".repeat(511));
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&destructive, ShellDialect::Cmd),
+            WindowsFilesystemSemanticDecision::Destructive("rd-recursive"),
+        );
+        let over_bound = format!("{safe} & echo rd");
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&over_bound, ShellDialect::Cmd),
+            WindowsFilesystemSemanticDecision::Incomplete,
+        );
+    }
+
+    #[test]
+    fn issue_647_statement_extension_preserves_byte_and_word_bounds() {
+        // One inert statement at exactly 64 KiB, then one byte over. This
+        // isolates the byte bound from both the statement and word bounds.
+        let prefix = "Write-Output 'rm ";
+        let at_byte_bound = format!(
+            "{prefix}{}'",
+            "x".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES - prefix.len() - 1),
+        );
+        assert_eq!(at_byte_bound.len(), MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES);
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &at_byte_bound,
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::NoMatch,
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &format!("{at_byte_bound} "),
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Incomplete,
+        );
+
+        // The 512-word limit is per protected statement, not a shared token
+        // budget for all 512 statements. Exceeding it must remain unverified,
+        // even when a preview/help flag would otherwise establish safety.
+        for (prefix, dialect) in [
+            ("Remove-Item -WhatIf", ShellDialect::PowerShell),
+            ("rd /?", ShellDialect::Cmd),
+        ] {
+            let at_word_bound = format!(
+                "{prefix}{}",
+                " C:\\example".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_TOKENS - 2),
+            );
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(&at_word_bound, dialect),
+                WindowsFilesystemSemanticDecision::Safe,
+                "{dialect:?} at the word bound",
+            );
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(
+                    &format!("{at_word_bound} C:\\example"),
+                    dialect,
+                ),
+                WindowsFilesystemSemanticDecision::Unverified,
+                "{dialect:?} over the word bound",
+            );
+        }
+    }
+
+    /// #569: the whole-command bounds stop the pass before it reads any
+    /// statement. That is an incomplete analysis, never an `Unverified`
+    /// finding (which asserts a protected role behind unresolved syntax).
+    #[test]
+    fn issue_569_whole_command_bounds_report_incomplete_not_unverified() {
+        let over_statement_bound =
+            "Write-Output 'rm x'; ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS + 4);
+        let cmd_over_statement_bound =
+            "echo rd & ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS + 4);
+        let over_byte_bound =
+            "Write-Output 'rm x'\n".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES / 16);
+        assert!(over_byte_bound.len() > MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES);
+        for (command, dialect) in [
+            (over_statement_bound.as_str(), ShellDialect::PowerShell),
+            (over_statement_bound.as_str(), ShellDialect::Unknown),
+            (cmd_over_statement_bound.as_str(), ShellDialect::Cmd),
+            (cmd_over_statement_bound.as_str(), ShellDialect::Unknown),
+            (over_byte_bound.as_str(), ShellDialect::PowerShell),
+            (over_byte_bound.as_str(), ShellDialect::Cmd),
+            (over_byte_bound.as_str(), ShellDialect::Unknown),
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                WindowsFilesystemSemanticDecision::Incomplete,
+                "{dialect:?}: {} bytes",
+                command.len()
+            );
+            // The pack must still be selected so the evaluator can report it.
+            // (Cmd selects it through its keyword rows instead.)
+            if dialect != ShellDialect::Cmd {
+                assert!(
+                    windows_filesystem_semantic_scan_required(command, dialect),
+                    "{dialect:?}"
+                );
+            }
+        }
+
+        // Neither a protected spelling nor dialect syntax: nothing to analyze.
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &"echo a; ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS + 4),
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::NoMatch
+        );
+        // A caller-proven POSIX command is never judged by this pack.
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&over_byte_bound, ShellDialect::Posix),
+            WindowsFilesystemSemanticDecision::NoMatch
+        );
+        // A real finding in either Unknown view still outranks a view that
+        // gave up: the bound is checked per view, and `Unverified`/
+        // `Destructive` keep their precedence. PowerShell splits every `;`
+        // (over the bound); cmd.exe keeps them in one statement and splits
+        // only at `&`, so its view reads `rd /s` in full.
+        let destructive_in_cmd = format!(
+            "{}& rd /s /q C:\\src",
+            "echo a; ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS + 4)
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &destructive_in_cmd,
+                ShellDialect::PowerShell
+            ),
+            WindowsFilesystemSemanticDecision::Incomplete
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &destructive_in_cmd,
+                ShellDialect::Unknown
+            ),
+            WindowsFilesystemSemanticDecision::Destructive("rd-recursive")
         );
     }
 }

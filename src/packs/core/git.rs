@@ -530,18 +530,19 @@ fn decode_branch_syntax(decoder: &mut ShellTokenDecoder, token: &str) -> Option<
         .map(std::borrow::Cow::into_owned)
 }
 
-const MAX_STATIC_SUBSTITUTION_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_STATIC_SUBSTITUTION_BYTES: usize = 16 * 1024;
 pub(crate) const POSIX_DYNAMIC_QUOTED: &str = "__DCG_POSIX_SUB_Q_7B8CFAE1__";
 pub(crate) const POSIX_DYNAMIC_UNQUOTED: &str = "__DCG_POSIX_SUB_U_7B8CFAE1__";
 
 /// Bounded matching-only view of POSIX command substitutions.
 ///
 /// The evaluator consumes this read-only view only while resolving an
-/// executable launcher command word; the original command remains
-/// authoritative for decisions, logging, allowlists, and source spans.
+/// executable or argument word; the original command remains authoritative
+/// for decisions, logging, allowlists, and source spans.
 pub(crate) struct PosixSubstitutionView {
     pub(crate) command: String,
     pub(crate) has_dynamic: bool,
+    pub(crate) literal_producers: Vec<&'static str>,
 }
 
 /// Resolve the deliberately small, non-executing subset of POSIX command
@@ -561,6 +562,20 @@ fn resolve_literal_printf_substitutions(command: &str) -> Result<Option<String>,
 }
 
 pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitutionView, ()> {
+    posix_substitution_view_inner(command, false)
+}
+
+/// Argument-only view that also recognizes literal dash-leading `echo`
+/// operands. Callers must prove that `literal_producers` have not been
+/// overridden in the shell before adopting the returned value.
+pub(crate) fn posix_argument_substitution_view(command: &str) -> Result<PosixSubstitutionView, ()> {
+    posix_substitution_view_inner(command, true)
+}
+
+fn posix_substitution_view_inner(
+    command: &str,
+    literal_echo_flags: bool,
+) -> Result<PosixSubstitutionView, ()> {
     if command.contains(POSIX_DYNAMIC_QUOTED) || command.contains(POSIX_DYNAMIC_UNQUOTED) {
         return Err(());
     }
@@ -571,6 +586,7 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
     let mut in_double = false;
     let mut changed = false;
     let mut has_dynamic = false;
+    let mut literal_producers = Vec::new();
 
     while index < bytes.len() {
         match bytes[index] {
@@ -593,9 +609,14 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
                 let close = find_posix_substitution_close(command, index + 2, b')')?;
                 match render_static_producer_body(
                     command.get(index + 2..close).ok_or(())?,
-                    in_double,
+                    literal_echo_flags,
                 ) {
-                    Ok(rendered) => output.push_str(&rendered),
+                    Ok((rendered, producer)) => {
+                        output.push_str(&rendered);
+                        if !literal_producers.contains(&producer) {
+                            literal_producers.push(producer);
+                        }
+                    }
                     Err(()) => {
                         output.push_str(if in_double {
                             POSIX_DYNAMIC_QUOTED
@@ -612,9 +633,14 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
                 let close = find_posix_substitution_close(command, index + 1, b'`')?;
                 match render_static_producer_body(
                     command.get(index + 1..close).ok_or(())?,
-                    in_double,
+                    literal_echo_flags,
                 ) {
-                    Ok(rendered) => output.push_str(&rendered),
+                    Ok((rendered, producer)) => {
+                        output.push_str(&rendered);
+                        if !literal_producers.contains(&producer) {
+                            literal_producers.push(producer);
+                        }
+                    }
                     Err(()) => {
                         output.push_str(if in_double {
                             POSIX_DYNAMIC_QUOTED
@@ -644,6 +670,7 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
     Ok(PosixSubstitutionView {
         command: if changed { output } else { command.to_string() },
         has_dynamic,
+        literal_producers,
     })
 }
 
@@ -688,7 +715,10 @@ fn find_posix_substitution_close(command: &str, start: usize, delimiter: u8) -> 
     Err(())
 }
 
-fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<String, ()> {
+fn render_static_producer_body(
+    body: &str,
+    literal_echo_flags: bool,
+) -> Result<(String, &'static str), ()> {
     if body.len() > MAX_STATIC_SUBSTITUTION_BYTES
         || body.bytes().any(|byte| {
             matches!(
@@ -722,12 +752,15 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
         return Err(());
     }
     let producer = words.remove(0);
-    let rendered = match producer.as_str() {
+    let (rendered, producer) = match producer.as_str() {
         "printf" => {
             if words.first().is_some_and(|word| word == "--") {
                 words.remove(0);
             }
-            crate::evaluator::render_literal_printf(&words).ok_or(())?
+            (
+                crate::evaluator::render_literal_printf(&words).ok_or(())?,
+                "printf",
+            )
         }
         // `echo` varies across shells once options or backslash escapes enter
         // the picture. Model only the portable literal subset. Command
@@ -735,10 +768,16 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
         // operands exactly reproduces the value that can become an executable
         // word without relying on implementation-specific echo behavior.
         "echo"
-            if words.first().is_none_or(|word| !word.starts_with('-'))
-                && words.iter().all(|word| !word.contains('\\')) =>
+            if words.first().is_none_or(|word| {
+                !word.starts_with('-')
+                    || (literal_echo_flags
+                        && !word.strip_prefix('-').is_some_and(|flags| {
+                            !flags.is_empty()
+                                && flags.bytes().all(|byte| matches!(byte, b'n' | b'e' | b'E'))
+                        }))
+            }) && words.iter().all(|word| !word.contains('\\')) =>
         {
-            words.join(" ")
+            (words.join(" "), "echo")
         }
         _ => return Err(()),
     };
@@ -760,7 +799,7 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
     // inside POSIX double quotes, so it can be inserted verbatim there. In an
     // unquoted word, literal whitespace intentionally reproduces field
     // splitting while the restricted alphabet prevents shell re-parsing.
-    Ok(rendered.to_string())
+    Ok((rendered.to_string(), producer))
 }
 
 #[derive(Clone)]
@@ -1975,6 +2014,26 @@ enum PowerShellCallTarget {
     Dynamic,
 }
 
+/// A runtime-dependent expression is different from exhausting analysis.
+/// Shared callers must not turn a parser bound into proof of no invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PowerShellStaticExecutableError {
+    NotStatic,
+    Work,
+    Nesting,
+}
+
+const fn powershell_static_single_quote(character: char) -> bool {
+    matches!(
+        character,
+        '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}'
+    )
+}
+
+const fn powershell_static_double_quote(character: char) -> bool {
+    matches!(character, '"' | '\u{201C}' | '\u{201D}' | '\u{201E}')
+}
+
 struct PowerShellStaticExecutableParser<'a> {
     expression: &'a str,
     index: usize,
@@ -1990,104 +2049,173 @@ impl<'a> PowerShellStaticExecutableParser<'a> {
         }
     }
 
-    fn skip_whitespace(&mut self) {
+    fn skip_trivia(&mut self) -> Result<(), PowerShellStaticExecutableError> {
         while let Some(character) = self.expression[self.index..].chars().next() {
-            if !character.is_whitespace() {
+            let rest = &self.expression[self.index..];
+            if character.is_whitespace() {
+                self.index += character.len_utf8();
+            } else if rest.starts_with("`\r\n") {
+                self.index += 3;
+            } else if rest.starts_with("`\n") {
+                self.index += 2;
+            } else if rest.starts_with("<#") {
+                self.index += 2;
+                let mut depth = 1usize;
+                while depth > 0 {
+                    let rest = &self.expression[self.index..];
+                    if rest.starts_with("<#") {
+                        depth += 1;
+                        if depth > MAX_GIT_ALIAS_DEPTH {
+                            return Err(PowerShellStaticExecutableError::Nesting);
+                        }
+                        self.index += 2;
+                    } else if rest.starts_with("#>") {
+                        depth -= 1;
+                        self.index += 2;
+                    } else {
+                        self.index += rest
+                            .chars()
+                            .next()
+                            .ok_or(PowerShellStaticExecutableError::NotStatic)?
+                            .len_utf8();
+                    }
+                }
+            } else if character == '#' {
+                while let Some(character) = self.expression[self.index..].chars().next() {
+                    if matches!(character, '\r' | '\n') {
+                        break;
+                    }
+                    self.index += character.len_utf8();
+                }
+            } else {
                 break;
             }
-            self.index += character.len_utf8();
         }
+        Ok(())
     }
 
-    fn parse(mut self) -> Result<String, ()> {
+    fn parse(mut self) -> Result<String, PowerShellStaticExecutableError> {
         if self.expression.len() > MAX_GIT_SEMANTIC_BYTES {
-            return Err(());
+            return Err(PowerShellStaticExecutableError::Work);
         }
-        self.skip_whitespace();
+        self.skip_trivia()?;
         let value = self.parse_concatenation(0)?;
-        self.skip_whitespace();
+        self.skip_trivia()?;
         (self.index == self.expression.len())
             .then_some(value)
-            .ok_or(())
+            .ok_or(PowerShellStaticExecutableError::NotStatic)
     }
 
-    fn parse_concatenation(&mut self, depth: usize) -> Result<String, ()> {
+    fn parse_concatenation(
+        &mut self,
+        depth: usize,
+    ) -> Result<String, PowerShellStaticExecutableError> {
         if depth > MAX_GIT_ALIAS_DEPTH {
-            return Err(());
+            return Err(PowerShellStaticExecutableError::Nesting);
         }
         let mut value = self.parse_primary(depth)?;
         loop {
-            self.skip_whitespace();
+            self.skip_trivia()?;
             if self.expression.as_bytes().get(self.index) != Some(&b'+') {
                 return Ok(value);
             }
             self.index += 1;
-            self.skip_whitespace();
+            self.skip_trivia()?;
             let suffix = self.parse_primary(depth)?;
             if value.len().saturating_add(suffix.len()) > MAX_GIT_SEMANTIC_BYTES {
-                return Err(());
+                return Err(PowerShellStaticExecutableError::Work);
             }
             value.push_str(&suffix);
         }
     }
 
-    fn parse_primary(&mut self, depth: usize) -> Result<String, ()> {
-        self.skip_whitespace();
+    fn parse_primary(&mut self, depth: usize) -> Result<String, PowerShellStaticExecutableError> {
+        self.skip_trivia()?;
         self.terms = self.terms.saturating_add(1);
         if self.terms > MAX_GIT_SEMANTIC_TOKENS {
-            return Err(());
+            return Err(PowerShellStaticExecutableError::Work);
         }
-        match self.expression.as_bytes().get(self.index).copied() {
-            Some(b'\'') => self.parse_single_quoted(),
-            Some(b'"') => self.parse_double_quoted(),
-            Some(b'(') => {
+        match self.expression[self.index..].chars().next() {
+            Some(quote) if powershell_static_single_quote(quote) => self.parse_single_quoted(),
+            Some(quote) if powershell_static_double_quote(quote) => self.parse_double_quoted(),
+            Some('(') => {
                 self.index += 1;
                 let value = self.parse_concatenation(depth + 1)?;
-                self.skip_whitespace();
+                self.skip_trivia()?;
                 if self.expression.as_bytes().get(self.index) != Some(&b')') {
-                    return Err(());
+                    return Err(PowerShellStaticExecutableError::NotStatic);
                 }
                 self.index += 1;
                 Ok(value)
             }
-            _ => Err(()),
+            _ => Err(PowerShellStaticExecutableError::NotStatic),
         }
     }
 
-    fn parse_single_quoted(&mut self) -> Result<String, ()> {
-        self.index += 1;
+    fn parse_single_quoted(&mut self) -> Result<String, PowerShellStaticExecutableError> {
+        self.index += self.expression[self.index..]
+            .chars()
+            .next()
+            .ok_or(PowerShellStaticExecutableError::NotStatic)?
+            .len_utf8();
         let mut value = String::new();
         while self.index < self.expression.len() {
-            let character = self.expression[self.index..].chars().next().ok_or(())?;
-            if character == '\'' {
-                if self.expression.as_bytes().get(self.index + 1) == Some(&b'\'') {
-                    value.push('\'');
-                    self.index += 2;
+            let character = self.expression[self.index..]
+                .chars()
+                .next()
+                .ok_or(PowerShellStaticExecutableError::NotStatic)?;
+            if powershell_static_single_quote(character) {
+                self.index += character.len_utf8();
+                if let Some(next) = self.expression[self.index..]
+                    .chars()
+                    .next()
+                    .filter(|next| powershell_static_single_quote(*next))
+                {
+                    value.push(character);
+                    self.index += next.len_utf8();
                     continue;
                 }
-                self.index += 1;
                 return Ok(value);
             }
             value.push(character);
             self.index += character.len_utf8();
         }
-        Err(())
+        Err(PowerShellStaticExecutableError::NotStatic)
     }
 
-    fn parse_double_quoted(&mut self) -> Result<String, ()> {
-        self.index += 1;
+    fn parse_double_quoted(&mut self) -> Result<String, PowerShellStaticExecutableError> {
+        self.index += self.expression[self.index..]
+            .chars()
+            .next()
+            .ok_or(PowerShellStaticExecutableError::NotStatic)?
+            .len_utf8();
         let mut value = String::new();
         while self.index < self.expression.len() {
-            let character = self.expression[self.index..].chars().next().ok_or(())?;
+            let character = self.expression[self.index..]
+                .chars()
+                .next()
+                .ok_or(PowerShellStaticExecutableError::NotStatic)?;
             match character {
-                '"' => {
-                    self.index += 1;
+                quote if powershell_static_double_quote(quote) => {
+                    self.index += quote.len_utf8();
+                    if let Some(next) = self.expression[self.index..]
+                        .chars()
+                        .next()
+                        .filter(|next| powershell_static_double_quote(*next))
+                    {
+                        value.push(quote);
+                        self.index += next.len_utf8();
+                        continue;
+                    }
                     return Ok(value);
                 }
-                '$' => return Err(()),
+                '$' => return Err(PowerShellStaticExecutableError::NotStatic),
                 '`' => {
                     self.index += 1;
-                    let escaped = self.expression[self.index..].chars().next().ok_or(())?;
+                    let escaped = self.expression[self.index..]
+                        .chars()
+                        .next()
+                        .ok_or(PowerShellStaticExecutableError::NotStatic)?;
                     self.index += escaped.len_utf8();
                     match escaped {
                         '0' => value.push('\0'),
@@ -2099,6 +2227,39 @@ impl<'a> PowerShellStaticExecutableParser<'a> {
                         'r' => value.push('\r'),
                         't' => value.push('\t'),
                         'v' => value.push('\u{000b}'),
+                        'u' => {
+                            if self.expression.as_bytes().get(self.index) != Some(&b'{') {
+                                return Err(PowerShellStaticExecutableError::NotStatic);
+                            }
+                            self.index += 1;
+                            let mut scalar = 0_u32;
+                            let mut digits = 0_usize;
+                            loop {
+                                let digit = self.expression[self.index..]
+                                    .chars()
+                                    .next()
+                                    .ok_or(PowerShellStaticExecutableError::NotStatic)?;
+                                self.index += digit.len_utf8();
+                                if digit == '}' {
+                                    break;
+                                }
+                                if digits == 6 {
+                                    return Err(PowerShellStaticExecutableError::NotStatic);
+                                }
+                                scalar = scalar * 16
+                                    + digit
+                                        .to_digit(16)
+                                        .ok_or(PowerShellStaticExecutableError::NotStatic)?;
+                                digits += 1;
+                            }
+                            if digits == 0 {
+                                return Err(PowerShellStaticExecutableError::NotStatic);
+                            }
+                            value.push(
+                                char::from_u32(scalar)
+                                    .ok_or(PowerShellStaticExecutableError::NotStatic)?,
+                            );
+                        }
                         '\n' => {}
                         '\r' if self.expression.as_bytes().get(self.index) == Some(&b'\n') => {
                             self.index += 1;
@@ -2112,8 +2273,16 @@ impl<'a> PowerShellStaticExecutableParser<'a> {
                 }
             }
         }
-        Err(())
+        Err(PowerShellStaticExecutableError::NotStatic)
     }
+}
+
+/// Decode only the bounded literal/concatenation expression itself. Unlike
+/// the legacy call-tail helper, this never drops an index or member postfix.
+pub(crate) fn decode_powershell_static_executable(
+    expression: &str,
+) -> Result<String, PowerShellStaticExecutableError> {
+    PowerShellStaticExecutableParser::new(expression).parse()
 }
 
 fn powershell_call_expression_parts(command: &str) -> Option<(&str, &str)> {
@@ -2204,9 +2373,7 @@ pub(crate) fn powershell_static_call_executable(command: &str) -> Option<(Option
         .strip_prefix('$')
         .or_else(|| expression.strip_prefix('@'))
         .unwrap_or(expression);
-    let executable = PowerShellStaticExecutableParser::new(expression)
-        .parse()
-        .ok();
+    let executable = decode_powershell_static_executable(expression).ok();
     Some((executable, tail))
 }
 
@@ -4059,7 +4226,17 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
             let Some(value) = words.get(index + 1) else {
                 return false;
             };
-            if value.dynamic && value.may_split {
+            // A field-splitting value could supply the subcommand itself
+            // (`$r` = `dir branch`), so the words after it may be branch
+            // argv. When a literal Git subcommand follows the value, that
+            // reading needs a second unknown to reach a deletion flag
+            // (`git -C $r log main $b`), and two unknowns are not evidence
+            // (#281): let the visible subcommand decide, as #405 does for
+            // aliases (#597).
+            let visible_subcommand = words
+                .get(index + 2)
+                .is_some_and(|next| !next.dynamic && is_known_git_command(&next.decoded));
+            if value.dynamic && value.may_split && !visible_subcommand {
                 return semantic_branch_argv_may_mutate(&words[index + 2..], dialect);
             }
             index += 2;
@@ -4833,6 +5010,10 @@ pub(crate) fn unmodeled_exec_wrapper(basename: &str, next: Option<&str>) -> bool
             | "chronic"
             | "unbuffer"
             | "caffeinate"
+            | "arch"
+            | "xcrun"
+            | "taskpolicy"
+            | "sandbox-exec"
             | "flock"
             | "taskset"
             | "numactl"
@@ -5013,10 +5194,16 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         return Some("__dcg_non_git_command__".to_string());
     }
 
+    // A dynamic executable followed by `=` is no Git invocation; see
+    // `is_powershell_assignment_operator`.
     if let Some(semantic) = decode_git_semantic_words(command, dialect)
         && !semantic.over_limit
         && let Some(executable_index) = semantic_git_executable_index(&semantic.words, dialect)
         && semantic.words[executable_index].dynamic
+        && !semantic
+            .words
+            .get(executable_index + 1)
+            .is_some_and(|word| is_powershell_assignment_operator(&word.decoded))
     {
         let mut words: Vec<_> = semantic
             .words
@@ -5029,6 +5216,19 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
 
     let decoded = words.join(" ");
     Some(crate::normalize::normalize_command(&decoded).into_owned())
+}
+
+/// A PowerShell assignment operator: `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `??=`.
+///
+/// `$warning = 'Do not use reset --hard here'` assigns a string in
+/// PowerShell. Read as POSIX it runs `$warning` with `=` as its first
+/// argument, and Git has no subcommand or option spelled like any of these:
+/// it stops there with an error. So a dynamic executable followed by one is
+/// not synthesized as `git`, which handed the assigned text to the Git rules
+/// and made the unknown dialect, which takes the POSIX reading, deny
+/// PowerShell assignments.
+fn is_powershell_assignment_operator(word: &str) -> bool {
+    matches!(word, "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "??=")
 }
 
 /// Build the decoded Git regex view without reintroducing inert argv data.
@@ -5047,6 +5247,19 @@ pub(crate) fn syntax_view_for_pattern_matching(
 ) -> Option<String> {
     let sanitized_view = syntax_view_in_dialect(sanitized_command, dialect);
     if dialect == ShellDialect::Unknown {
+        // The unknown dialect stands for every shell, POSIX among them. When
+        // the POSIX reading proves an executable that can be Git and this
+        // view does not read as Git, the synthesized `git …` view is the one
+        // to match: without it `$d reset --hard`, denied under POSIX, was an
+        // unknown program here and allowed (bd-executable-assignment-scope).
+        // A view that already reads as Git keeps its existing role.
+        let reads_as_git =
+            |view: Option<&str>| view.is_some_and(|view| view == "git" || view.starts_with("git "));
+        let posix =
+            syntax_view_for_pattern_matching(command, sanitized_command, ShellDialect::Posix);
+        if reads_as_git(posix.as_deref()) && !reads_as_git(sanitized_view.as_deref()) {
+            return posix;
+        }
         return sanitized_view;
     }
 
@@ -5071,6 +5284,14 @@ pub(crate) fn syntax_view_for_pattern_matching(
     let Some(executable_index) = semantic_git_executable_index(&decoded.words, dialect) else {
         return sanitized_view;
     };
+    // Not a Git invocation: see `is_powershell_assignment_operator`.
+    if decoded
+        .words
+        .get(executable_index + 1)
+        .is_some_and(|word| is_powershell_assignment_operator(&word.decoded))
+    {
+        return sanitized_view;
+    }
 
     // A dynamic argv word may become a destructive option at execution time.
     // Keep the established conservative sanitized view in that case. Only the
@@ -6109,10 +6330,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `--hard` may follow other arguments (`git reset HEAD~1 --hard`,
         // `git reset -q --hard`), and git accepts any unambiguous prefix of a
         // long option, down to `--h` here. Both were allowed while only
-        // `reset --hard` in first position denied.
+        // `reset --hard` in first position denied. A bare `--` terminates
+        // option parsing: a later `--hard` is a pathspec, including when a
+        // literal substitution supplied it. Keep the executable prefix
+        // permissive and stop only the option walk at that delimiter.
         destructive_pattern!(
             "reset-hard",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--h(?:a(?:rd?)?)?\b",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b(?:(?!\s--(?:\s|$))[^;&|\n<>()])*?\s--h(?:a(?:rd?)?)?\b",
             "git reset --hard destroys uncommitted changes. Use 'git stash' first.",
             Critical,
             "git reset --hard discards ALL uncommitted changes in your working directory \
@@ -6152,7 +6376,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "reset-merge",
             // Anywhere in the reset, and down to `--me` (`--m` is ambiguous
             // with `--mixed`), for the same reasons as `reset-hard`.
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--me(?:r(?:ge?)?)?\b",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b(?:(?!\s--(?:\s|$))[^;&|\n<>()])*?\s--me(?:r(?:ge?)?)?\b",
             "git reset --merge can lose uncommitted changes.",
             High,
             "git reset --merge resets the index and updates files in the working tree that \
@@ -6618,6 +6842,93 @@ mod tests {
     use crate::packs::test_helpers::*;
     use std::fmt::Write as _;
 
+    #[test]
+    fn powershell_static_executable_decoder_reuses_bounded_literal_grammar() {
+        for (expression, expected) in [
+            ("('gi'+'t')", "git"),
+            ("(('Tee-') + ('Object'))", "Tee-Object"),
+            (
+                "('Tee-' <# outer <# inner #> tail #> + 'Object')",
+                "Tee-Object",
+            ),
+            ("('Tee-' + # comment with )\n 'Object')", "Tee-Object"),
+            ("('Tee-' `\r\n + 'Object')", "Tee-Object"),
+            ("(‘Tee-’+‘Object’)", "Tee-Object"),
+            ("(“Tee-”+“Object”)", "Tee-Object"),
+            ("(\"Tee`-\"+\"Object\")", "Tee-Object"),
+            ("(\"gi`u{74}\")", "git"),
+            ("(\"Tee`u{2d}Object\")", "Tee-Object"),
+            ("(\"Tee`u{00002D}Object\")", "Tee-Object"),
+            ("(\"`u{1F600}\")", "😀"),
+            ("('a''b'+\"c\"\"d\")", "a'bc\"d"),
+            (
+                "('Microsoft.PowerShell.Utility\\Tee-'+'Object')",
+                "Microsoft.PowerShell.Utility\\Tee-Object",
+            ),
+        ] {
+            assert_eq!(
+                decode_powershell_static_executable(expression),
+                Ok(expected.to_string()),
+                "{expression}"
+            );
+        }
+        for expression in [
+            "('git')[0]",
+            "('git').ToString()",
+            "('gi'+$suffix)",
+            "(\"$program\")",
+            "('git'; Write-Output other)",
+            "('git' <# unfinished)",
+            "(\"git`u\")",
+            "(\"git`u{}\")",
+            "(\"git`u{74\")",
+            "(\"git`u{z}\")",
+            "(\"git`u{0000074}\")",
+            "(\"git`u{110000}\")",
+            "(\"git`u{D800}\")",
+            "(\"git`u{DFFF}\")",
+        ] {
+            assert_eq!(
+                decode_powershell_static_executable(expression),
+                Err(PowerShellStaticExecutableError::NotStatic),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_static_executable_decoder_reports_its_existing_bounds() {
+        let oversized = format!("'{}'", "x".repeat(MAX_GIT_SEMANTIC_BYTES));
+        assert_eq!(
+            decode_powershell_static_executable(&oversized),
+            Err(PowerShellStaticExecutableError::Work)
+        );
+        let terms = std::iter::repeat_n("''", MAX_GIT_SEMANTIC_TOKENS + 1)
+            .collect::<Vec<_>>()
+            .join("+");
+        assert_eq!(
+            decode_powershell_static_executable(&terms),
+            Err(PowerShellStaticExecutableError::Work)
+        );
+        let nested = format!(
+            "{}'git'{}",
+            "(".repeat(MAX_GIT_ALIAS_DEPTH + 1),
+            ")".repeat(MAX_GIT_ALIAS_DEPTH + 1)
+        );
+        assert_eq!(
+            decode_powershell_static_executable(&nested),
+            Err(PowerShellStaticExecutableError::Nesting)
+        );
+        let comments = format!(
+            "{}{}'git'",
+            "<#".repeat(MAX_GIT_ALIAS_DEPTH + 1),
+            "#>".repeat(MAX_GIT_ALIAS_DEPTH + 1)
+        );
+        assert_eq!(
+            decode_powershell_static_executable(&comments),
+            Err(PowerShellStaticExecutableError::Nesting)
+        );
+    }
     // =========================================================================
     // Git LFS (Refs PR #383): `git lfs` is a known subcommand, and its three
     // destructive verbs carry their own rules.
@@ -6669,6 +6980,47 @@ mod tests {
                 InvokedGitAliasDecision::Unverified,
                 "{command} must stay unverifiable"
             );
+        }
+    }
+
+    #[test]
+    fn dynamic_path_value_before_a_visible_subcommand_is_not_branch_argv() {
+        // #597: with an unquoted `-C $r`, a bare dynamic operand after a
+        // read-only subcommand was judged as `git branch` argv.
+        for command in [
+            "git -C $r log main $b",
+            "git -C $r log $b",
+            "git -C $r log main \"$b\"",
+            "git -C $r diff main $b",
+            "git -C $r rev-list main $b",
+            "git -C $r merge-base main $b",
+            "git -C $r cherry main $b",
+            "git --work-tree $w --git-dir $d diff $b",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !decision.is_destructive(),
+                    "{command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+        // Branch argv after the dynamic path, and a dynamic path with no
+        // visible subcommand after it, still fail closed.
+        for command in [
+            "git -C $r branch $b",
+            "git -C $r branch -D $b",
+            "git -C $r -D main",
+            "git -C $r $sub main $b",
+            "git -C $r -f main $b",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    decision.is_destructive(),
+                    "{command} ({dialect:?}) -> {decision:?}"
+                );
+            }
         }
     }
 

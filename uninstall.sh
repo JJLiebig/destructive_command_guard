@@ -2,8 +2,9 @@
 #
 # dcg uninstaller
 #
-# One-liner uninstall:
-#   curl -fsSL https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/uninstall.sh | bash
+# Run from a reviewed local checkout whose provenance you trust:
+#   bash ./uninstall.sh
+# Releases do not currently publish signed uninstaller assets.
 #
 # Options:
 #   --yes            Skip confirmation prompt
@@ -12,6 +13,17 @@
 #   --purge          Remove everything (overrides keep flags)
 #   --quiet          Suppress non-error output
 #
+
+# This is a bash script. Piped into another shell (`| sh` where sh is dash,
+# `| zsh`), it would fail or misbehave later, so stop here with the fix.
+# Keep this block POSIX sh: it runs before anything bash-specific is parsed.
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf '%s\n' \
+    "dcg uninstaller: this script needs bash. From your reviewed local checkout, run:" \
+    '  bash ./uninstall.sh' >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 # Keep this resolver in sync with install.sh and the Rust CLI.
@@ -1266,6 +1278,70 @@ unconfigure_crush() {
     return 0
 }
 
+droid_may_have_dcg_hooks() {
+    # Conservative inventory only, never a JSON editor or an ownership claim.
+    # If a file is unreadable, retain the binary until native cleanup can check.
+    local factory_dir="$1"
+    local candidate
+    for candidate in "$factory_dir/hooks.json" "$factory_dir/settings.json" \
+        "$factory_dir/settings.local.json" "$factory_dir/hooks/hooks.json"; do
+        if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+            if [ ! -f "$candidate" ] || [ ! -r "$candidate" ]; then
+                return 0
+            fi
+            # JSON may spell the executable with Unicode escapes. Delegate
+            # such files to the native parser instead of silently missing a
+            # live registration; any read error is also an unknown result.
+            local inventory_status=0
+            grep -Eiq 'dcg|\\u[0-9a-f]{4}' "$candidate" || inventory_status=$?
+            if [ "$inventory_status" -ne 1 ]; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+unconfigure_droid() {
+    # Factory has standalone and settings-wrapped hook maps, including local
+    # overrides. Let the native editor remove only DCG entries in each scope,
+    # while the binary still exists. Never guess at JSON structure here.
+    local dcg_bin="${1:-}"
+    local repo_root=""
+    repo_root=$(current_repo_root) || true
+    local user_hook=0 project_hook=0
+    droid_may_have_dcg_hooks "$HOME/.factory" && user_hook=1
+    if [ -n "$repo_root" ] && droid_may_have_dcg_hooks "$repo_root/.factory"; then
+        project_hook=1
+    fi
+    if [ "$user_hook" -eq 0 ] && [ "$project_hook" -eq 0 ]; then
+        return 0
+    fi
+    [ -n "$dcg_bin" ] || dcg_bin=$(find_dcg_binary)
+    if [ -z "$dcg_bin" ] || [ ! -x "$dcg_bin" ]; then
+        warn "Factory Droid cleanup requires a DCG binary with Droid support."
+        warn "Run 'dcg uninstall --droid' (and --project in each configured project)."
+        return 1
+    fi
+    case "$dcg_bin" in
+        /*) ;;
+        *) dcg_bin="$PWD/$dcg_bin" ;;
+    esac
+    if [ "$user_hook" -eq 1 ]; then
+        if ! "$dcg_bin" uninstall --droid; then
+            warn "Factory Droid user hook cleanup failed; inspect ~/.factory before removing DCG."
+            return 1
+        fi
+    fi
+    if [ "$project_hook" -eq 1 ]; then
+        if ! (cd "$repo_root" && "$dcg_bin" uninstall --droid --project); then
+            warn "Factory Droid project hook cleanup failed at $repo_root/.factory."
+            return 1
+        fi
+    fi
+    return 0
+}
+
 unconfigure_reasonix() {
     # Reasonix hook (#358): <Reasonix home>/settings.json (REASONIX_HOME, else
     # ~/.reasonix) plus any repo-local .reasonix/settings.json written by
@@ -1740,6 +1816,13 @@ main() {
         # cleanup can re-enumerate and report precise marker/removal failures.
         [ "$omp_inventory_status" -ne 2 ] || found_anything=1
     fi
+    local droid_repo_root=""
+    droid_repo_root=$(current_repo_root) || true
+    if droid_may_have_dcg_hooks "$HOME/.factory" ||
+        { [ -n "$droid_repo_root" ] && droid_may_have_dcg_hooks "$droid_repo_root/.factory"; }; then
+        log "  • Factory Droid DCG hook entries (user and current project)"
+        found_anything=1
+    fi
 
     # Config
     if { [ "$KEEP_CONFIG" -eq 0 ] || [ "$KEEP_HISTORY" -eq 0 ]; } &&
@@ -1791,7 +1874,7 @@ main() {
             echo
             log "${YELLOW}Cannot read confirmation (no TTY available).${NC}"
             log "${YELLOW}Re-run with --yes to skip the prompt, e.g.:${NC}"
-            log "    curl -fsSL https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/uninstall.sh | bash -s -- --yes"
+            log "    bash ./uninstall.sh --yes  # from your reviewed local checkout"
             return 1
         fi
         case "$response" in
@@ -1820,6 +1903,10 @@ main() {
     report_unconfigure "OpenCode plugin" unconfigure_opencode
     report_unconfigure "Crush hook" unconfigure_crush
     report_unconfigure "Reasonix hook" unconfigure_reasonix
+    if ! unconfigure_droid "$binary"; then
+        err "Factory Droid hook cleanup is incomplete; retaining the DCG binary."
+        return 1
+    fi
     report_unconfigure "Oh My Pi extension" unconfigure_omp
 
     # Remove Aider config

@@ -2,27 +2,42 @@
 #
 # dcg installer
 #
-# One-liner install (with cache buster):
-#   curl -fsSL "https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/install.sh?$(date +%s)" | bash
-#
-# Or without cache buster:
-#   curl -fsSL https://raw.githubusercontent.com/JJLiebig/destructive_command_guard/main/install.sh | bash
+# Authenticate a pinned release installer before running this script:
+#   https://github.com/JJLiebig/destructive_command_guard#this-fork-ask-before-dcg-flagged-codex-commands
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
 #   --dest DIR         Install to DIR (default: ~/.local/bin)
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
-#   --verify           Run self-test after install
+#   --verify           Self-test the candidate before installing
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
-#   --no-configure     Skip AI agent hook configuration
+#   --no-configure     Skip AI agent hook configuration and shell completions
 #   --no-verify        Skip checksum + signature verification (for testing only)
 #   --require-minisign Require a valid release .minisig and the minisign tool
 #   --minisign-url URL Override the adjacent .minisig URL (including file://)
 #   --offline          Skip network preflight checks
 #
+
+# This is a bash script, and must stay parseable by macOS /bin/bash 3.2.
+# Piped into another shell (`| sh` where sh is dash, `| zsh`), it would fail
+# later with an unrelated-looking error, so stop here with the fix instead.
+# Keep this block POSIX sh: it runs before anything bash-specific is parsed.
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf '%s\n' \
+    'dcg installer: this script needs bash. Authenticate the release installer first:' \
+    '  https://github.com/JJLiebig/destructive_command_guard#this-fork-ask-before-dcg-flagged-codex-commands' >&2
+  exit 1
+fi
+# bash run as `sh` starts in POSIX mode, which rejects the process
+# substitutions below. The script reads on command by command, so leaving
+# POSIX mode here is enough for the rest of it to parse.
+case ":${SHELLOPTS:-}:" in
+  *:posix:*) set +o posix ;;
+esac
+
 set -euo pipefail
 umask 022
 shopt -s lastpipe 2>/dev/null || true
@@ -252,6 +267,7 @@ POSIT_ASSISTANT_VERSION=""
 OPENCODE_VERSION=""
 CRUSH_VERSION=""
 REASONIX_VERSION=""
+DROID_VERSION=""
 OMP_VERSION=""
 
 print_agent_scan_notice() {
@@ -520,6 +536,15 @@ detect_agents() {
     [[ -n "$reasonix_bin" ]] && REASONIX_VERSION=$(try_version "$reasonix_bin")
   fi
 
+  # Factory Droid uses ~/.factory and an optional native `droid` CLI.
+  local droid_bin
+  droid_bin=$(builtin type -P droid 2>/dev/null || true)
+  if [[ -d "$HOME/.factory" ]] \
+    || [[ -n "$droid_bin" && -f "$droid_bin" && -x "$droid_bin" ]]; then
+    DETECTED_AGENTS+=("droid")
+    [[ -n "$droid_bin" ]] && DROID_VERSION=$(try_version "$droid_bin")
+  fi
+
   # Oh My Pi (`omp`) — require an external executable on PATH. Config/profile
   # state can outlive an uninstall, while command lookup also accepts aliases
   # and functions that the non-interactive installer cannot safely identify as
@@ -608,6 +633,11 @@ print_detected_agents() {
           [[ -n "$REASONIX_VERSION" ]] && ver_info=" (${REASONIX_VERSION})"
           gum style --foreground 42 "  ✓ Reasonix${ver_info}"
           ;;
+        droid)
+          local ver_info=""
+          [[ -n "$DROID_VERSION" ]] && ver_info=" (${DROID_VERSION})"
+          gum style --foreground 42 "  ✓ Factory Droid${ver_info}"
+          ;;
         omp)
           local ver_info=""
           [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
@@ -681,6 +711,11 @@ print_detected_agents() {
           [[ -n "$REASONIX_VERSION" ]] && ver_info=" (${REASONIX_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Reasonix${ver_info}"
           ;;
+        droid)
+          local ver_info=""
+          [[ -n "$DROID_VERSION" ]] && ver_info=" (${DROID_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Factory Droid${ver_info}"
+          ;;
         omp)
           local ver_info=""
           [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
@@ -727,19 +762,20 @@ normalize_version_tag() {
   printf 'v%s\n' "$without_v"
 }
 
-get_installed_version() {
+get_binary_version() {
+  local dcg_path="$1"
   local output=""
   local line
   local candidate
   local normalized
 
-  if [ ! -x "$DEST/dcg" ]; then
+  if [ ! -x "$dcg_path" ]; then
     return 1
   fi
 
-  output=$("$DEST/dcg" --version 2>/dev/null) || return 1
+  output=$("$dcg_path" --version 2>/dev/null) || return 1
   if [ -z "$output" ]; then
-    output=$(NO_COLOR=1 "$DEST/dcg" --version 2>&1) || return 1
+    output=$(NO_COLOR=1 "$dcg_path" --version 2>&1) || return 1
   fi
 
   while IFS= read -r line; do
@@ -766,17 +802,18 @@ check_installed_version() {
   local target_normalized
 
   target_normalized=$(normalize_version_tag "$target_version") || return 1
-  installed_version=$(get_installed_version) || return 1
+  installed_version=$(get_binary_version "$DEST/dcg") || return 1
   [ "$target_normalized" = "$installed_version" ]
 }
 
-assert_installed_version() {
-  local expected_version="${1:-}"
+assert_binary_version() {
+  local dcg_path="$1"
+  local expected_version="${2:-}"
   local reported_version
   local expected_normalized
 
-  if ! reported_version=$(get_installed_version); then
-    err "Installed dcg failed its --version check"
+  if ! reported_version=$(get_binary_version "$dcg_path"); then
+    err "The dcg binary failed its --version check"
     return 1
   fi
 
@@ -786,22 +823,75 @@ assert_installed_version() {
       return 1
     }
     if [ "$reported_version" != "$expected_normalized" ]; then
-      err "Installed dcg version mismatch: expected ${expected_normalized}, got ${reported_version}"
+      err "dcg version mismatch: expected ${expected_normalized}, got ${reported_version}"
       return 1
     fi
   fi
 
-  ok "Installed version verified: ${reported_version#v}"
+  ok "Binary version verified: ${reported_version#v}"
+}
+
+# Put the binary at $DEST/dcg with a single rename(2).
+#
+# Running agents exec the hook on every shell tool call. `install -m` (GNU and
+# BSD alike) unlinks the target and then copies, so a hook starting during the
+# copy found no file or a partial one (bd-0zx5). The staged copy sits in $DEST,
+# so the final `mv -f` stays on one filesystem: a hook sees the old binary or
+# the new one, never neither. Qualify the actual staged bytes before that
+# rename: a candidate with the wrong version or a failed requested self-test
+# must never replace a working guard. Failed qualification or promotion leaves
+# the incumbent's bytes and executable mode unchanged.
+install_binary_atomically() {
+  local src="$1"
+  local expected_version="${2:-}"
+  local verify="${3:-0}"
+  local staged
+
+  # Without this guard, mv treats an existing directory (including a symlink
+  # to one) as a container and reports success without installing $DEST/dcg.
+  if [ -d "$DEST/dcg" ]; then
+    err "Cannot replace directory at $DEST/dcg with the dcg binary"
+    return 1
+  fi
+  if ! staged=$(mktemp "$DEST/.dcg.XXXXXX"); then
+    err "Cannot create a temporary file in $DEST"
+    return 1
+  fi
+  if ! cp "$src" "$staged" || ! chmod 0755 "$staged"; then
+    rm -f "$staged"
+    err "Cannot stage the dcg binary in $DEST"
+    return 1
+  fi
+  if ! assert_binary_version "$staged" "$expected_version"; then
+    rm -f "$staged"
+    err "The new dcg binary failed its --version check; $DEST/dcg was not replaced"
+    return 1
+  fi
+  if [ "$verify" -eq 1 ] && ! run_install_self_test "$staged"; then
+    rm -f "$staged"
+    err "The new dcg binary failed its self-test; $DEST/dcg was not replaced"
+    return 1
+  fi
+  if ! mv -f "$staged" "$DEST/dcg"; then
+    rm -f "$staged"
+    err "Cannot move the new dcg binary into place at $DEST/dcg"
+    return 1
+  fi
 }
 
 run_install_self_test() {
   local allow_output
-  local dcg_path
+  local dcg_path="${1:-$DEST/dcg}"
   local deny_output
   local deny_status
 
   info "Running self-test"
-  dcg_path="$(cd -- "$DEST" && pwd -P)/dcg"
+  # The probes run outside the project and with isolated user configuration.
+  # Resolve a relative staged path before changing their working directory.
+  case "$dcg_path" in
+    /*) ;;
+    *) dcg_path="$(pwd -P)/$dcg_path" ;;
+  esac
   if ! allow_output=$(cd "$TMP" && \
     HOME="$TMP/selftest-home" XDG_CONFIG_HOME="$TMP/selftest-xdg" \
     "$dcg_path" test --format json "git status" 2>&1); then
@@ -846,7 +936,7 @@ resolve_version() {
   info "Resolving latest version..."
   local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
   local tag
-  if ! tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
+  if ! tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n 1 | sed -E 's/.*"([^"]*)"$/\1/'); then
     tag=""
   fi
 
@@ -1074,8 +1164,12 @@ maybe_add_shell_check() {
   # Add a shell startup check that warns if the DCG hook has been silently
   # removed from the active Claude Code settings. Silent when present, fast (ms),
   # and only runs when both dcg and jq are on PATH.
-  local snippet
-  snippet=$(cat <<'EOFSNIPPET'
+  # Read with `read -d ''`, not `$(cat <<EOF)`: bash 3.2 (macOS /bin/bash)
+  # cannot parse the snippet's `case` patterns inside a command substitution,
+  # so the whole installer failed to parse there. The trailing newline that
+  # `$(...)` used to strip is removed below, keeping the snippet byte-identical.
+  local snippet=""
+  IFS= read -r -d '' snippet <<'EOFSNIPPET' || true
 
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
@@ -1099,7 +1193,7 @@ if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
   )
 fi
 EOFSNIPPET
-  )
+  snippet="${snippet%$'\n'}"
   # The snippet minus its leading blank line: what a managed region should
   # contain, used both as the is-current test and the repair replacement.
   local body="${snippet#?}"
@@ -1277,6 +1371,22 @@ install_completions_for_shell() {
   # Generate and install completions
   local error_output
   if error_output=$("$bin" completions "$shell" 2>&1) && [ -n "$error_output" ]; then
+    if [ -f "$target" ] && printf '%s\n' "$error_output" | cmp -s - "$target"; then
+      ok "$shell completions at $target are current"
+      return 0
+    fi
+    # Keep a different existing file, as the agent-config steps do (bd-qny3).
+    # The backup is a dotfile: zsh's compinit loads every `_*` file on fpath,
+    # so `_dcg.bak.*` would register a second, older `#compdef dcg`.
+    if [ -f "$target" ]; then
+      local backup
+      backup="$(dirname "$target")/.$(basename "$target").bak.$(date +%Y%m%d%H%M%S)"
+      if ! cp -p "$target" "$backup"; then
+        warn "Could not back up $target; leaving the existing $shell completions unchanged"
+        return 1
+      fi
+      info "Backed up the previous $shell completions to $backup"
+    fi
     printf '%s\n' "$error_output" > "$target"
 
     # When the installer is running as root under sudo, the directory tree we
@@ -1310,6 +1420,12 @@ install_completions_for_shell() {
 
 maybe_install_completions() {
   local shell=""
+  # --no-configure (`dcg update --binary-only`) changes only the binary in
+  # --dest; completions live in the caller's home like the hook settings.
+  if [ "$NO_CONFIGURE" -eq 1 ]; then
+    info "Shell completions: skipped (--no-configure)"
+    return 0
+  fi
   if ! shell=$(detect_default_shell); then
     # Distinguish the "running as root with no caller to attribute" case
     # (e.g. logged in directly as root, no sudo) from "user has an exotic
@@ -1584,12 +1700,13 @@ Options:
   --dest DIR         Install to DIR (default: ~/.local/bin)
   --system           Install to /usr/local/bin (requires sudo)
   --easy-mode        Auto-update PATH in shell rc files
-  --verify           Run self-test after install
+  --verify           Self-test the candidate before installing
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
   --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
-  --no-configure     Skip AI agent hook configuration
+  --no-configure     Change only the binary: skip agent hook configuration,
+                     the shell startup check and shell completions
   --minisign-url URL Override the adjacent .minisig URL (supports file://)
   --require-minisign Require a valid .minisig and the minisign verifier
   --no-verify        Skip checksum + signature verification (for testing only)
@@ -1715,7 +1832,10 @@ trap cleanup EXIT
 # Reusing an installed version still configures the active agent settings, so
 # keep that mutation under the same lock as a fresh or source installation.
 if [ "$FORCE_INSTALL" -eq 0 ] && [ "$REQUIRE_MINISIGN" -eq 0 ] && check_installed_version "$VERSION"; then
-  assert_installed_version "$VERSION" || exit 1
+  assert_binary_version "$DEST/dcg" "$VERSION" || exit 1
+  if [ "$VERIFY" -eq 1 ]; then
+    run_install_self_test "$DEST/dcg" || exit 1
+  fi
   ok "dcg $VERSION is already installed at $DEST/dcg"
   info "Use --force to reinstall"
   maybe_install_completions
@@ -1746,13 +1866,9 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   (cd "$TMP/src" && cargo build --release)
   BIN="$TMP/src/target/release/dcg"
   [ -x "$BIN" ] || { err "Build failed"; exit 1; }
-  install -m 0755 "$BIN" "$DEST/dcg"
+  install_binary_atomically "$BIN" "$VERSION" "$VERIFY" || exit 1
   ok "Installed to $DEST/dcg (source build)"
-  assert_installed_version "$VERSION" || exit 1
   maybe_add_path
-  if [ "$VERIFY" -eq 1 ]; then
-    run_install_self_test || exit 1
-  fi
   ok "Done. Binary at: $DEST/dcg"
   maybe_install_completions
   return 0
@@ -1842,14 +1958,9 @@ BIN="$TMP/dcg.extracted"
 tar -xOf "$TMP/$TAR" dcg > "$BIN" || { err "Cannot stream dcg from release archive"; exit 1; }
 [ -s "$BIN" ] || { err "Release archive contained an empty dcg binary"; exit 1; }
 chmod 0755 "$BIN"
-install -m 0755 "$BIN" "$DEST/dcg"
+install_binary_atomically "$BIN" "$VERSION" "$VERIFY" || exit 1
 ok "Installed to $DEST/dcg"
-assert_installed_version "$VERSION" || exit 1
 maybe_add_path
-
-if [ "$VERIFY" -eq 1 ]; then
-  run_install_self_test || exit 1
-fi
 
 ok "Done. Binary at: $DEST/dcg"
 maybe_install_completions
@@ -1991,6 +2102,8 @@ CRUSH_STATUS=""  # "created"|"merged"|"skipped"|"failed"
 CRUSH_FAILURE_REASON=""
 REASONIX_STATUS=""  # "created"|"merged"|"skipped"|"failed"
 REASONIX_FAILURE_REASON=""
+DROID_STATUS=""  # "configured"|"skipped"|"failed"
+DROID_FAILURE_REASON=""
 OMP_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
 OMP_FAILURE_REASON=""
 POSIT_ASSISTANT_BACKUP=""
@@ -2007,6 +2120,7 @@ configure_claude_code() {
   local settings_file="$1"
   local cleanup_predecessor="$2"
   CLAUDE_FAILURE_REASON=""
+  CLAUDE_BACKUP=""
   # Default to cleaning up predecessor if not specified or empty
   [ -z "$cleanup_predecessor" ] && cleanup_predecessor=1
   local settings_dir
@@ -2019,7 +2133,16 @@ configure_claude_code() {
 
   # Always create the config directory if it doesn't exist
   if [ ! -d "$settings_dir" ]; then
-    mkdir -p "$settings_dir"
+    if ! mkdir -p "$settings_dir"; then
+      CLAUDE_STATUS="failed"
+      CLAUDE_FAILURE_REASON="could not create settings directory"
+      return 0
+    fi
+  fi
+  if { [ -e "$settings_file" ] || [ -L "$settings_file" ]; } && [ ! -f "$settings_file" ]; then
+    CLAUDE_STATUS="failed"
+    CLAUDE_FAILURE_REASON="settings.json is not a regular file; left unchanged"
+    return 0
   fi
 
   if [ -f "$settings_file" ]; then
@@ -2028,7 +2151,7 @@ configure_claude_code() {
     # must fall through to the merge path.
     if command -v python3 >/dev/null 2>&1; then
       local claude_hook_state
-      claude_hook_state=$(python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
+      if ! claude_hook_state=$(python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
 import json
 import os
 import shlex
@@ -2036,11 +2159,26 @@ import sys
 
 settings_file = sys.argv[1]
 dcg_path = sys.argv[2]
+dcg_command = shlex.quote(dcg_path)
 cleanup_predecessor = sys.argv[3] == "1" if len(sys.argv) > 3 else True
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
 
 def is_dcg_command(cmd):
     if not isinstance(cmd, str) or not cmd:
         return False
+    # Older installers emitted this exact path without shell quoting.
+    if cmd == dcg_path:
+        return True
     try:
         tokens = shlex.split(cmd)
     except ValueError:
@@ -2053,15 +2191,16 @@ def is_dcg_command(cmd):
     return name == 'dcg'
 
 try:
-    with open(settings_file, 'r') as f:
+    with open(settings_file, 'r', encoding='utf-8') as f:
         raw_settings = f.read()
-except IOError:
-    print("merge")
+except (OSError, UnicodeError):
+    print("invalid")
     raise SystemExit(0)
 
 if raw_settings.strip():
     try:
-        settings = json.loads(raw_settings)
+        settings = json.loads(raw_settings, object_pairs_hook=unique_object,
+                              parse_constant=invalid_constant)
     except (ValueError, json.JSONDecodeError):
         print("invalid")
         raise SystemExit(0)
@@ -2094,8 +2233,6 @@ for entry in pre_tool_use:
     if not isinstance(entry, dict):
         continue
     matcher = entry.get("matcher")
-    if matcher != CANONICAL_MATCHER and matcher not in LEGACY_MATCHERS:
-        continue
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
         print("invalid")
@@ -2104,7 +2241,9 @@ for entry in pre_tool_use:
         if not isinstance(hook, dict):
             continue
         cmd = hook.get("command")
-        if isinstance(cmd, str) and "git_safety_guard" in cmd:
+        if ((matcher == CANONICAL_MATCHER or matcher in LEGACY_MATCHERS)
+                and isinstance(cmd, str) and "git_safety_guard" in cmd
+                and not is_dcg_command(cmd)):
             predecessor_present = True
         if is_dcg_command(cmd):
             dcg_commands.append(cmd)
@@ -2116,20 +2255,28 @@ if isinstance(first_entry, dict) and first_entry.get("matcher") == CANONICAL_MAT
     if isinstance(first_hooks, list) and first_hooks:
         first_hook = first_hooks[0]
         if isinstance(first_hook, dict):
-            canonical_entry_is_first = first_hook.get("command") == dcg_path
+            canonical_entry_is_first = (
+                first_hook.get("type") == "command"
+                and first_hook.get("command") == dcg_command
+                and "shell" not in first_hook
+            )
 
 if cleanup_predecessor and predecessor_present:
     print("merge")
-elif dcg_commands == [dcg_path] and canonical_entry_is_first:
+elif dcg_commands == [dcg_command] and canonical_entry_is_first:
     print("already")
 else:
     print("merge")
 PYEOF
-)
+      ); then
+        CLAUDE_STATUS="failed"
+        CLAUDE_FAILURE_REASON="could not inspect existing settings.json; left unchanged"
+        return 0
+      fi
       if [ "$claude_hook_state" = "invalid" ]; then
         CLAUDE_STATUS="failed"
-        CLAUDE_FAILURE_REASON="existing settings.json is invalid or has malformed hooks; left unchanged"
-        warn "Claude Code settings.json is invalid or has malformed hooks; leaving it unchanged: $settings_file"
+        CLAUDE_FAILURE_REASON="existing settings.json is unreadable, invalid or has malformed hooks; left unchanged"
+        warn "Claude Code settings.json is unreadable, invalid or has malformed hooks; leaving it unchanged: $settings_file"
         return 0
       fi
       if [ "$claude_hook_state" = "already" ]; then
@@ -2165,20 +2312,51 @@ PYEOF
       fi
     fi
 
-    # Settings file exists, need to merge
-    CLAUDE_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$settings_file" "$CLAUDE_BACKUP"
+    if ! command -v python3 >/dev/null 2>&1; then
+      CLAUDE_STATUS="failed"
+      CLAUDE_FAILURE_REASON="python3 required for merge"
+      return 1
+    fi
 
-    if command -v python3 >/dev/null 2>&1; then
-      if python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
+    # Keep the original before attempting a repair. A failed backup must not
+    # turn a recoverable configuration error into a destructive update.
+    local backup_base backup_suffix=0
+    backup_base="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
+    CLAUDE_BACKUP="$backup_base"
+    while [ -e "$CLAUDE_BACKUP" ] || [ -L "$CLAUDE_BACKUP" ]; do
+      backup_suffix=$((backup_suffix + 1))
+      CLAUDE_BACKUP="${backup_base}.${backup_suffix}"
+    done
+    if ! cp "$settings_file" "$CLAUDE_BACKUP"; then
+      CLAUDE_STATUS="failed"
+      CLAUDE_FAILURE_REASON="could not back up existing settings.json; left unchanged"
+      CLAUDE_BACKUP=""
+      return 0
+    fi
+
+    if python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
 import json
 import os
 import shlex
+import stat
 import sys
+import tempfile
 
 settings_file = sys.argv[1]
 dcg_path = sys.argv[2]
+dcg_command = shlex.quote(dcg_path)
 cleanup_predecessor = sys.argv[3] == "1" if len(sys.argv) > 3 else True
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
 
 def is_dcg_command(cmd):
     """True iff `cmd` invokes the dcg binary (basename match, not substring).
@@ -2189,8 +2367,12 @@ def is_dcg_command(cmd):
     causing the installer to skip merge ("dcg already there!") or, worse,
     causing the uninstaller to delete those entries on its --purge run.
     """
-    if not cmd:
+    if not isinstance(cmd, str) or not cmd:
         return False
+    # Recover fields from the unquoted path emitted by older installers,
+    # without mistaking an unrelated command's arguments for an executable.
+    if cmd == dcg_path:
+        return True
     try:
         tokens = shlex.split(cmd)
     except ValueError:
@@ -2204,16 +2386,17 @@ def is_dcg_command(cmd):
         name = name[:-4]
     return name == 'dcg'
 
-raw_settings = ""
 try:
-    with open(settings_file, 'r') as f:
+    with open(settings_file, 'r', encoding='utf-8') as f:
         raw_settings = f.read()
-except IOError:
-    settings = {}
+except (OSError, UnicodeError) as error:
+    print(f"cannot read Claude Code settings.json: {settings_file}: {error}", file=sys.stderr)
+    raise SystemExit(1)
 
 if raw_settings.strip():
     try:
-        settings = json.loads(raw_settings)
+        settings = json.loads(raw_settings, object_pairs_hook=unique_object,
+                              parse_constant=invalid_constant)
     except (ValueError, json.JSONDecodeError):
         print(f"invalid Claude Code settings.json: {settings_file}", file=sys.stderr)
         raise SystemExit(1)
@@ -2242,10 +2425,32 @@ elif not isinstance(settings['hooks']['PreToolUse'], list):
 CANONICAL_MATCHER = "Bash|PowerShell|Monitor"
 LEGACY_MATCHERS = ("Bash", "Bash|PowerShell")
 
-# First pass: strip dcg (and, when asked, its predecessor) out of every entry
-# dcg may previously have owned. Other hooks keep their own matcher so their
-# scope is never silently widened; entries emptied by the strip are dropped.
+# Match #345's ownership rule in src/cli.rs: only identity is ours. Keep all
+# other fields, including future host settings. Compatible duplicates can be
+# combined; conflicting operator choices cannot safely be guessed (#582).
+DCG_OWNED_HOOK_KEYS = {"type", "command", "shell"}
+host_owned_fields = {}
+
+def preserve_hook_fields(hook):
+    for key, value in hook.items():
+        if key in DCG_OWNED_HOOK_KEYS:
+            continue
+        if key in host_owned_fields and json.dumps(
+            host_owned_fields[key], sort_keys=True
+        ) != json.dumps(value, sort_keys=True):
+            print(
+                f"conflicting operator-owned DCG hook field {key!r}; "
+                f"reconcile duplicate registrations in {settings_file}; left unchanged",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        host_owned_fields[key] = value
+
+# Remove recognized dcg hooks under every matcher, as the Rust repair does.
+# Other hooks retain their matcher, metadata, and order. Reuse the first
+# canonical entry so its metadata stays attached to the repaired registration.
 new_pre_tool_use = []
+canonical_entry = None
 predecessor_removed = False
 
 for entry in settings['hooks']['PreToolUse']:
@@ -2253,9 +2458,6 @@ for entry in settings['hooks']['PreToolUse']:
         new_pre_tool_use.append(entry)
         continue
     matcher = entry.get('matcher')
-    if matcher != CANONICAL_MATCHER and matcher not in LEGACY_MATCHERS:
-        new_pre_tool_use.append(entry)
-        continue
     if 'hooks' not in entry:
         new_pre_tool_use.append(entry)
         continue
@@ -2263,58 +2465,121 @@ for entry in settings['hooks']['PreToolUse']:
         print(f"Claude Code {matcher} matcher hooks must contain a list: {settings_file}", file=sys.stderr)
         raise SystemExit(1)
     kept_hooks = []
+    removed = False
     for hook in entry['hooks']:
-        if isinstance(hook, dict) and 'command' in hook:
-            cmd = hook.get('command', '')
-            if 'git_safety_guard' in cmd:
-                if cleanup_predecessor:
-                    predecessor_removed = True
-                    continue  # Skip predecessor
-                kept_hooks.append(hook)  # Keep predecessor
-            elif not is_dcg_command(cmd):  # Don't duplicate dcg
-                kept_hooks.append(hook)
-        else:
-            kept_hooks.append(hook)
-    if kept_hooks:
+        if isinstance(hook, dict):
+            cmd = hook.get('command')
+            if is_dcg_command(cmd):
+                preserve_hook_fields(hook)
+                removed = True
+                continue
+            if (cleanup_predecessor
+                    and (matcher == CANONICAL_MATCHER or matcher in LEGACY_MATCHERS)
+                    and isinstance(cmd, str) and 'git_safety_guard' in cmd):
+                predecessor_removed = True
+                removed = True
+                continue
+        kept_hooks.append(hook)
+    if matcher == CANONICAL_MATCHER and canonical_entry is None:
+        entry['hooks'] = kept_hooks
+        canonical_entry = entry
+    elif kept_hooks or not removed:
         entry['hooks'] = kept_hooks
         new_pre_tool_use.append(entry)
 
 # Add exactly one current dcg hook, first, so it runs before any other hook.
 # Existing dcg hooks, including stale paths, duplicates, and both legacy
 # matcher registrations, were collapsed above.
-new_pre_tool_use.insert(0, {
-    "matcher": CANONICAL_MATCHER,
-    "hooks": [{"type": "command", "command": dcg_path}]
-})
+desired_hook = {"type": "command", "command": dcg_command}
+desired_hook.update(host_owned_fields)
+if canonical_entry is None:
+    canonical_entry = {"matcher": CANONICAL_MATCHER, "hooks": []}
+canonical_entry['hooks'].insert(0, desired_hook)
+new_pre_tool_use.insert(0, canonical_entry)
 
 settings['hooks']['PreToolUse'] = new_pre_tool_use
 
-with open(settings_file, 'w') as f:
-    json.dump(settings, f, indent=2)
+# Serialize before touching disk, then atomically publish next to the resolved
+# target. Preserve symlinks (e.g. stow/chezmoi) and the operator's file mode.
+# A read, serialization, staging, or replacement failure leaves the old file.
+serialized = json.dumps(settings, indent=2, allow_nan=False) + "\n"
+target = os.path.realpath(settings_file)
+original_stat = os.stat(target)
+fd, temporary = tempfile.mkstemp(prefix='.settings.json.', suffix='.tmp',
+                               dir=os.path.dirname(target))
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        staged_stat = os.fstat(f.fileno())
+        if (staged_stat.st_uid, staged_stat.st_gid) != (original_stat.st_uid, original_stat.st_gid):
+            os.fchown(f.fileno(), original_stat.st_uid, original_stat.st_gid)
+        os.fchmod(f.fileno(), stat.S_IMODE(original_stat.st_mode))
+        f.write(serialized)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, target)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
 
 if predecessor_removed:
     print("PREDECESSOR_CLEANED", file=sys.stderr)
 PYEOF
-      then
-        CLAUDE_STATUS="merged"
-        AUTO_CONFIGURED=1
-      else
-        mv "$CLAUDE_BACKUP" "$settings_file" 2>/dev/null || true
-        CLAUDE_STATUS="failed"
-        CLAUDE_FAILURE_REASON="merge failed; restored backup"
-        CLAUDE_BACKUP=""
-      fi
+    then
+      CLAUDE_STATUS="merged"
+      AUTO_CONFIGURED=1
     else
-      # python3 not available - remove unnecessary backup
-      rm -f "$CLAUDE_BACKUP" 2>/dev/null || true
-      CLAUDE_BACKUP=""
       CLAUDE_STATUS="failed"
-      CLAUDE_FAILURE_REASON="python3 required for merge"
-      return 1
+      CLAUDE_FAILURE_REASON="merge failed; existing settings left unchanged (see diagnostic)"
     fi
   else
-    # Create new settings file
-    cat > "$settings_file" <<EOFSET
+    # Fresh settings must use the same JSON and shell quoting as repairs.
+    if command -v python3 >/dev/null 2>&1; then
+      if python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+import tempfile
+
+settings_file = os.path.abspath(sys.argv[1])
+settings = {"hooks": {"PreToolUse": [{
+    "matcher": "Bash|PowerShell|Monitor",
+    "hooks": [{"type": "command", "command": shlex.quote(sys.argv[2])}]
+}]}}
+serialized = json.dumps(settings, indent=2) + "\n"
+fd, temporary = tempfile.mkstemp(prefix='.settings.json.', suffix='.tmp',
+                               dir=os.path.dirname(settings_file))
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(serialized)
+        f.flush()
+        os.fsync(f.fileno())
+    # Publish only if still absent; never overwrite settings created meanwhile.
+    os.link(temporary, settings_file)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PYEOF
+      then
+        CLAUDE_STATUS="created"
+        AUTO_CONFIGURED=1
+      else
+        CLAUDE_STATUS="failed"
+        CLAUDE_FAILURE_REASON="could not create settings.json; existing settings left unchanged"
+      fi
+      return 0
+    fi
+
+    # Without Python, only paths needing neither shell nor JSON escaping can
+    # be safely emitted. Existing settings are never rewritten by this path.
+    case "$DEST/dcg" in
+      *[!a-zA-Z0-9_./-]*)
+        CLAUDE_STATUS="failed"
+        CLAUDE_FAILURE_REASON="python3 required to quote the hook command"
+        return 1
+        ;;
+    esac
+    if ! (set -C; cat > "$settings_file" <<EOFSET
 {
   "hooks": {
     "PreToolUse": [
@@ -2331,15 +2596,274 @@ PYEOF
   }
 }
 EOFSET
+    ); then
+      CLAUDE_STATUS="failed"
+      CLAUDE_FAILURE_REASON="could not create settings.json; existing settings left unchanged"
+      return 0
+    fi
     CLAUDE_STATUS="created"
     AUTO_CONFIGURED=1
   fi
 }
 
+configure_json_policy_hook() {
+  # Shared by Gemini, Codex and Posit. Match Claude's #345/#582 ownership
+  # rule: operator policy survives identity repair, including duplicates.
+  local settings_file="$1" host="$2" settings_dir
+  JSON_HOOK_STATUS="failed"
+  JSON_HOOK_FAILURE_REASON=""
+  JSON_HOOK_BACKUP=""
+  case "$settings_file" in
+    */*) settings_dir="${settings_file%/*}"; [ -n "$settings_dir" ] || settings_dir="/" ;;
+    *) settings_dir="." ;;
+  esac
+  if ! mkdir -p "$settings_dir"; then
+    JSON_HOOK_FAILURE_REASON="could not create settings directory"
+    return 0
+  fi
+  if { [ -e "$settings_file" ] || [ -L "$settings_file" ]; } && [ ! -f "$settings_file" ]; then
+    JSON_HOOK_FAILURE_REASON="settings path is not a regular file; left unchanged"
+    return 0
+  fi
+
+  local existed=0 backup_base backup_path backup_suffix=0
+  [ ! -f "$settings_file" ] || existed=1
+  if ! command -v python3 >/dev/null 2>&1; then
+    # Keep dependency-free fresh installs for paths needing no shell/JSON
+    # escaping. Existing settings require a real parser and stay untouched.
+    if [ "$existed" -eq 1 ]; then
+      JSON_HOOK_FAILURE_REASON="python3 required to safely merge existing settings"
+      return 0
+    fi
+    case "$DEST/dcg" in
+      *[!a-zA-Z0-9_./-]*)
+        JSON_HOOK_FAILURE_REASON="python3 required to quote the hook command"
+        return 0
+        ;;
+    esac
+    local event matcher hook_json
+    case "$host" in
+      gemini)
+        event="BeforeTool"; matcher="run_shell_command"
+        hook_json="\"name\":\"dcg\",\"type\":\"command\",\"command\":\"$DEST/dcg\",\"timeout\":5000"
+        ;;
+      codex)
+        event="PreToolUse"; matcher="Bash"
+        hook_json="\"type\":\"command\",\"command\":\"$DEST/dcg\""
+        ;;
+      posit)
+        event="PreToolUse"; matcher="bash|powershell"
+        hook_json="\"type\":\"command\",\"command\":\"\\\"$DEST/dcg\\\"\",\"timeout\":10"
+        ;;
+      *) JSON_HOOK_FAILURE_REASON="unknown hook host"; return 0 ;;
+    esac
+    if (set -C; printf '{"hooks":{"%s":[{"matcher":"%s","hooks":[{%s}]}]}}\n' \
+        "$event" "$matcher" "$hook_json" > "$settings_file"); then
+      JSON_HOOK_STATUS="created"
+      AUTO_CONFIGURED=1
+    else
+      JSON_HOOK_FAILURE_REASON="could not create settings; existing file left unchanged"
+    fi
+    return 0
+  fi
+
+  backup_base="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
+  backup_path="$backup_base"
+  while [ -e "$backup_path" ] || [ -L "$backup_path" ]; do
+    backup_suffix=$((backup_suffix + 1))
+    backup_path="${backup_base}.${backup_suffix}"
+  done
+  local hook_state
+  if hook_state=$(python3 - "$settings_file" "$DEST/dcg" "$host" "$existed" "$backup_path" <<'PYEOF'
+import json
+import os
+import shlex
+import stat
+import sys
+import tempfile
+
+settings_file, dcg_path, host, existed, backup_path = sys.argv[1:]
+existed = existed == "1"
+owned_keys = {"type", "command", "shell"}
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
+
+def is_dcg_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    if command == dcg_path:
+        return True  # Recover the old unquoted current executable path.
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(words) and words[0].replace('\\', '/').rsplit('/', 1)[-1] in ('dcg', 'dcg.exe')
+
+def configure():
+    command = shlex.quote(dcg_path)
+    event, matcher, defaults = {
+        "gemini": ("BeforeTool", "run_shell_command", {"name": "dcg", "timeout": 5000}),
+        "codex": ("PreToolUse", "Bash", {"statusMessage": "dcg (destructive command guard)"}),
+        "posit": ("PreToolUse", "bash|powershell", {"timeout": 10}),
+    }[host]
+    if host == "posit":
+        # Preserve Posit's quoted-path contract, escaping shell expansions as
+        # well as quotes/backslashes. JSON encoding is handled separately.
+        command = '"' + ''.join('\\' + c if c in '\\"$`' else c for c in dcg_path) + '"'
+    identity = {"type": "command", "command": command}
+    raw = b""
+    if existed:
+        with open(settings_file, 'rb') as source:
+            raw = source.read()
+        decoded = raw.decode('utf-8')
+        if decoded.strip() or host != "posit":
+            settings = json.loads(decoded, object_pairs_hook=unique_object,
+                                  parse_constant=invalid_constant)
+        else:
+            settings = {}
+    else:
+        settings = {}
+    if not isinstance(settings, dict):
+        raise ValueError("settings must contain a JSON object")
+    hooks = settings.get('hooks', {})
+    if not isinstance(hooks, dict):
+        raise ValueError("hooks must contain a JSON object")
+    entries = hooks.get(event, [])
+    if not isinstance(entries, list):
+        raise ValueError(f"{event} must contain a list")
+
+    operator_fields = {}
+    dcg_hooks = []
+    sequential = None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if 'hooks' not in entry and entry.get('matcher') != matcher:
+            continue
+        entry_hooks = entry.get('hooks')
+        if not isinstance(entry_hooks, list):
+            raise ValueError("matcher-group hooks must contain a list")
+        contains_dcg = False
+        for hook in entry_hooks:
+            if not isinstance(hook, dict) or not is_dcg_command(hook.get('command')):
+                continue
+            contains_dcg = True
+            dcg_hooks.append(hook)
+            for key, value in hook.items():
+                if key in owned_keys:
+                    continue
+                if key in operator_fields and json.dumps(operator_fields[key], sort_keys=True) != json.dumps(value, sort_keys=True):
+                    raise ValueError(f"conflicting operator-owned DCG hook field {key!r}; reconcile duplicate registrations")
+                operator_fields[key] = value
+        if host == "gemini" and (entry.get('matcher') == matcher or contains_dcg) and 'sequential' in entry:
+            if not isinstance(entry['sequential'], bool):
+                raise ValueError("Gemini sequential must be a boolean")
+            # Keep the existing conservative OR rule when consolidating DCG:
+            # a later DCG-only group's sequential:true must not disappear.
+            sequential = entry['sequential'] if sequential is None else sequential or entry['sequential']
+
+    first = entries[0] if entries else None
+    first_hooks = first.get('hooks') if isinstance(first, dict) else None
+    if (len(dcg_hooks) == 1 and isinstance(first, dict)
+            and first.get('matcher') == matcher and isinstance(first_hooks, list)
+            and first_hooks and first_hooks[0] is dcg_hooks[0]
+            and all(dcg_hooks[0].get(key) == identity.get(key) for key in owned_keys)
+            and 'shell' not in dcg_hooks[0]):
+        return "already"
+
+    retained, canonical = [], None
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get('hooks'), list):
+            retained.append(entry)
+            continue
+        original = entry['hooks']
+        kept = [hook for hook in original if not (
+            isinstance(hook, dict) and is_dcg_command(hook.get('command')))]
+        entry['hooks'] = kept
+        if entry.get('matcher') == matcher and canonical is None:
+            canonical = entry
+        elif kept or len(kept) == len(original):
+            retained.append(entry)
+    desired = dict(defaults)
+    desired.update(operator_fields)
+    desired.update(identity)
+    if canonical is None:
+        canonical = {"matcher": matcher, "hooks": []}
+    if sequential is not None:
+        canonical['sequential'] = sequential
+    canonical['hooks'].insert(0, desired)
+    retained.insert(0, canonical)
+    hooks[event] = retained
+    settings['hooks'] = hooks
+    serialized = (json.dumps(settings, indent=2, allow_nan=False) + '\n').encode('utf-8')
+
+    target = os.path.realpath(settings_file)
+    original_stat = os.stat(target) if existed else None
+    def write_contents(fd, data):
+        with os.fdopen(fd, 'wb') as output:
+            if original_stat is not None:
+                staged = os.fstat(output.fileno())
+                if (staged.st_uid, staged.st_gid) != (original_stat.st_uid, original_stat.st_gid):
+                    os.fchown(output.fileno(), original_stat.st_uid, original_stat.st_gid)
+                os.fchmod(output.fileno(), stat.S_IMODE(original_stat.st_mode))
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+
+    # Back up the exact bytes only after all validation/serialization succeeds.
+    # Exclusive creation protects earlier backups, even during same-second runs.
+    if existed:
+        backup_fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            write_contents(backup_fd, raw)
+        except BaseException:
+            os.unlink(backup_path)
+            raise
+    fd, temporary = tempfile.mkstemp(prefix='.dcg-settings.', suffix='.tmp',
+                                   dir=os.path.dirname(target))
+    try:
+        write_contents(fd, serialized)
+        if existed:
+            os.replace(temporary, target)
+        else:
+            os.link(temporary, settings_file)  # Publish only if still absent.
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return "created" if not existed or not raw.strip() else "merged"
+
+try:
+    print(configure())
+except (OSError, UnicodeError, ValueError) as error:
+    category = "cannot configure" if isinstance(error, OSError) else "invalid"
+    print(f"{category} {host} settings: {error}; existing settings left unchanged")
+    raise SystemExit(1)
+PYEOF
+  ); then
+    JSON_HOOK_STATUS="$hook_state"
+    [ ! -f "$backup_path" ] || JSON_HOOK_BACKUP="$backup_path"
+    AUTO_CONFIGURED=1
+  else
+    [ ! -f "$backup_path" ] || JSON_HOOK_BACKUP="$backup_path"
+    JSON_HOOK_FAILURE_REASON="${hook_state:-configuration failed; existing settings left unchanged}"
+    warn "$JSON_HOOK_FAILURE_REASON"
+  fi
+}
+
 configure_gemini() {
   local settings_file="$1"
-  local settings_dir
-  settings_dir=$(dirname "$settings_file")
+  local settings_dir="${settings_file%/*}"
+  [ "$settings_dir" != "$settings_file" ] || settings_dir="."
+  [ -n "$settings_dir" ] || settings_dir="/"
   GEMINI_FAILURE_REASON=""
   GEMINI_BACKUP=""
 
@@ -2350,250 +2874,10 @@ configure_gemini() {
     return 0
   fi
 
-  # Create directory if needed (gemini command exists but no config dir yet)
-  if [ ! -d "$settings_dir" ]; then
-    mkdir -p "$settings_dir"
-  fi
-
-  if [ -f "$settings_file" ]; then
-    # Check whether the exact current dcg hook is already configured. Do not
-    # trust a raw substring match: unrelated commands can contain "dcg" in
-    # their path/name and would otherwise suppress Gemini hook installation.
-    if command -v python3 >/dev/null 2>&1; then
-      local gemini_hook_state
-      gemini_hook_state=$(python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-settings_file = sys.argv[1]
-dcg_path = sys.argv[2]
-
-def is_dcg_command(cmd):
-    if not isinstance(cmd, str) or not cmd:
-        return False
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    name = os.path.basename(tokens[0])
-    if name.endswith('.exe'):
-        name = name[:-4]
-    return name == 'dcg'
-
-try:
-    with open(settings_file, 'r') as f:
-        settings = json.load(f)
-except (IOError, ValueError, json.JSONDecodeError):
-    print("invalid")
-    raise SystemExit(0)
-
-if not isinstance(settings, dict):
-    print("invalid")
-    raise SystemExit(0)
-
-hooks_obj = settings.get("hooks", {})
-if not isinstance(hooks_obj, dict):
-    print("invalid")
-    raise SystemExit(0)
-
-before_tool = hooks_obj.get("BeforeTool", [])
-if not isinstance(before_tool, list):
-    print("invalid")
-    raise SystemExit(0)
-
-dcg_commands = []
-first_shell_hook_command = None
-first_shell_matcher_seen = False
-for entry in before_tool:
-    if not isinstance(entry, dict) or entry.get("matcher") != "run_shell_command":
-        continue
-    hooks = entry.get("hooks", [])
-    if not isinstance(hooks, list):
-        print("invalid")
-        raise SystemExit(0)
-    if not first_shell_matcher_seen:
-        first_shell_matcher_seen = True
-        first_hook = hooks[0] if hooks else None
-        if isinstance(first_hook, dict):
-            first_shell_hook_command = first_hook.get("command")
-    for hook in hooks:
-        if isinstance(hook, dict) and is_dcg_command(hook.get("command")):
-            dcg_commands.append(hook.get("command"))
-
-if dcg_commands == [dcg_path] and first_shell_hook_command == dcg_path:
-    print("already")
-else:
-    print("merge")
-PYEOF
-)
-      if [ "$gemini_hook_state" = "invalid" ]; then
-        GEMINI_STATUS="failed"
-        GEMINI_FAILURE_REASON="existing settings.json is invalid or has malformed hooks; left unchanged"
-        warn "Gemini settings.json is invalid or has malformed hooks; leaving it unchanged: $settings_file"
-        return 0
-      fi
-      if [ "$gemini_hook_state" = "already" ]; then
-        GEMINI_STATUS="already"
-        AUTO_CONFIGURED=1
-        return 0
-      fi
-    else
-      # Fallback for systems without python3; the merge path below also needs
-      # python3, so only claim "already" when the exact current hook is first.
-      local dcg_hook_regex
-      local compact_settings
-      local dcg_command_marker
-      local after_first_dcg
-      dcg_hook_regex=$(printf '%s' "$DEST/dcg" | sed 's/[][\\.^$*+?{}()|]/\\&/g')
-      # tr, not GNU sed `:a;N;$!ba;...` — see the configure_claude_code
-      # fallback above for why (BSD sed compatibility).
-      compact_settings=$(LC_ALL=C tr -d '[:space:]' < "$settings_file" 2>/dev/null || true)
-      dcg_command_marker="\"command\":\"$DEST/dcg\""
-      after_first_dcg="${compact_settings#*"$dcg_command_marker"}"
-      if [ "$after_first_dcg" != "$compact_settings" ] &&
-         [ "${after_first_dcg#*"$dcg_command_marker"}" = "$after_first_dcg" ] &&
-         printf '%s\n' "$compact_settings" |
-           grep -Eq "\"matcher\":\"run_shell_command\",\"hooks\":\\[\\{[^}]*\"command\":\"$dcg_hook_regex\""; then
-        GEMINI_STATUS="already"
-        AUTO_CONFIGURED=1
-        return 0
-      fi
-    fi
-
-    GEMINI_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$settings_file" "$GEMINI_BACKUP"
-
-    if command -v python3 >/dev/null 2>&1; then
-      if python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-settings_file = sys.argv[1]
-dcg_path = sys.argv[2]
-
-def is_dcg_command(cmd):
-    """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
-    if not cmd:
-        return False
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    name = os.path.basename(tokens[0])
-    if name.endswith('.exe'):
-        name = name[:-4]
-    return name == 'dcg'
-
-try:
-    with open(settings_file, 'r') as f:
-        settings = json.load(f)
-except (IOError, ValueError, json.JSONDecodeError):
-    print(f"invalid Gemini settings.json: {settings_file}", file=sys.stderr)
-    raise SystemExit(1)
-
-if not isinstance(settings, dict):
-    print(f"Gemini settings.json must contain a JSON object: {settings_file}", file=sys.stderr)
-    raise SystemExit(1)
-
-# Gemini CLI uses BeforeTool instead of PreToolUse
-if 'hooks' not in settings:
-    settings['hooks'] = {}
-elif not isinstance(settings['hooks'], dict):
-    print(f"Gemini settings.json hooks must contain a JSON object: {settings_file}", file=sys.stderr)
-    raise SystemExit(1)
-if 'BeforeTool' not in settings['hooks']:
-    settings['hooks']['BeforeTool'] = []
-elif not isinstance(settings['hooks']['BeforeTool'], list):
-    print(f"Gemini settings.json BeforeTool must contain a list: {settings_file}", file=sys.stderr)
-    raise SystemExit(1)
-
-dcg_hook = {"name": "dcg", "type": "command", "command": dcg_path, "timeout": 5000}
-
-shell_hooks = []
-new_before_tool = []
-shell_sequential = None
-
-for entry in settings['hooks']['BeforeTool']:
-    if isinstance(entry, dict) and entry.get('matcher') == 'run_shell_command':
-        if isinstance(entry.get('sequential'), bool):
-            shell_sequential = (
-                entry['sequential']
-                if shell_sequential is None
-                else shell_sequential or entry['sequential']
-            )
-        hooks = entry.get('hooks', [])
-        if not isinstance(hooks, list):
-            print(f"Gemini run_shell_command hooks must contain a list: {settings_file}", file=sys.stderr)
-            raise SystemExit(1)
-        for hook in hooks:
-            if isinstance(hook, dict) and is_dcg_command(hook.get('command', '')):
-                continue
-            shell_hooks.append(hook)
-    else:
-        new_before_tool.append(entry)
-
-shell_hooks.insert(0, dcg_hook)
-shell_entry = {
-    "matcher": "run_shell_command",
-    "hooks": shell_hooks
-}
-if shell_sequential is not None:
-    shell_entry["sequential"] = shell_sequential
-new_before_tool.insert(0, shell_entry)
-settings['hooks']['BeforeTool'] = new_before_tool
-
-with open(settings_file, 'w') as f:
-    json.dump(settings, f, indent=2)
-PYEOF
-      then
-        GEMINI_STATUS="merged"
-        AUTO_CONFIGURED=1
-      else
-        mv "$GEMINI_BACKUP" "$settings_file" 2>/dev/null || true
-        GEMINI_STATUS="failed"
-        GEMINI_FAILURE_REASON="merge failed; restored backup"
-        GEMINI_BACKUP=""
-      fi
-    else
-      # python3 not available - remove unnecessary backup
-      rm -f "$GEMINI_BACKUP" 2>/dev/null || true
-      GEMINI_BACKUP=""
-      GEMINI_STATUS="failed"
-      GEMINI_FAILURE_REASON="python3 required for merge"
-      return 0
-    fi
-  else
-    # Create new settings file with dcg hook
-    cat > "$settings_file" <<EOFSET
-{
-  "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "run_shell_command",
-        "hooks": [
-          {
-            "name": "dcg",
-            "type": "command",
-            "command": "$DEST/dcg",
-            "timeout": 5000
-          }
-        ]
-      }
-    ]
-  }
-}
-EOFSET
-    GEMINI_STATUS="created"
-    AUTO_CONFIGURED=1
-  fi
+  configure_json_policy_hook "$settings_file" gemini
+  GEMINI_STATUS="$JSON_HOOK_STATUS"
+  GEMINI_FAILURE_REASON="$JSON_HOOK_FAILURE_REASON"
+  GEMINI_BACKUP="$JSON_HOOK_BACKUP"
 }
 
 configure_aider() {
@@ -2742,262 +3026,21 @@ configure_codex() {
   # See: https://developers.openai.com/codex/hooks
 
   local settings_file="$CODEX_SETTINGS"
+  local settings_dir="${settings_file%/*}"
+  [ "$settings_dir" != "$settings_file" ] || settings_dir="."
+  [ -n "$settings_dir" ] || settings_dir="/"
   CODEX_FAILURE_REASON=""
-  local settings_dir
-  settings_dir=$(dirname "$settings_file")
+  CODEX_BACKUP=""
 
-  # Check if Codex is installed
-  local codex_installed=0
-
-  # Check for CLI command
-  if command -v codex >/dev/null 2>&1; then
-    codex_installed=1
-  fi
-
-  # Check for config directory
-  if [ -d "$settings_dir" ]; then
-    codex_installed=1
-  fi
-
-  if [ "$codex_installed" -eq 0 ]; then
+  if [ ! -d "$settings_dir" ] && ! command -v codex >/dev/null 2>&1; then
     CODEX_STATUS="skipped"
     return 0
   fi
 
-  # Create directory if needed (codex command exists but no config dir yet)
-  if [ ! -d "$settings_dir" ]; then
-    mkdir -p "$settings_dir"
-  fi
-
-  if [ -f "$settings_file" ]; then
-    # Check if the exact current dcg hook is already configured. A stale dcg
-    # path must still fall through to the merge path so it can be updated.
-    if command -v python3 >/dev/null 2>&1; then
-      local codex_hook_state
-      codex_hook_state=$(python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-hooks_file = sys.argv[1]
-dcg_path = sys.argv[2]
-
-def is_dcg_command(cmd):
-    if not isinstance(cmd, str) or not cmd:
-        return False
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    name = os.path.basename(tokens[0])
-    if name.endswith('.exe'):
-        name = name[:-4]
-    return name == 'dcg'
-
-try:
-    with open(hooks_file, 'r') as f:
-        config = json.load(f)
-except (IOError, ValueError, json.JSONDecodeError):
-    print("invalid")
-    raise SystemExit(0)
-
-if not isinstance(config, dict):
-    print("invalid")
-    raise SystemExit(0)
-
-hooks_obj = config.get("hooks", {})
-if "hooks" in config and not isinstance(hooks_obj, dict):
-    print("invalid")
-    raise SystemExit(0)
-
-pre_tool_use = hooks_obj.get("PreToolUse", [])
-if "PreToolUse" in hooks_obj and not isinstance(pre_tool_use, list):
-    print("invalid")
-    raise SystemExit(0)
-
-dcg_commands = []
-first_bash_hook_command = None
-first_bash_matcher_seen = False
-for entry in pre_tool_use:
-    if not isinstance(entry, dict) or entry.get("matcher") != "Bash":
-        continue
-    hooks = entry.get("hooks", [])
-    if not isinstance(hooks, list):
-        print("invalid")
-        raise SystemExit(0)
-    if not first_bash_matcher_seen:
-        first_bash_matcher_seen = True
-        first_hook = hooks[0] if hooks else None
-        if isinstance(first_hook, dict):
-            first_bash_hook_command = first_hook.get("command")
-    for hook in hooks:
-        if isinstance(hook, dict) and is_dcg_command(hook.get("command")):
-            dcg_commands.append(hook.get("command"))
-
-if dcg_commands == [dcg_path] and first_bash_hook_command == dcg_path:
-    print("already")
-else:
-    print("merge")
-PYEOF
-)
-      if [ "$codex_hook_state" = "invalid" ]; then
-        CODEX_STATUS="failed"
-        CODEX_FAILURE_REASON="existing hooks.json is invalid; left unchanged"
-        warn "Codex hooks.json is invalid; leaving it unchanged: $settings_file"
-        return 0
-      fi
-      if [ "$codex_hook_state" = "already" ]; then
-        CODEX_STATUS="already"
-        AUTO_CONFIGURED=1
-        return 0
-      fi
-    fi
-
-    # hooks.json exists, need to merge. Invalid JSON was detected above and is
-    # deliberately not repaired here: replacing a hand-edited hooks file would
-    # silently discard user configuration.
-    CODEX_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$settings_file" "$CODEX_BACKUP"
-
-    if command -v python3 >/dev/null 2>&1; then
-      if python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-hooks_file = sys.argv[1]
-dcg_path = sys.argv[2]
-
-def is_dcg_command(cmd):
-    """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
-    if not cmd:
-        return False
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    name = os.path.basename(tokens[0])
-    if name.endswith('.exe'):
-        name = name[:-4]
-    return name == 'dcg'
-
-try:
-    with open(hooks_file, 'r') as f:
-        config = json.load(f)
-except (IOError, ValueError, json.JSONDecodeError):
-    print(f"invalid Codex hooks.json: {hooks_file}", file=sys.stderr)
-    raise SystemExit(1)
-
-if not isinstance(config, dict):
-    print(f"Codex hooks.json must contain a JSON object: {hooks_file}", file=sys.stderr)
-    raise SystemExit(1)
-
-# Preserve malformed top-level hook structures instead of replacing them. A
-# user may have hand-edited data here; the installer should not discard it.
-if 'hooks' not in config:
-    config['hooks'] = {}
-elif not isinstance(config['hooks'], dict):
-    print(f"Codex hooks.json hooks must contain a JSON object: {hooks_file}", file=sys.stderr)
-    raise SystemExit(1)
-
-if 'PreToolUse' not in config['hooks']:
-    config['hooks']['PreToolUse'] = []
-elif not isinstance(config['hooks']['PreToolUse'], list):
-    print(f"Codex hooks.json PreToolUse must contain a list: {hooks_file}", file=sys.stderr)
-    raise SystemExit(1)
-
-# Look for existing Bash matcher
-bash_hooks = []
-new_pre_tool_use = []
-dcg_seen = False
-
-for entry in config['hooks']['PreToolUse']:
-    if not isinstance(entry, dict):
-        new_pre_tool_use.append(entry)
-    elif entry.get('matcher') == 'Bash':
-        hooks = entry.get('hooks', [])
-        if not isinstance(hooks, list):
-            print(f"Codex Bash matcher hooks must contain a list: {hooks_file}", file=sys.stderr)
-            raise SystemExit(1)
-        for hook in hooks:
-            if isinstance(hook, dict) and 'command' in hook:
-                cmd = str(hook.get('command', ''))
-                if not is_dcg_command(cmd):  # Don't duplicate dcg
-                    bash_hooks.append(hook)
-                else:
-                    dcg_seen = True
-            else:
-                bash_hooks.append(hook)
-    else:
-        new_pre_tool_use.append(entry)
-
-# Add exactly one dcg hook at the beginning. Existing dcg hooks, including stale
-# paths or duplicates, are intentionally collapsed here.
-dcg_hook = {"type": "command", "command": dcg_path}
-if dcg_seen or not any(
-    is_dcg_command(h.get('command', ''))
-    for h in bash_hooks
-    if isinstance(h, dict)
-):
-    bash_hooks.insert(0, dcg_hook)
-
-# Create consolidated Bash matcher with dcg first
-if bash_hooks:
-    new_pre_tool_use.insert(0, {
-        "matcher": "Bash",
-        "hooks": bash_hooks
-    })
-
-config['hooks']['PreToolUse'] = new_pre_tool_use
-
-with open(hooks_file, 'w') as f:
-    json.dump(config, f, indent=2)
-PYEOF
-      then
-        CODEX_STATUS="merged"
-        AUTO_CONFIGURED=1
-      else
-        mv "$CODEX_BACKUP" "$settings_file" 2>/dev/null || true
-        CODEX_STATUS="failed"
-        CODEX_FAILURE_REASON="merge failed; restored backup"
-        CODEX_BACKUP=""
-      fi
-    else
-      # python3 not available - remove unnecessary backup
-      rm -f "$CODEX_BACKUP" 2>/dev/null || true
-      CODEX_BACKUP=""
-      CODEX_STATUS="failed"
-      CODEX_FAILURE_REASON="python3 required for merge"
-      return 0
-    fi
-  else
-    # Create new hooks.json file
-    cat > "$settings_file" <<EOFSET
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$DEST/dcg"
-          }
-        ]
-      }
-    ]
-  }
-}
-EOFSET
-    CODEX_STATUS="created"
-    AUTO_CONFIGURED=1
-  fi
+  configure_json_policy_hook "$settings_file" codex
+  CODEX_STATUS="$JSON_HOOK_STATUS"
+  CODEX_FAILURE_REASON="$JSON_HOOK_FAILURE_REASON"
+  CODEX_BACKUP="$JSON_HOOK_BACKUP"
 }
 
 configure_copilot() {
@@ -3855,288 +3898,31 @@ configure_posit_assistant() {
   #      alternatives), and the shell tools are named "bash"/"powershell" — a
   #      matcher copied from the Claude entry would never fire. Listing both
   #      names covers a Windows PowerShell host with the same entry.
-  #   2. Only documented handler fields are written: type, command, timeout.
-  #      There is NO `shell` field (which the Windows Claude entry uses); the
-  #      command path is quoted instead so an install path containing spaces
-  #      survives shell-form execution (cmd.exe on Windows).
+  #   2. Fresh handlers use type, command, and timeout; existing operator-owned
+  #      fields are retained. There is NO `shell` field (which the Windows
+  #      Claude entry uses); the command path is quoted instead so an install
+  #      path containing spaces survives shell-form execution (cmd.exe on Windows).
   #   3. `timeout` is in SECONDS and bounds a wedged hook.
   #
-  # Unlike configure_claude_code, existing matcher groups are preserved
-  # structurally rather than consolidated: hook config is additive (every group
-  # whose matcher matches contributes), so a user's "bash,edit" group keeps
-  # working untouched. dcg gets one dedicated group at the front — a denial
-  # then fires before other hooks — and stale dcg entries anywhere else are
-  # collapsed into it.
+  # Hook config is additive: every matching group contributes. The canonical
+  # "bash|powershell" group goes first with dcg as its first hook, while unrelated
+  # hooks keep their original matcher scopes (including a user's "bash,edit"
+  # group). Operator policy from stale dcg entries anywhere else is preserved
+  # when those registrations are collapsed into the canonical group.
 
   local settings_file="$POSIT_ASSISTANT_SETTINGS"
   POSIT_ASSISTANT_FAILURE_REASON=""
   POSIT_ASSISTANT_BACKUP=""
-  local settings_dir
-  settings_dir=$(dirname "$settings_file")
-  local pa_matcher="bash|powershell"
-  # Contract detail 2: the stored command is the quoted binary path.
-  local pa_command="\"$DEST/dcg\""
 
   if ! posit_assistant_installed; then
     POSIT_ASSISTANT_STATUS="skipped"
     return 0
   fi
 
-  if [ ! -d "$settings_dir" ]; then
-    mkdir -p "$settings_dir"
-  fi
-
-  # An existing but EMPTY (or whitespace-only) settings.json holds nothing to
-  # merge or preserve — treat it exactly like a missing file and create
-  # fresh. The first-pass state check below would otherwise misreport it as
-  # invalid JSON and fail the configuration.
-  if [ -f "$settings_file" ] && LC_ALL=C grep -q '[^[:space:]]' "$settings_file" 2>/dev/null; then
-    if ! command -v python3 >/dev/null 2>&1; then
-      POSIT_ASSISTANT_STATUS="failed"
-      POSIT_ASSISTANT_FAILURE_REASON="python3 required to safely merge settings.json"
-      return 0
-    fi
-
-    # First pass: is the exact current dcg hook already the sole dcg entry,
-    # sitting first in its own matcher group? Stale paths and duplicates fall
-    # through to the merge below so they get collapsed.
-    local pa_hook_state
-    pa_hook_state=$(python3 - "$settings_file" "$pa_command" "$pa_matcher" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-settings_file = sys.argv[1]
-dcg_command = sys.argv[2]
-matcher = sys.argv[3]
-
-def is_dcg_command(cmd):
-    if not isinstance(cmd, str) or not cmd:
-        return False
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    name = os.path.basename(tokens[0])
-    if name.endswith('.exe'):
-        name = name[:-4]
-    return name == 'dcg'
-
-try:
-    with open(settings_file, 'r') as f:
-        settings = json.load(f)
-except (IOError, ValueError, json.JSONDecodeError):
-    print("invalid")
-    raise SystemExit(0)
-
-if not isinstance(settings, dict):
-    print("invalid")
-    raise SystemExit(0)
-
-hooks_obj = settings.get("hooks", {})
-if not isinstance(hooks_obj, dict):
-    print("invalid")
-    raise SystemExit(0)
-
-pre_tool_use = hooks_obj.get("PreToolUse", [])
-if not isinstance(pre_tool_use, list):
-    print("invalid")
-    raise SystemExit(0)
-
-dcg_commands = []
-for entry in pre_tool_use:
-    if not isinstance(entry, dict):
-        continue
-    hooks = entry.get("hooks", [])
-    if not isinstance(hooks, list):
-        print("invalid")
-        raise SystemExit(0)
-    for hook in hooks:
-        if isinstance(hook, dict) and is_dcg_command(hook.get("command")):
-            dcg_commands.append(hook.get("command"))
-
-first = pre_tool_use[0] if pre_tool_use else None
-first_is_current = (
-    isinstance(first, dict)
-    and first.get("matcher") == matcher
-    and isinstance(first.get("hooks"), list)
-    and bool(first["hooks"])
-    and isinstance(first["hooks"][0], dict)
-    and first["hooks"][0].get("command") == dcg_command
-)
-
-if dcg_commands == [dcg_command] and first_is_current:
-    print("already")
-else:
-    print("merge")
-PYEOF
-)
-    if [ "$pa_hook_state" = "invalid" ]; then
-      POSIT_ASSISTANT_STATUS="failed"
-      POSIT_ASSISTANT_FAILURE_REASON="existing settings.json is invalid or has malformed hooks; left unchanged"
-      warn "Posit Assistant settings.json is invalid or has malformed hooks; leaving it unchanged: $settings_file"
-      return 0
-    fi
-    if [ "$pa_hook_state" = "already" ]; then
-      POSIT_ASSISTANT_STATUS="already"
-      AUTO_CONFIGURED=1
-      return 0
-    fi
-
-    POSIT_ASSISTANT_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$settings_file" "$POSIT_ASSISTANT_BACKUP"
-
-    if python3 - "$settings_file" "$pa_command" "$pa_matcher" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-settings_file = sys.argv[1]
-dcg_command = sys.argv[2]
-matcher = sys.argv[3]
-
-def is_dcg_command(cmd):
-    """True iff `cmd` invokes the dcg binary (basename match, not substring).
-
-    A substring check would also match unrelated user tools whose path merely
-    contains "dcg" (/opt/dcgrep/bin/scan, ~/.local/bin/dcgworkflow, ...) and
-    would then drop or replace their hook entries.
-    """
-    if not isinstance(cmd, str) or not cmd:
-        return False
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        # Unparseable command (mismatched quotes, ...) — treat as NOT-dcg so
-        # it is never dropped or replaced.
-        return False
-    if not tokens:
-        return False
-    name = os.path.basename(tokens[0])
-    if name.endswith('.exe'):
-        name = name[:-4]
-    return name == 'dcg'
-
-try:
-    with open(settings_file, 'r') as f:
-        raw_settings = f.read()
-except IOError:
-    raw_settings = ""
-
-if raw_settings.strip():
-    try:
-        settings = json.loads(raw_settings)
-    except ValueError:
-        print(f"invalid Posit Assistant settings.json: {settings_file}", file=sys.stderr)
-        raise SystemExit(1)
-else:
-    settings = {}
-
-if not isinstance(settings, dict):
-    print(
-        f"Posit Assistant settings.json must contain a JSON object: {settings_file}",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-if 'hooks' not in settings:
-    settings['hooks'] = {}
-elif not isinstance(settings['hooks'], dict):
-    print(
-        f"Posit Assistant settings.json hooks must contain a JSON object: {settings_file}",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-if 'PreToolUse' not in settings['hooks']:
-    settings['hooks']['PreToolUse'] = []
-elif not isinstance(settings['hooks']['PreToolUse'], list):
-    print(
-        f"Posit Assistant settings.json PreToolUse must contain a list: {settings_file}",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-# Strip every pre-existing dcg entry (stale paths, duplicates) from all matcher
-# groups; a group whose hooks list empties out as a result is pruned rather
-# than left behind as an empty group. Non-dcg hooks and the user's group
-# structure are otherwise preserved verbatim.
-cleaned = []
-for entry in settings['hooks']['PreToolUse']:
-    if not isinstance(entry, dict):
-        cleaned.append(entry)
-        continue
-    hooks = entry.get('hooks')
-    if not isinstance(hooks, list):
-        if 'hooks' in entry:
-            print(
-                f"Posit Assistant matcher-group hooks must contain a list: {settings_file}",
-                file=sys.stderr,
-            )
-            raise SystemExit(1)
-        cleaned.append(entry)
-        continue
-    kept = [
-        hook
-        for hook in hooks
-        if not (isinstance(hook, dict) and is_dcg_command(hook.get('command')))
-    ]
-    if hooks and not kept:
-        # The group existed only to run dcg; drop it.
-        continue
-    entry['hooks'] = kept
-    cleaned.append(entry)
-
-# dcg's dedicated group goes first so a denial fires before other hooks run.
-cleaned.insert(
-    0,
-    {
-        "matcher": matcher,
-        "hooks": [{"type": "command", "command": dcg_command, "timeout": 10}],
-    },
-)
-
-settings['hooks']['PreToolUse'] = cleaned
-
-with open(settings_file, 'w') as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-PYEOF
-    then
-      POSIT_ASSISTANT_STATUS="merged"
-      AUTO_CONFIGURED=1
-    else
-      mv "$POSIT_ASSISTANT_BACKUP" "$settings_file" 2>/dev/null || true
-      POSIT_ASSISTANT_STATUS="failed"
-      POSIT_ASSISTANT_FAILURE_REASON="merge failed; restored backup"
-      POSIT_ASSISTANT_BACKUP=""
-    fi
-  else
-    cat > "$settings_file" <<EOFSET
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "$pa_matcher",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\\"$DEST/dcg\\"",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
-}
-EOFSET
-    POSIT_ASSISTANT_STATUS="created"
-    AUTO_CONFIGURED=1
-  fi
+  configure_json_policy_hook "$settings_file" posit
+  POSIT_ASSISTANT_STATUS="$JSON_HOOK_STATUS"
+  POSIT_ASSISTANT_FAILURE_REASON="$JSON_HOOK_FAILURE_REASON"
+  POSIT_ASSISTANT_BACKUP="$JSON_HOOK_BACKUP"
 }
 
 configure_opencode() {
@@ -4222,6 +4008,36 @@ configure_crush() {
 
   CRUSH_STATUS="failed"
   CRUSH_FAILURE_REASON=$(printf '%s' "$output" | tail -n 1)
+  return 1
+}
+
+configure_droid() {
+  # Keep Factory's standalone hooks.json/settings.json precedence and safe
+  # JSON editing in the Rust installer. The installed hook uses Execute and
+  # an absolute dcg path with --agent droid, even in a scrubbed environment.
+  if ! is_agent_detected "droid"; then
+    DROID_STATUS="skipped"
+    return 0
+  fi
+
+  local dcg_bin="$DEST/dcg"
+  if [ ! -x "$dcg_bin" ]; then
+    DROID_STATUS="failed"
+    DROID_FAILURE_REASON="dcg binary not found at $dcg_bin"
+    return 1
+  fi
+
+  local output
+  if output=$("$dcg_bin" install --droid --force 2>&1); then
+    DROID_STATUS="configured"
+    AUTO_CONFIGURED=1
+    # Native diagnostics include disabled hooks and host-loading caveats.
+    [ -z "$output" ] || info "$output"
+    return 0
+  fi
+
+  DROID_STATUS="failed"
+  DROID_FAILURE_REASON=$(printf '%s' "$output" | tail -n 1)
   return 1
 }
 
@@ -4449,6 +4265,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
 
   # Configure Reasonix (if installed); same failure handling as Crush.
   configure_reasonix || true
+
+  # Configure Factory Droid through the same native installer as manual setup.
+  configure_droid || true
 
   # Configure Oh My Pi (if installed)
   # A refusal/failure is a terminal OMP_STATUS state rendered in the summary;
@@ -4766,6 +4585,19 @@ case "$REASONIX_STATUS" in
     else
       summary_lines+=("Reasonix:    Configuration failed")
     fi
+    ;;
+esac
+
+case "$DROID_STATUS" in
+  configured)
+    summary_lines+=("Droid:       Configured Execute PreToolUse hook")
+    summary_lines+=("             Restart Droid and inspect /hooks; Script coverage is unverified")
+    ;;
+  skipped|"")
+    summary_lines+=("Droid:       Not installed (skipped)")
+    ;;
+  failed)
+    summary_lines+=("Droid:       Configuration failed ($DROID_FAILURE_REASON)")
     ;;
 esac
 

@@ -350,7 +350,10 @@ pub struct DestructivePattern {
     /// this list. A dynamic argv0 (one containing a shell expansion) never
     /// matches.
     ///
-    /// Names must be written lowercase without a path or extension.
+    /// Names must be written lowercase without a path or extension. In a
+    /// built-in pack, a name ending in `*` covers every program that starts
+    /// with the rest of it and is longer: `mkfs.*` matches `mkfs.ext4` but not
+    /// `mkfs`. External packs reject `*` when they load.
     pub executables: Option<&'static [&'static str]>,
 }
 
@@ -371,7 +374,8 @@ impl std::fmt::Debug for DestructivePattern {
 impl DestructivePattern {
     /// Match through the same executable-scope contract as the primary
     /// evaluator. Unscoped rules retain their historical raw-regex behavior.
-    fn matches_command(&self, command: &str) -> bool {
+    fn matches_command(&self, pack_id: &str, command: &str) -> bool {
+        self.regex.set_rule_identity(pack_id, self.name);
         match self.executables {
             None => self.regex.is_match(command),
             Some(executables) => crate::evaluator::executable_scoped_pattern_matches(
@@ -595,7 +599,7 @@ impl Pack {
     /// `safe_regex_set_is_complete`) to their default values. These are populated
     /// during pack registration by `PackEntry::get_pack()`.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         id: PackId,
         name: &'static str,
         description: &'static str,
@@ -603,6 +607,12 @@ impl Pack {
         safe_patterns: Vec<SafePattern>,
         destructive_patterns: Vec<DestructivePattern>,
     ) -> Self {
+        for pattern in &safe_patterns {
+            pattern.regex.set_rule_identity(&id, Some(pattern.name));
+        }
+        for pattern in &destructive_patterns {
+            pattern.regex.set_rule_identity(&id, pattern.name);
+        }
         Self {
             id,
             name,
@@ -672,7 +682,7 @@ impl Pack {
             && self
                 .destructive_patterns
                 .iter()
-                .any(|pattern| pattern.matches_command(cmd))
+                .any(|pattern| pattern.matches_command(&self.id, cmd))
     }
 
     fn destructive_match_vetoes_safe_with_deadline(
@@ -690,11 +700,53 @@ impl Pack {
                 // an indeterminate result rather than treating time as safety.
                 return true;
             }
-            if pattern.matches_command(cmd) {
+            if pattern.matches_command(&self.id, cmd) {
                 return true;
             }
         }
         false
+    }
+
+    /// Apply operation-specific safety proofs independently of regex grants.
+    ///
+    /// `Some(false)` is an authoritative refusal: a permissive safe regex must
+    /// not override it. `None` leaves the command to ordinary pattern matching.
+    /// These proofs inspect command semantics, so the evaluator can preserve
+    /// them while binding regex exemptions to their original source spelling.
+    #[must_use]
+    pub(crate) fn semantic_safe_decision(&self, cmd: &str) -> Option<bool> {
+        match self.id.as_str() {
+            "careful_company_running_windows.guardrails" => {
+                crate::packs::careful_company_running_windows::guardrails::authorization_store_write_span(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+                .map(|_| false)
+            }
+            "core.filesystem" => {
+                // This proof owns unlink's exemptions, including rejected
+                // literal-path boundaries that a legacy temp regex may match.
+                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+                .map(|command| command.safe)
+            }
+            "system.permissions" => {
+                crate::packs::system::permissions::posix_chmod_is_safe(cmd).then_some(true)
+            }
+            "kubernetes.kubectl" => {
+                crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd).then_some(true)
+            }
+            "kubernetes.helm" => {
+                crate::packs::kubernetes::helm::dry_run_is_effectively_safe(cmd).then_some(true)
+            }
+            "cloud.aws" => crate::packs::cloud::aws::ec2_dry_run_decision(cmd),
+            "careful_company_running_windows.transfer" => {
+                crate::packs::careful_company_running_windows::transfer::direct_safe_decision(cmd)
+            }
+            _ => None,
+        }
     }
 
     /// Check if a command matches any safe pattern.
@@ -706,20 +758,7 @@ impl Pack {
         if self.destructive_match_vetoes_safe(cmd) {
             return false;
         }
-        if self.id == "system.permissions"
-            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
-        {
-            return true;
-        }
-        if self.id == "kubernetes.kubectl"
-            && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
-        {
-            return true;
-        }
-        if self.id == "careful_company_running_windows.transfer"
-            && let Some(decision) =
-                crate::packs::careful_company_running_windows::transfer::direct_safe_decision(cmd)
-        {
+        if let Some(decision) = self.semantic_safe_decision(cmd) {
             return decision;
         }
         // Fast path: use RegexSet if available
@@ -745,8 +784,10 @@ impl Pack {
         // With no set (including a RegexSet compilation failure), retain the
         // conservative fallback over every pattern.
         self.safe_patterns.iter().any(|p| {
-            (!linear_set_missed || regex_engine::needs_backtracking_engine(p.regex.as_str()))
-                && p.regex.is_match(cmd)
+            (!linear_set_missed || regex_engine::needs_backtracking_engine(p.regex.as_str())) && {
+                p.regex.set_rule_identity(&self.id, Some(p.name));
+                p.regex.is_match(cmd)
+            }
         })
     }
 
@@ -768,20 +809,7 @@ impl Pack {
         if self.destructive_match_vetoes_safe_with_deadline(cmd, deadline) {
             return false;
         }
-        if self.id == "system.permissions"
-            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
-        {
-            return true;
-        }
-        if self.id == "kubernetes.kubectl"
-            && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
-        {
-            return true;
-        }
-        if self.id == "careful_company_running_windows.transfer"
-            && let Some(decision) =
-                crate::packs::careful_company_running_windows::transfer::direct_safe_decision(cmd)
-        {
+        if let Some(decision) = self.semantic_safe_decision(cmd) {
             return decision;
         }
         let linear_set_missed = if let Some(ref set) = self.safe_regex_set {
@@ -803,6 +831,7 @@ impl Pack {
             if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
                 return false;
             }
+            p.regex.set_rule_identity(&self.id, Some(p.name));
             if p.regex.is_match(cmd) {
                 return true;
             }
@@ -814,6 +843,15 @@ impl Pack {
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
+        if self.id == "careful_company_running_windows.guardrails"
+            && crate::packs::careful_company_running_windows::guardrails::authorization_store_write_span(
+                cmd,
+                crate::normalize::ShellDialect::Unknown,
+            )
+            .is_some()
+        {
+            return self.destructive_match_by_name("dcg-policy-self-weakening", cmd);
+        }
         if self.id == "system.permissions" {
             match crate::packs::system::permissions::posix_permission_decision(
                 cmd,
@@ -886,10 +924,33 @@ impl Pack {
                     .matches_destructive_named_by(cmd, |name| name != Some("branch-force-delete"));
             }
         }
-        let found = self
-            .destructive_patterns
-            .iter()
-            .find(|p| p.matches_command(cmd));
+        let unlink_command = (self.id == "core.filesystem")
+            .then(|| {
+                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+            })
+            .flatten();
+        let found = self.destructive_patterns.iter().find(|pattern| {
+            pattern.regex.set_rule_identity(&self.id, pattern.name);
+            if crate::packs::core::filesystem::is_unlink_rule(pattern.name)
+                && let Some(command) = &unlink_command
+            {
+                return !command.safe && pattern.regex.is_match(&command.matching_view);
+            }
+            pattern.matches_command(&self.id, cmd)
+        });
+        // The same add-only masked pass the evaluator gives core.filesystem
+        // (#552 follow-up); the unlink proof above already read the operands.
+        let found = found.or_else(|| {
+            let masked = self.core_filesystem_separator_masked_view(cmd)?;
+            self.destructive_patterns.iter().find(|pattern| {
+                !(crate::packs::core::filesystem::is_unlink_rule(pattern.name)
+                    && unlink_command.is_some())
+                    && pattern.matches_command(&self.id, &masked)
+            })
+        });
         // #509: the `branch-force-delete` regex is the fallback for a branch
         // command the parser could not read; a readable merge-checked
         // deletion is reported as `branch-delete`, as the parser would.
@@ -919,16 +980,38 @@ impl Pack {
         cmd: &str,
         predicate: impl Fn(Option<&'static str>) -> bool,
     ) -> Option<DestructiveMatch> {
-        self.destructive_patterns
-            .iter()
-            .filter(|p| predicate(p.name))
-            .find(|p| p.matches_command(cmd))
+        let find = |text: &str| {
+            self.destructive_patterns
+                .iter()
+                .filter(|p| predicate(p.name))
+                .find(|p| p.matches_command(&self.id, text))
+        };
+        find(cmd)
+            .or_else(|| {
+                self.core_filesystem_separator_masked_view(cmd)
+                    .and_then(|masked| find(&masked))
+            })
             .map(|p| DestructiveMatch {
                 reason: p.reason,
                 name: p.name,
                 severity: p.severity,
                 explanation: p.explanation,
             })
+    }
+
+    /// For `core.filesystem`, `cmd` with its quoted and escaped `;`, `|` and
+    /// `&` masked, when it has any: the view the evaluator's add-only second
+    /// destructive pass matches (see
+    /// [`crate::packs::mask_quoted_shell_separators`]). Destructive matching
+    /// only; safe patterns never see it.
+    fn core_filesystem_separator_masked_view(&self, cmd: &str) -> Option<String> {
+        if self.id != "core.filesystem" {
+            return None;
+        }
+        match crate::packs::mask_quoted_shell_separators(cmd) {
+            std::borrow::Cow::Owned(masked) => Some(masked),
+            std::borrow::Cow::Borrowed(_) => None,
+        }
     }
 
     fn destructive_match_by_name(&self, name: &str, cmd: &str) -> Option<DestructiveMatch> {
@@ -1008,6 +1091,12 @@ impl Pack {
     /// pattern in another (`docker system prune`).
     #[must_use]
     pub fn check(&self, cmd: &str) -> Option<DestructiveMatch> {
+        // Authorization-store paths depend on leading directory changes.
+        // Keep the full source for this pack's structural write proof; its
+        // safe regexes already exclude shell separators and redirections.
+        if self.id == "careful_company_running_windows.guardrails" {
+            return self.check_single(cmd);
+        }
         let segments = crate::packs::split_command_segments(cmd);
         if segments.len() > 1 {
             if self.id == "careful_company_running_windows.upload"
@@ -1036,7 +1125,13 @@ impl Pack {
 
     fn check_single(&self, cmd: &str) -> Option<DestructiveMatch> {
         // Quick reject if no keywords match
-        if !self.might_match(cmd) {
+        if !(self.might_match(cmd)
+            || (self.id == "core.filesystem"
+                && crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )))
+        {
             return None;
         }
 
@@ -1219,6 +1314,16 @@ impl PackEntry {
     pub fn get_pack(&self) -> &Pack {
         self.instance.get_or_init(|| {
             let mut pack = (self.builder)();
+            for pattern in &pack.safe_patterns {
+                pattern
+                    .regex
+                    .set_static_rule_identity(self.id, Some(pattern.name));
+            }
+            for pattern in &pack.destructive_patterns {
+                pattern
+                    .regex
+                    .set_static_rule_identity(self.id, pattern.name);
+            }
             // Build Aho-Corasick automaton for keyword matching
             //
             // These direct-transfer packs are selected through the global
@@ -1448,23 +1553,32 @@ impl EnabledKeywordIndex {
             return true;
         }
 
-        if self.core_git_mask != 0
-            && crate::packs::core::git::contains_git_ascii_case_insensitive(decoded)
-            && !crate::packs::core::git::contains_git_ascii_case_insensitive(baseline)
-        {
+        // Occurrences are counted, not just looked for: one benign occurrence
+        // elsewhere in the baseline (`echo legit & gi^t reset --hard`, or a
+        // harmless `git status` before it) does not account for the one the
+        // decode created.
+        let git_count = |text: &str| {
+            text.as_bytes()
+                .windows(3)
+                .filter(|window| window.eq_ignore_ascii_case(b"git"))
+                .count()
+        };
+        if self.core_git_mask != 0 && git_count(decoded) > git_count(baseline) {
             return true;
         }
 
         if let Some(ac) = &self.keyword_matcher {
-            let baseline_hits: std::collections::BTreeSet<usize> = ac
-                .find_overlapping_iter(baseline)
-                .map(|m| m.pattern().as_usize())
-                .collect();
-            if ac
-                .find_overlapping_iter(decoded)
-                .any(|m| !baseline_hits.contains(&m.pattern().as_usize()))
-            {
-                return true;
+            let mut baseline_hits: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            for hit in ac.find_overlapping_iter(baseline) {
+                *baseline_hits.entry(hit.pattern().as_usize()).or_default() += 1;
+            }
+            for hit in ac.find_overlapping_iter(decoded) {
+                let remaining = baseline_hits.entry(hit.pattern().as_usize()).or_default();
+                if *remaining == 0 {
+                    return true;
+                }
+                *remaining -= 1;
             }
         }
 
@@ -2499,6 +2613,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         // `upstart` is here only so the row covers the pack's own list. It matches
         // no real command — upstart's CLI is `initctl` — and no rule covers
         // `initctl` at all, so that is a coverage gap rather than a gate problem.
+        //
+        // `modprobe` and `rmmod` are the command words of the kernel-module
+        // unload rules, which no other word here would let through.
         &[
             "systemctl",
             "service",
@@ -2506,6 +2623,8 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "upstart",
             "shutdown",
             "reboot",
+            "modprobe",
+            "rmmod",
         ],
         system::services::create_pack,
     ),
@@ -3249,6 +3368,40 @@ impl ExternalPackStore {
         &self.keywords
     }
 
+    /// Add the loaded packs that `enabled_packs` names to an evaluation's
+    /// keyword list and pack order (#588).
+    ///
+    /// Only packs in `enabled_packs` take part, so a pack loaded from
+    /// `custom_paths` and then disabled is never evaluated. They are added in
+    /// ID order, so every process evaluates them in the same order. Returns
+    /// whether any took part: the enabled-keyword index covers registry packs
+    /// only, so the caller must not build one when an external pack is in
+    /// the evaluation.
+    pub fn extend_evaluation(
+        &self,
+        enabled_packs: &HashSet<String>,
+        keywords: &mut Vec<&'static str>,
+        ordered_packs: &mut Vec<String>,
+    ) -> bool {
+        let mut ids: Vec<&String> = self
+            .packs
+            .keys()
+            .filter(|id| enabled_packs.contains(id.as_str()))
+            .collect();
+        ids.sort_unstable();
+        for id in &ids {
+            for keyword in self.packs[*id].keywords {
+                if !keywords.contains(keyword) {
+                    keywords.push(keyword);
+                }
+            }
+            if !ordered_packs.contains(*id) {
+                ordered_packs.push((*id).clone());
+            }
+        }
+        !ids.is_empty()
+    }
+
     /// Get warnings from pack loading.
     #[must_use]
     pub fn warnings(&self) -> &[String] {
@@ -3703,6 +3856,237 @@ fn contains_unquoted_shell_operator(
     false
 }
 
+/// The POSIX command text with every inert redirection replaced by spaces,
+/// for keyword gating only (#571).
+///
+/// A redirection is inert when it can neither write nor read anything but
+/// the null device, and neither names a file nor runs code: a redirection of
+/// any descriptor to or from `/dev/null` (`2>/dev/null`, `>/dev/null`,
+/// `&>/dev/null`, `>>/dev/null`, `>|/dev/null`, `</dev/null`) and a
+/// descriptor duplication or close (`2>&1`, `>&2`, `1>&-`, `<&3`). Removing
+/// one from a command never changes which files the command touches, so it
+/// cannot be what makes the command destructive. Its bytes still spelled the
+/// `2>`, `>&`, `>/` and `/dev/` keywords, so `ls 2>/dev/null` selected
+/// `core.filesystem` and `system.disk` and paid for compiling both packs,
+/// about four times the cost of `ls`, while neither pack had a rule that could
+/// match it.
+///
+/// Only the gating decision reads this view. Every selected pack still
+/// matches against the original text.
+///
+/// Blanking is applied ONLY when every unquoted redirection in the command is
+/// inert. A command that also has a real redirection keeps its full text, so
+/// the pack it selects still evaluates that redirection — critically, a
+/// destructive redirect can have NO keyword of its own (`> logs/run_$x.log`
+/// carries none of `>/`, `>$`, …; it was caught only because some other
+/// redirect such as `2>&1` selected `core.filesystem`). Removing the inert
+/// redirect's keyword would then drop the pack and hide the real redirect, so
+/// in that case nothing is blanked.
+///
+/// The recognizer is deliberately narrow and lexical: the redirection must be
+/// unquoted and unescaped, a descriptor number must begin its word, and the
+/// target must be exactly `/dev/null` (or a descriptor number, or `-`) ending
+/// at a shell metacharacter. `>/dev/null"x"`, `>/dev/null/../sda`, `>&file`,
+/// `"2>/dev/null"` and `{fd}>/dev/null` are left as they are. Spans are blanked
+/// in place, so offsets and word boundaries are unchanged: in
+/// `"git">/dev/null reset --hard` the command word stays `"git"`.
+#[must_use]
+pub(crate) fn blank_inert_redirections(command: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = command.as_bytes();
+    if !bytes.iter().any(|&byte| matches!(byte, b'>' | b'<')) {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    // Pass 1: every unquoted `>`/`<` is a redirection operator. Collect the
+    // inert ones; a single real (non-inert) one means the whole command keeps
+    // its keywords, so return it unchanged.
+    let mut inert_spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_ansi_c = false;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_single {
+            in_single = byte != b'\'';
+            i += 1;
+            continue;
+        }
+        if in_ansi_c {
+            if byte == b'\\' {
+                i += 2;
+                continue;
+            }
+            in_ansi_c = byte != b'\'';
+            i += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            i += 2;
+            continue;
+        }
+        if in_double {
+            in_double = byte != b'"';
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                in_ansi_c = true;
+                i += 2;
+                continue;
+            }
+            // A comment runs to the end of its line; its quotes quote nothing.
+            b'#' if i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')'
+                ) =>
+            {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'>' | b'<' => {
+                let start = redirect_operator_start(bytes, i);
+                match inert_redirection_end(bytes, start) {
+                    Some(end) => {
+                        inert_spans.push((start, end));
+                        i = end;
+                        continue;
+                    }
+                    // A real redirection: do not blank anything on this line.
+                    None => return std::borrow::Cow::Borrowed(command),
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if inert_spans.is_empty() {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    let mut out = bytes.to_vec();
+    for (start, end) in inert_spans {
+        out[start..end].fill(b' ');
+    }
+    // Only ASCII bytes were replaced, with ASCII spaces.
+    std::borrow::Cow::Owned(String::from_utf8(out).unwrap_or_else(|_| command.to_string()))
+}
+
+/// The byte where the redirection whose operator is at `op` (`>` or `<`)
+/// begins: a leading file-descriptor number that forms a whole word, or the
+/// `&` of an `&>`; otherwise the operator itself.
+fn redirect_operator_start(bytes: &[u8], op: usize) -> usize {
+    const fn boundary(byte: u8) -> bool {
+        matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'{' | b'}'
+        )
+    }
+    let mut digits = op;
+    while digits > 0 && bytes[digits - 1].is_ascii_digit() {
+        digits -= 1;
+    }
+    if digits < op && (digits == 0 || boundary(bytes[digits - 1])) {
+        return digits;
+    }
+    if bytes[op] == b'>'
+        && op > 0
+        && bytes[op - 1] == b'&'
+        && !(op >= 2 && matches!(bytes[op - 2], b'&' | b'|'))
+    {
+        return op - 1;
+    }
+    op
+}
+
+/// End of the inert redirection that starts at `start`, if one does (see
+/// [`blank_inert_redirections`]). `start` is an unquoted, unescaped byte.
+fn inert_redirection_end(bytes: &[u8], start: usize) -> Option<usize> {
+    const fn ends_word(byte: Option<&u8>) -> bool {
+        matches!(
+            byte,
+            None | Some(
+                b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+            )
+        )
+    }
+    let previous = start.checked_sub(1).map(|index| &bytes[index]);
+    let mut i = start;
+    if bytes[i].is_ascii_digit() {
+        // A descriptor number only when it is a whole word before the
+        // operator: in `foo2>/dev/null` the `2` belongs to the word `foo2`,
+        // and the redirection starts at `>`.
+        if !matches!(
+            previous,
+            None | Some(b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')')
+        ) {
+            return None;
+        }
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if !matches!(bytes.get(i), Some(b'>' | b'<')) {
+            return None;
+        }
+    } else if bytes[i] == b'&' {
+        // `&>` and `&>>`, but not the `&&` / `|&` operators before a `>`.
+        if bytes.get(i + 1) != Some(&b'>') || matches!(previous, Some(b'&' | b'|')) {
+            return None;
+        }
+        i += 1;
+    } else if matches!(previous, Some(b'&' | b'<' | b'>' | b'}')) {
+        // The tail of a longer operator an earlier position declined (`&&>`,
+        // `<<<`, `<>`), or a bash `{name}` descriptor variable.
+        return None;
+    }
+    let input = bytes[i] == b'<';
+    i += 1;
+    let mut duplication = false;
+    match (input, bytes.get(i)) {
+        // `<<`, `<<<` and `<>` are here-documents, here-strings and
+        // read-write opens, never inert.
+        (true, Some(b'<' | b'>')) => return None,
+        (_, Some(b'&')) if bytes[start] != b'&' => {
+            duplication = true;
+            i += 1;
+        }
+        (false, Some(b'>' | b'|')) => i += 1,
+        _ => {}
+    }
+    if duplication {
+        // `N>&M`, `N>&-`, `N<&M`, `N<&-`. A word target after `>&` is a file
+        // (`>&/etc/passwd` truncates it), except the null device itself.
+        let target = i;
+        if bytes.get(i) == Some(&b'-') {
+            i += 1;
+        } else {
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+        }
+        if i > target && ends_word(bytes.get(i)) {
+            return Some(i);
+        }
+        if input {
+            return None;
+        }
+        i = target;
+    }
+    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    let target = bytes.get(i..i + b"/dev/null".len())?;
+    if target != b"/dev/null" {
+        return None;
+    }
+    i += b"/dev/null".len();
+    ends_word(bytes.get(i)).then_some(i)
+}
+
 #[inline]
 fn pipeline_text_may_be_executed(command: &str) -> bool {
     if !contains_shell_pipeline_operator(command) {
@@ -4117,6 +4501,146 @@ fn collect_command_segments<'a>(
     }
 }
 
+/// The byte a data `;`, `|` or `&` becomes in [`mask_quoted_shell_separators`].
+///
+/// A word byte, so it neither ends a `[^|;&]*` scan nor reads as whitespace,
+/// a quote, a path separator, or an expansion.
+pub(crate) const MASKED_SHELL_SEPARATOR: u8 = b'_';
+
+/// Byte offsets of every `;`, `|` and `&` in `cmd` that POSIX shell reads as
+/// data: inside single or double quotes, or escaped by a backslash.
+///
+/// The scan is [`collect_command_segments`]'s, byte for byte: the same quote
+/// toggles, the same backslash skip outside single quotes, and the same
+/// command, process and arithmetic substitution bodies. A body is scanned in
+/// its own quoting context, because there its unquoted separators are real
+/// and split its own segments. So an offset returned here is never one the
+/// segmenter splits on, while every separator byte it declined to split on
+/// for quoting or escaping is returned. Redirection syntax (`2>&1`, `&>`,
+/// `>|`) is not quoting and is not returned.
+#[must_use]
+pub(crate) fn quoted_shell_separator_offsets(cmd: &str) -> Vec<usize> {
+    let bytes = cmd.as_bytes();
+    let mut offsets = Vec::new();
+    if bytes.iter().any(|byte| matches!(byte, b';' | b'|' | b'&'))
+        && bytes
+            .iter()
+            .any(|byte| matches!(byte, b'\'' | b'"' | b'\\'))
+    {
+        collect_quoted_shell_separator_offsets(cmd, 0, cmd.len(), 0, &mut offsets);
+        // The scan visits bodies in place, so this is already ordered; callers
+        // binary-search it.
+        offsets.sort_unstable();
+    }
+    offsets
+}
+
+/// `cmd` with each offset from [`quoted_shell_separator_offsets`] replaced by
+/// [`MASKED_SHELL_SEPARATOR`]; length and every other byte are unchanged.
+///
+/// Regex rules that stay inside one command with `[^|;&]*` stop at the first
+/// `;`, `|` or `&` even when it is quoted, so a quoted separator in an earlier
+/// operand hid every later operand from them: `mv "a;b" ~/Documents /tmp/x`
+/// and `find "a;b" / -delete` were allowed (GitHub #552 follow-up). Matching
+/// this view lets those scans read the whole command the shell runs.
+#[must_use]
+pub(crate) fn mask_quoted_shell_separators(cmd: &str) -> std::borrow::Cow<'_, str> {
+    let offsets = quoted_shell_separator_offsets(cmd);
+    if offsets.is_empty() {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+    let mut bytes = cmd.as_bytes().to_vec();
+    for offset in offsets {
+        bytes[offset] = MASKED_SHELL_SEPARATOR;
+    }
+    std::borrow::Cow::Owned(
+        String::from_utf8(bytes).expect("replacing ASCII bytes with ASCII keeps UTF-8 valid"),
+    )
+}
+
+fn collect_quoted_shell_separator_offsets(
+    cmd: &str,
+    start: usize,
+    end: usize,
+    recursion_depth: usize,
+    offsets: &mut Vec<usize>,
+) {
+    if recursion_depth > MAX_SEGMENT_RECURSION {
+        return;
+    }
+    let bytes = cmd.as_bytes();
+    let mut i = start;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < end {
+        let b = bytes[i];
+
+        if b == b'\\' && !in_single && i + 1 < end {
+            if matches!(bytes[i + 1], b';' | b'|' | b'&') {
+                offsets.push(i + 1);
+            }
+            i += 2;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+
+        if !in_single
+            && b == b'$'
+            && i + 2 < end
+            && bytes[i + 1] == b'('
+            && bytes[i + 2] == b'('
+            && let Some(close) = find_matching_arithmetic_expansion(cmd, i + 3, end)
+        {
+            collect_quoted_shell_separator_offsets(cmd, i + 3, close, recursion_depth + 1, offsets);
+            i = close + 2;
+            continue;
+        }
+        // `$(…)` anywhere outside single quotes; `<(…)` / `>(…)` unquoted.
+        let opens_substitution = i + 1 < end
+            && bytes[i + 1] == b'('
+            && ((!in_single && b == b'$')
+                || (!in_single && !in_double && matches!(b, b'<' | b'>')));
+        if opens_substitution {
+            // An unclosed body runs to `end`, exactly as the segmenter reads it.
+            let body = i + 2;
+            let close = find_matching_command_substitution(cmd, body, end);
+            let body_end = close.unwrap_or(end);
+            collect_quoted_shell_separator_offsets(
+                cmd,
+                body,
+                body_end,
+                recursion_depth + 1,
+                offsets,
+            );
+            i = close.map_or(end, |close| close + 1);
+            continue;
+        }
+        if !in_single
+            && b == b'`'
+            && let Some(close) = find_matching_backtick(cmd, i + 1, end)
+        {
+            collect_quoted_shell_separator_offsets(cmd, i + 1, close, recursion_depth + 1, offsets);
+            i = close + 1;
+            continue;
+        }
+
+        if (in_single || in_double) && matches!(b, b';' | b'|' | b'&') {
+            offsets.push(i);
+        }
+        i += 1;
+    }
+}
+
 fn push_trimmed_segment<'a>(cmd: &'a str, start: usize, end: usize, segments: &mut Vec<&'a str>) {
     let segment = cmd[start..end].trim();
     if !segment.is_empty() {
@@ -4399,6 +4923,17 @@ pub(crate) fn pack_aware_quick_reject_pre_normalized(
     !enabled_keywords.is_empty()
         && !external_pack_forces_full_evaluation()
         && !span_matches_any_keyword(normalized, enabled_keywords)
+}
+
+/// [`pack_aware_quick_reject`] for a view that is already normalized, such as
+/// the evaluator's normalized command after [`blank_inert_redirections`].
+#[inline]
+#[must_use]
+pub(crate) fn pack_aware_quick_reject_normalized_view(
+    normalized: &str,
+    enabled_keywords: &[&str],
+) -> bool {
+    pack_aware_quick_reject_from_normalized_spans(normalized, enabled_keywords)
 }
 
 #[inline]
@@ -4784,6 +5319,84 @@ destructive_patterns:
             !pack_aware_quick_reject(r#""git">/dev/null reset --hard"#, &keywords),
             "quoted command words with attached redirections must still trigger pack evaluation"
         );
+    }
+
+    #[test]
+    fn blank_inert_redirections_spans_issue_571() {
+        // (input, expected gating view)
+        let blanked = [
+            ("ls 2>/dev/null", "ls            "),
+            ("ls >/dev/null 2>&1", "ls                "),
+            ("ls &>/dev/null", "ls            "),
+            ("ls &>>/dev/null", "ls             "),
+            ("ls >> /dev/null", "ls             "),
+            ("ls >|/dev/null", "ls            "),
+            ("ls 2> /dev/null;rm x", "ls             ;rm x"),
+            ("cat x </dev/null", "cat x           "),
+            ("cat x 0< /dev/null", "cat x             "),
+            ("echo hi >&2", "echo hi    "),
+            ("echo hi 1>&2", "echo hi     "),
+            ("exec 3>&- 4<&3", "exec          "),
+            ("ls >& /dev/null", "ls             "),
+            ("ls 10>/dev/null|wc", "ls             |wc"),
+            ("(ls 2>/dev/null)", "(ls            )"),
+            ("$(ls 2>/dev/null)", "$(ls            )"),
+            ("foo2>/dev/null x", "foo2           x"),
+            (
+                "\"git\">/dev/null reset --hard",
+                "\"git\"           reset --hard",
+            ),
+            ("ls 2&>/dev/null", "ls 2           "),
+            ("ls # it's\nls 2>/dev/null", "ls # it's\nls            "),
+        ];
+        for (input, expected) in blanked {
+            assert_eq!(blank_inert_redirections(input), expected, "{input:?}");
+            assert_eq!(
+                blank_inert_redirections(input).len(),
+                input.len(),
+                "{input:?}"
+            );
+        }
+        // Not inert, or not provably a redirection at this level: unchanged.
+        for input in [
+            "ls",
+            "ls > /etc/hosts",
+            "ls 2>/dev/null2",
+            "ls 2>/dev/null/../sda",
+            r#"ls >/dev/null"x""#,
+            "ls >/dev/nul'l'",
+            "ls >\"/dev/null\"",
+            "echo x >&/etc/passwd",
+            "echo x >&2x",
+            "echo x >& file",
+            "ls {fd}>/dev/null",
+            "cat <<EOF",
+            "cat <<</dev/null",
+            "cat <>/dev/null",
+            "echo '2>/dev/null'",
+            "echo \"2>/dev/null\"",
+            "echo $'2>/dev/null'",
+            r"echo \>/dev/null",
+            "ls >/dev/zero",
+            "ls >/dev/sda",
+            "ls &&>/dev/null",
+            "ls # 2>/dev/null",
+            // A real redirection anywhere keeps the WHOLE command's keywords,
+            // so a destructive redirect without a keyword of its own (caught
+            // only because the inert redirect's keyword selected the pack) is
+            // still evaluated. Nothing is blanked when a real redirect is
+            // present, e.g. a remote script's `>logs/run_$x.log 2>&1`.
+            "ls 2>/dev/null >/etc/hosts",
+            "echo x 2>&1 >/etc/hosts",
+            "cat a.log 2>/dev/null > out_$x.log",
+            "ssh h 'run 2>&1 >logs/gate_$t.log'",
+        ] {
+            assert_eq!(blank_inert_redirections(input), input, "{input:?}");
+        }
+        assert!(matches!(
+            blank_inert_redirections("ls -la"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -5235,6 +5848,71 @@ destructive_patterns:
         assert_eq!(split_command_segments(r"echo a\; b"), vec![r"echo a\; b"]);
         assert_eq!(split_command_segments(r"echo a\| b"), vec![r"echo a\| b"]);
         assert_eq!(split_command_segments(r"echo a\& b"), vec![r"echo a\& b"]);
+    }
+
+    #[test]
+    fn quoted_shell_separators_are_masked_exactly_where_the_segmenter_declines_to_split() {
+        // Quoted and escaped separators are data; each becomes `_` in place.
+        for (command, masked) in [
+            (r#"mv "a & b" /etc /tmp/x"#, r#"mv "a _ b" /etc /tmp/x"#),
+            ("mv 'a;b|c' ~ /tmp/x", "mv 'a_b_c' ~ /tmp/x"),
+            (r"find a\;b / -delete", r"find a\_b / -delete"),
+            (r#"echo "a\;b""#, r#"echo "a\_b""#),
+            // Real separators stay, so a command never runs into the next.
+            (
+                r#"mv "a;b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+                r#"mv "a_b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+            ),
+            (r#"a "x|y" && b 'p&q' || c"#, r#"a "x_y" && b 'p_q' || c"#),
+            // A substitution body has its own quoting: its bare `;` is real
+            // even inside double quotes, while a quoted one inside it is data.
+            (
+                r#"echo "$(cd /; ls "a;b")" '$(x;y)'"#,
+                r#"echo "$(cd /; ls "a_b")" '$(x_y)'"#,
+            ),
+            ("echo `a; b \"c;d\"`", "echo `a; b \"c_d\"`"),
+            (r#"diff <(sort "a|b"; ls) y"#, r#"diff <(sort "a_b"; ls) y"#),
+            // A single quote inside double quotes is a byte, and the reverse.
+            (r#"echo "it's; ok" x"#, r#"echo "it's_ ok" x"#),
+            (r#"echo 'say "a;b"' x"#, r#"echo 'say "a_b"' x"#),
+        ] {
+            let actual = mask_quoted_shell_separators(command);
+            assert_eq!(actual, masked, "{command}");
+            assert_eq!(actual.len(), command.len(), "{command}");
+        }
+        // Nothing to mask: borrowed, and redirection syntax is not quoting.
+        for command in [
+            "cp -a /etc /tmp/x && rm -rf /tmp/x",
+            "make 2>&1 | tee log",
+            "cmd &> out; echo >| f",
+            r#"echo "no separators here""#,
+            "mv a b; rm c",
+        ] {
+            assert!(
+                matches!(
+                    mask_quoted_shell_separators(command),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "{command}"
+            );
+        }
+        // An unbalanced quote keeps the segmenter's reading: the rest of the
+        // text is one quoted segment, so its separators are data to both.
+        let unbalanced = r#"echo "a; b"#;
+        assert_eq!(split_command_segments(unbalanced), vec![unbalanced]);
+        assert_eq!(mask_quoted_shell_separators(unbalanced), r#"echo "a_ b"#);
+        // The offsets agree with the segmenter on every listed command: no
+        // masked byte is ever a place it splits.
+        for command in [
+            r#"mv "a;b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+            r#"echo "$(cd /; ls "a;b")" && x 'p|q' | y"#,
+            r"a\;b; c\|d | e\&f & g",
+        ] {
+            let masked = mask_quoted_shell_separators(command);
+            let segments = split_command_segments(command);
+            let masked_segments = split_command_segments(&masked);
+            assert_eq!(segments.len(), masked_segments.len(), "{command}");
+        }
     }
 
     #[test]
@@ -5699,6 +6377,12 @@ destructive_patterns:
         assert!(index.exposes_keyword_absent_from(
             "dd if=/dev/zero of=/dev/sda",
             "d^d if=/dev/zero of=/dev/sda"
+        ));
+
+        // A benign occurrence elsewhere does not account for the decoded one.
+        assert!(index.exposes_keyword_absent_from(
+            "dd if=a of=b & dd of=/dev/sda",
+            "dd if=a of=b & d^d of=/dev/sda"
         ));
 
         // Same keywords on both sides: nothing new, so no replay is warranted.
@@ -7839,6 +8523,95 @@ destructive_patterns:
                 assert!(!pack.name.is_empty());
             }
         }
+    }
+
+    fn slow_diagnostic_pack() -> Pack {
+        Pack {
+            id: "test.provenance".to_string(),
+            name: "test",
+            description: "test",
+            keywords: &[],
+            safe_patterns: vec![safe_pattern!("slow-safe", r"^(a|aa)+\1$")],
+            destructive_patterns: vec![destructive_pattern!(
+                "slow-destructive",
+                r"^(a|aa)+\1$",
+                "test"
+            )],
+            keyword_matcher: None,
+            safe_regex_set: None,
+            safe_regex_set_is_complete: false,
+        }
+    }
+
+    #[test]
+    fn direct_pack_apis_attach_rule_provenance_issue_643() {
+        let command = format!("{}!", "a".repeat(80));
+        for operation in 0..3 {
+            let pack = slow_diagnostic_pack();
+            let scope = regex_engine::RegexEvaluationScope::enter();
+            let expected_name = match operation {
+                0 => {
+                    assert!(!pack.matches_safe(&command));
+                    "slow-safe"
+                }
+                1 => {
+                    assert!(!pack.matches_safe_with_deadline(&command, None));
+                    "slow-safe"
+                }
+                _ => {
+                    assert!(pack.matches_destructive(&command).is_none());
+                    "slow-destructive"
+                }
+            };
+            assert!(scope.has_failed());
+            let failure = scope.failure().unwrap();
+            assert_eq!(failure.pack_id.unwrap().as_str(), "test.provenance");
+            assert_eq!(failure.pattern_id.unwrap().as_str(), expected_name);
+            assert_eq!(
+                failure.cause,
+                crate::perf::RegexFailureCause::BacktrackLimit {
+                    steps: regex_engine::BACKTRACK_LIMIT
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn registered_patterns_retain_identity_when_evaluator_accesses_regex_directly_issue_643() {
+        let entry = PackEntry::new("test.provenance", &[], slow_diagnostic_pack);
+        let pack = entry.get_pack();
+        let command = format!("{}!", "a".repeat(80));
+        let scope = regex_engine::RegexEvaluationScope::enter();
+        assert!(
+            pack.destructive_patterns[0]
+                .regex
+                .find_from(&command, 0)
+                .is_none()
+        );
+        let failure = scope.failure().unwrap();
+        assert_eq!(failure.pack_id.unwrap().as_str(), "test.provenance");
+        assert_eq!(failure.pattern_id.unwrap().as_str(), "slow-destructive");
+        assert_eq!(failure.operation, crate::perf::RegexOperation::FindFrom);
+    }
+
+    #[test]
+    fn constructed_pack_provenance_survives_owned_pack_lifetime_issue_643() {
+        let failure = {
+            let pack = Pack::new(
+                String::from("test.owned"),
+                "test",
+                "test",
+                &[],
+                vec![safe_pattern!("slow-safe", r"^(a|aa)+\1$")],
+                Vec::new(),
+            );
+            let scope = regex_engine::RegexEvaluationScope::enter();
+            let command = format!("{}!", "a".repeat(80));
+            assert!(!pack.safe_patterns[0].regex.is_match(&command));
+            scope.failure().unwrap()
+        };
+        assert_eq!(failure.pack_id.unwrap().as_str(), "test.owned");
+        assert_eq!(failure.pattern_id.unwrap().as_str(), "slow-safe");
     }
 
     fn mixed_engine_safe_pack() -> Pack {

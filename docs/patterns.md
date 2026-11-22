@@ -163,11 +163,11 @@ what is matched and what the reported span covers.
 | Rule ID | Pattern | Reason |
 | --- | --- | --- |
 | `heredoc.python.shutil_rmtree` | `$M.rmtree($$$)` | recursively deletes directories |
-| `heredoc.python.os_remove` | `os.remove($$$)` | deletes files |
-| `heredoc.python.os_rmdir` | `os.rmdir($$$)` | deletes directories |
-| `heredoc.python.os_unlink` | `os.unlink($$$)` | deletes files |
-| `heredoc.python.pathlib_unlink` | `pathlib.Path($$$).unlink($$$)` and `Path($$$).unlink($$$)` | deletes files |
-| `heredoc.python.pathlib_rmdir` | `pathlib.Path($$$).rmdir($$$)` and `Path($$$).rmdir($$$)` | deletes directories |
+| `heredoc.python.os_remove` | `os.remove($$$)`, including resolved module and callable aliases | deletes files |
+| `heredoc.python.os_rmdir` | `os.rmdir($$$)`, including resolved module and callable aliases | deletes directories |
+| `heredoc.python.os_unlink` | `os.unlink($$$)`, including resolved module and callable aliases | deletes files |
+| `heredoc.python.pathlib_unlink` | `receiver.unlink($$$)`, including `Path(...)`, path variables, and captured methods | deletes files |
+| `heredoc.python.pathlib_rmdir` | `receiver.rmdir($$$)`, including `Path(...)`, path variables, and captured methods | deletes directories |
 | `heredoc.python.subprocess_run` | `subprocess.run($$$)` | executes shell commands |
 | `heredoc.python.subprocess_call` | `subprocess.call($$$)` | executes shell commands |
 | `heredoc.python.subprocess_popen` | `subprocess.Popen($$$)` | spawns shell processes |
@@ -175,6 +175,116 @@ what is matched and what the reported span covers.
 | `heredoc.python.subprocess_check_output` | `subprocess.check_output($$$)` | executes shell commands |
 | `heredoc.python.os_system` | `os.system($$$)` | executes shell commands |
 | `heredoc.python.os_popen` | `os.popen($$$)` | executes shell commands |
+
+#### Python deletion targets and temporary ownership
+
+Python file-deletion calls use bounded, scope-aware path analysis on the same
+parsed source as the rules above. Assigning a path to a variable does not evade
+the deletion rule: both `Path('/etc/hosts').unlink()` and
+`p = Path('/etc/hosts'); p.unlink()` are denied. A receiver whose identity cannot
+be resolved, such as `p.unlink()` without a proven binding, is also denied.
+
+The analysis follows assignments in statement order, copied path values,
+imported aliases, captured deletion methods, `str(path)`, `Path` construction,
+`/`, `joinpath`, and `os.path.join`. Reassignment replaces a variable's current
+value; a copied immutable path or captured method retains its earlier value.
+Conditional branches preserve a safety fact only when every reaching binding
+proves it. Loop assignments, shadowed parameters, and deferred function access
+to mutable outer paths cannot inherit a stale temporary-path allowance.
+
+Captured deletion functions also retain their identity through literal lists,
+tuples, dictionary values, and builtin `getattr` with a static deletion member.
+A finding requires an invocation: storing `p.unlink` or retrieving it alone
+does not delete a file. Exact literal selection can preserve a trusted captured
+method or function; unknown selection, merged identities, or mutation cannot
+provide a temporary-path allowance. A supported builtin `getattr` lookup on a
+known `Path` instance or `os` module follows the same target checks as direct
+attribute access. Other reflective access remains conservative.
+
+Literal-container `get` and `pop` operations can return captured deletion
+functions; calling the lookup itself is not a deletion invocation.
+`append`, `extend`, and `update` preserve possible stored callbacks through
+aliases, captured methods, and supported literal argument unpacking.
+A proved lookup can retain the selected immutable callback's path proof.
+A `pop` also invalidates the receiver's earlier contents, so later reads
+through aliases, captured selectors, subscriptions, or unpacking cannot reuse
+a stale safe selection. Mutation effects merge across branches and executed
+comprehensions; unused deferred bodies do not mutate the caller's facts.
+
+Unknown keys, potentially active hashing or equality, unknown iterables, and
+uncertain arguments cannot establish a cleanup allowance. Selector-return
+depth is bounded separately from deletion invocation: exceeding that bound
+reports incomplete analysis instead of inventing a destructive call.
+
+Supported calls to source-visible synchronous local helpers bind arguments in
+a fresh function scope and track returned callbacks. A callback invoked through
+a parameter receives the same deletion and target checks as a direct call.
+Passing, storing, or returning that callback alone does not invoke it. Function
+aliases retain their definition identity; reassignment replaces the current
+binding. Definition-time defaults and supported literal argument unpacking
+participate in argument binding without turning unknown values into path proofs.
+
+Only proved live values can carry a temporary-child allowance across a supported
+call. Mutable outer bindings and closure captures do not inherit a stale safe
+path. A supported closure invocation reads its still-active lexical owner's
+current bindings as possible identities only. An escaped closure or unidentified
+owner reports incomplete analysis instead of reusing definition-time cell values.
+Returned values follow return/finally control flow and lose temporary ownership
+when their context ends. Recursive calls, unresolved helper identities, and
+exhausted call-analysis bounds cannot establish an allowance. Calls share the
+existing AST, traversal budget, and deadline. Generator and coroutine creation
+is not treated as synchronous execution of their bodies; this helper analysis
+does not model their later consumption.
+
+If extraction or analysis is incomplete, captured deletion names remain a
+blocking signal, including static `getattr` member names written with string
+escapes. This fallback does not assert that an unused capture was invoked;
+it cannot complete the proof that would establish that it stays unused.
+
+Normal completion, `break`, `continue`, `return`, and exceptions retain separate
+path states. Unreachable assignments after an exit cannot replace the state
+that actually reaches a later deletion. Loop `else` clauses apply only on
+exhaustion, and `finally` blocks apply to every incoming exit. Implicit
+exceptions can occur before a later assignment, so exception handlers and
+finalizers cannot assume that the entire protected body completed.
+
+List, set, and dictionary comprehensions analyze paths across repeated
+iterations, including filter side effects and empty inner iterators. Their
+effects reach the enclosing scope, while iteration variables remain local.
+Generator bodies use deferred proofs that are revoked by subsequent opaque
+operations; the leftmost iterable is evaluated immediately in the enclosing
+scope. These passes share the existing traversal budget and deadline.
+
+Cleanup is permitted for a proven descendant of the shared literal temporary
+directories described below, or of a fresh directory obtained from an
+unmodified standard-library `tempfile.mkdtemp()` or `TemporaryDirectory()`
+binding. For example:
+
+```python
+import os, tempfile
+from pathlib import Path
+p = Path(tempfile.mkdtemp()) / 'leaked.lock'
+os.unlink(str(p))
+```
+
+The same proof applies to `os.remove(p)` and `p.unlink()`, and to descendants
+built inside `with tempfile.TemporaryDirectory() as directory:`. It grants
+only the individual deletion whose target was proved. Other operations in the
+script retain their own checks.
+
+The shared temporary root itself, a fresh producer root without a descendant,
+unknown directories or join components, `..` traversal, and protected
+destinations do not receive this allowance. Absolute join components replace
+the prior base: `Path(tempfile.mkdtemp()) / '/etc/hosts'` remains denied.
+Replaced factories, modified dependencies, reflective binding mutation, and
+unsupported path transformations cannot establish temporary ownership.
+Unresolved operands to path/string conversions and overloaded `+` or `/`
+operations can execute Python hooks such as `__fspath__` or `__str__`; these
+operations revoke later factory and receiver proofs. Conversions of known standard values
+preserve unrelated cleanup proofs even when the result's exact path is unknown.
+Conversions alone do not produce deletion findings: an actual destructive
+invocation is still required.
+Analysis limits or an incomplete proof never establish a safe target.
 
 ### Ruby
 
@@ -350,8 +460,10 @@ construction; Go has no equivalent because `os.MkdirTemp` returns
 `(string, error)` and so cannot be nested inside the delete call. The Go idiom
 that splits it across two statements (`dir, _ := os.MkdirTemp(…)` then
 `defer os.RemoveAll(dir)`) is denied, exactly as Python's two-statement
-`d = tempfile.mkdtemp(); shutil.rmtree(d)` is — proving `dir` still holds that
-value needs taint analysis this scanner does not do.
+`d = tempfile.mkdtemp(); shutil.rmtree(d)` is. This recursive-deletion rule does
+not resolve those two-statement producer bindings. The bounded Python path
+analysis described above applies to `unlink`, `remove`, and `rmdir`; it does
+not broaden the existing `shutil.rmtree` producer exemptions.
 
 The reason it is one policy is that the thing choosing the spelling is usually
 an agent. An agent refused `rm -rf ./build` must not get the same effect from a

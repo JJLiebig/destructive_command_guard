@@ -61,50 +61,89 @@ pub(crate) enum ConfigSource {
 /// the subsequent read and prevents a FIFO from wedging the hook before its
 /// file type can be rejected.
 pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Option<String> {
+    read_config_file_result(path, source).ok()
+}
+
+/// Preserve the outcome of the actual open/read. A later filesystem restat is
+/// useful for diagnostics, but must not decide whether required policy vanished.
+#[derive(Debug)]
+enum ConfigReadFailure {
+    Missing,
+    #[cfg_attr(unix, allow(dead_code))]
+    Unsupported,
+    Rejected(String),
+    Content(String),
+}
+
+impl ConfigReadFailure {
+    fn blocks_trusted_layer(&self, source: ConfigSource, layer: ConfigFileLayer) -> bool {
+        if source == ConfigSource::AutoProject {
+            return false;
+        }
+        match self {
+            Self::Missing => layer == ConfigFileLayer::Explicit,
+            Self::Unsupported => false,
+            // A system path that failed its ownership/path trust checks is not
+            // administrator policy. Keep ignoring it, including on Windows.
+            Self::Rejected(_) => source == ConfigSource::Untrusted,
+            // Content failures occur AFTER the source's handle was validated.
+            Self::Content(_) => true,
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Missing => "the explicitly selected configuration file does not exist",
+            Self::Unsupported => "this configuration source is unsupported on this platform",
+            Self::Rejected(detail) | Self::Content(detail) => detail,
+        }
+    }
+}
+
+fn read_config_file_result(path: &Path, source: ConfigSource) -> Result<String, ConfigReadFailure> {
     #[cfg(not(unix))]
     if non_unix_source_is_unsupported(source) {
         warn_and_ignore_non_unix_restricted_config(path, source);
-        return None;
+        return Err(ConfigReadFailure::Unsupported);
     }
 
     let mut file = match open_config_file_for_source(path, source) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ConfigReadFailure::Missing);
+        }
+        Err(error) => {
             crate::emit_stderr!(
                 "Warning: refusing to load config file '{}': {}",
                 path.display(),
-                e
+                error
             );
-            return None;
+            return Err(ConfigReadFailure::Rejected(error.to_string()));
         }
     };
-
-    // `take(MAX_CONFIG_BYTES + 1)` lets us tell "exactly cap" (allowed) from
-    // "more than cap" (rejected) without reading unbounded bytes either way.
-    let mut buf = String::new();
-    if let Err(e) = file
+    let mut content = String::new();
+    if let Err(error) = file
         .by_ref()
         .take(MAX_CONFIG_BYTES + 1)
-        .read_to_string(&mut buf)
+        .read_to_string(&mut content)
     {
         crate::emit_stderr!(
             "Warning: Failed to read config file '{}': {}",
             path.display(),
-            e
+            error
         );
-        return None;
+        return Err(ConfigReadFailure::Content(error.to_string()));
     }
-    if buf.len() as u64 > MAX_CONFIG_BYTES {
+    if content.len() as u64 > MAX_CONFIG_BYTES {
+        let detail = format!("configuration exceeds the {MAX_CONFIG_BYTES}-byte limit");
         crate::emit_stderr!(
-            "Warning: refusing to load config '{}' — exceeds {}-byte cap",
+            "Warning: refusing to load config '{}': {}",
             path.display(),
-            MAX_CONFIG_BYTES
+            detail
         );
-        return None;
+        return Err(ConfigReadFailure::Content(detail));
     }
-
-    Some(buf)
+    Ok(content)
 }
 
 /// Render a TOML error from an automatically discovered repository config
@@ -2171,13 +2210,13 @@ impl PacksConfig {
         // to drop all system.* packs).
         enabled.insert("system.disk".to_string());
 
-        // Windows-native packs are default-ON only on Windows: a fresh Windows
-        // install must block `del /s`, `rd /s`, `Remove-Item -Recurse -Force`,
-        // etc. with no config, while Unix pays no quick-reject cost for Windows
-        // verbs by default. The packs stay *registered* on every platform, so
-        // Unix users can still opt in (e.g. to scan committed `.ps1`/`.cmd`
-        // scripts) via `enabled = ["windows.filesystem"]`. Opt out on Windows
-        // with `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`).
+        // Windows-native packs are default-ON on Windows and for recognized
+        // Cmd/PowerShell hook payloads on any host. Ordinary Unix POSIX requests
+        // keep these verbs out of quick rejection. The packs stay registered
+        // everywhere, so users can also select them explicitly (e.g. to scan
+        // committed `.ps1`/`.cmd` scripts) via `enabled = ["windows.filesystem"]`.
+        // `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`)
+        // still excludes them when defaults are expanded for a Windows payload.
         if include_windows_defaults {
             for pack_id in ["windows.filesystem", "windows.system"] {
                 enabled.insert(pack_id.to_string());
@@ -2982,6 +3021,12 @@ pub fn take_rule_target_suppressions() -> Vec<RuleTargetSuppression> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct OverridesConfig {
+    /// Runtime-only failure of a required trusted config layer (#568).
+    /// Neither TOML nor an automatic project policy can manufacture or clear it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub configuration_error: Option<String>,
+
     /// Patterns to allow that would otherwise be blocked.
     #[serde(default)]
     pub allow: Vec<AllowOverride>,
@@ -3834,6 +3879,8 @@ impl CompiledBlockOverride {
 /// evaluations. It eliminates per-command regex compilation overhead.
 #[derive(Debug, Default)]
 pub struct CompiledOverrides {
+    /// Fatal trusted-config failure, checked before every authorization path.
+    pub configuration_error: Option<String>,
     /// Compiled allow overrides.
     pub allow: Vec<CompiledAllowOverride>,
     /// Compiled block overrides.
@@ -3916,7 +3963,10 @@ impl OverridesConfig {
     /// Use `CompiledOverrides::invalid_patterns` to check for issues.
     #[must_use]
     pub fn compile(&self) -> CompiledOverrides {
-        let mut compiled = CompiledOverrides::default();
+        let mut compiled = CompiledOverrides {
+            configuration_error: self.configuration_error.clone(),
+            ..CompiledOverrides::default()
+        };
 
         // Compile allow overrides
         for allow in &self.allow {
@@ -4013,7 +4063,7 @@ impl Config {
         // Hook mode is latency-sensitive. The shared loader keeps tracing
         // disabled here so ordinary evaluations do not allocate diagnostic
         // vectors/paths/details that only `config` and `doctor` consume.
-        Self::load_internal(false).0
+        Self::load_internal(false, None).0
     }
 
     /// Load the effective configuration and retain an auditable account of
@@ -4025,14 +4075,59 @@ impl Config {
     /// skipped because a valid `DCG_CONFIG` replaces the default user file.
     #[must_use]
     pub(crate) fn load_with_report() -> ConfigLoadReport {
-        let (config, sources) = Self::load_internal(true);
+        let (config, sources) = Self::load_internal(true, None);
         ConfigLoadReport {
             config,
             sources: sources.expect("source tracing requested"),
         }
     }
 
-    fn load_internal(capture_sources: bool) -> (Self, Option<Vec<ConfigSourceOutcome>>) {
+    /// Load a CLI-selected file with the same trust, precedence and environment
+    /// handling as DCG_CONFIG. A CLI path takes precedence over DCG_CONFIG.
+    #[must_use]
+    pub fn load_with_explicit_path(path: &Path) -> Self {
+        Self::load_internal(false, Some(path)).0
+    }
+
+    /// Why trusted policy could not be loaded. No command is verified while
+    /// this is present, even if another layer contains an allow override.
+    #[must_use]
+    pub fn configuration_error(&self) -> Option<&str> {
+        self.overrides.configuration_error.as_deref()
+    }
+
+    fn failed_config_layer(path: &Path, detail: &str) -> ConfigLayer {
+        // Keep diagnostics bounded and terminal-safe. Automatic project source
+        // text never reaches this function.
+        let path: String = path
+            .to_string_lossy()
+            .chars()
+            .take(1024)
+            .flat_map(char::escape_default)
+            .collect();
+        let detail: String = detail
+            .chars()
+            .take(1024)
+            .flat_map(char::escape_default)
+            .collect();
+        let reason = format!(
+            "DCG configuration error in '{path}': {detail}. Required protection \
+             policies could not be loaded; command evaluation is blocked. \
+             Repair the configuration and run 'dcg doctor --strict'."
+        );
+        ConfigLayer {
+            overrides: Some(OverridesConfig {
+                configuration_error: Some(reason),
+                ..OverridesConfig::default()
+            }),
+            ..ConfigLayer::default()
+        }
+    }
+
+    fn load_internal(
+        capture_sources: bool,
+        explicit_path_override: Option<&Path>,
+    ) -> (Self, Option<Vec<ConfigSourceOutcome>>) {
         // Start with truly empty defaults - packs must be explicitly enabled.
         // generate_default() is for sample configs shown to users, not runtime defaults.
         let mut config = Self::default();
@@ -4040,38 +4135,62 @@ impl Config {
         let cwd = env::current_dir().ok();
 
         // Optional explicit config path override (highest-priority file config).
-        // It is parsed first only so a valid explicit file can suppress the
+        // It is parsed first so the explicitly selected source can suppress the
         // default user path; its outcome is appended last to preserve the
         // actual low-to-high precedence order exposed to diagnostics.
-        let (explicit_layer, explicit_outcome) = match env::var(ENV_CONFIG_PATH) {
-            Ok(value) => match resolve_config_path_value(&value, cwd.as_deref()) {
-                Some(path) => {
-                    let (layer, outcome) = Self::load_layer_from_file_with_outcome(
-                        &path,
-                        ConfigSource::Untrusted,
+        let selected_path = if let Some(path) = explicit_path_override {
+            if path.as_os_str().is_empty() {
+                Err("the explicit config path is empty")
+            } else {
+                Ok(Some(path.to_path_buf()))
+            }
+        } else {
+            match env::var(ENV_CONFIG_PATH) {
+                Ok(value) => resolve_config_path_value(&value, cwd.as_deref())
+                    .map(Some)
+                    .ok_or("DCG_CONFIG is set but empty"),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(env::VarError::NotUnicode(_)) => Err("DCG_CONFIG is not valid Unicode"),
+            }
+        };
+        let (explicit_layer, explicit_outcome) = match &selected_path {
+            Ok(Some(path)) => Self::load_layer_from_file_with_outcome(
+                path,
+                ConfigSource::Untrusted,
+                ConfigFileLayer::Explicit,
+                ConfigFileAuthority::Full,
+                capture_sources,
+            ),
+            Ok(None) => (None, None),
+            Err(detail) => (
+                Some(Self::failed_config_layer(
+                    Path::new("DCG_CONFIG/--config"),
+                    detail,
+                )),
+                capture_sources.then(|| {
+                    ConfigSourceOutcome::new(
                         ConfigFileLayer::Explicit,
                         ConfigFileAuthority::Full,
-                        capture_sources,
-                    );
-                    (layer, outcome)
-                }
-                None => (
-                    None,
-                    capture_sources.then(|| {
-                        ConfigSourceOutcome::new(
-                            ConfigFileLayer::Explicit,
-                            ConfigFileAuthority::Full,
-                            ConfigFileStatus::Rejected,
-                            None,
-                            Some("DCG_CONFIG is set but empty".to_string()),
-                        )
-                    }),
-                ),
-            },
-            Err(_) => (None, None),
+                        ConfigFileStatus::Rejected,
+                        None,
+                        Some((*detail).to_string()),
+                    )
+                }),
+            ),
         };
-        let explicit_project_policy = explicit_layer.is_some()
-            && cwd.as_deref().is_some_and(explicitly_trusts_project_policy);
+        // Selecting the repository file explicitly promotes it to a trusted
+        // source. Do not apply it again as an automatic hardening contribution.
+        let explicit_project_policy = selected_path
+            .as_ref()
+            .ok()
+            .and_then(|path| path.as_deref())
+            .and_then(|path| fs::canonicalize(path).ok())
+            .is_some_and(|selected| {
+                cwd.as_deref()
+                    .and_then(|dir| find_repo_root(dir, REPO_ROOT_SEARCH_MAX_HOPS))
+                    .and_then(|root| fs::canonicalize(root.join(PROJECT_CONFIG_NAME)).ok())
+                    .is_some_and(|project| selected == project)
+            });
 
         // Load system config (lowest priority of file configs)
         let system_path = system_config_dir().join(CONFIG_FILE_NAME);
@@ -4089,7 +4208,7 @@ impl Config {
 
         // Load user config
         //
-        // If an explicit config file is present and valid, we treat it as the
+        // An explicit config file (including a fatal load failure) is the
         // user-level config and skip loading the default user config path to
         // reduce layering confusion.
         if explicit_layer.is_some() {
@@ -4102,7 +4221,9 @@ impl Config {
                     ConfigFileAuthority::Full,
                     ConfigFileStatus::Skipped,
                     user_path,
-                    Some("a valid DCG_CONFIG replaces the default user config".to_string()),
+                    Some(
+                        "an explicit config selection replaces the default user config".to_string(),
+                    ),
                 ));
             }
         } else {
@@ -4229,14 +4350,25 @@ impl Config {
         authority: ConfigFileAuthority,
         capture_outcome: bool,
     ) -> (Option<ConfigLayer>, Option<ConfigSourceOutcome>) {
-        let Some(content) = read_config_file_bounded(path, source) else {
-            let outcome = capture_outcome.then(|| {
-                let (status, detail) = failed_config_read_outcome(path, source);
-                ConfigSourceOutcome::new(layer, authority, status, Some(path.to_path_buf()), detail)
-            });
-            return (None, outcome);
+        let content = match read_config_file_result(path, source) {
+            Ok(content) => content,
+            Err(error) => {
+                let failed_layer = error
+                    .blocks_trusted_layer(source, layer)
+                    .then(|| Self::failed_config_layer(path, error.detail()));
+                let outcome = capture_outcome.then(|| {
+                    let (status, detail) = failed_config_read_outcome(path, source);
+                    ConfigSourceOutcome::new(
+                        layer,
+                        authority,
+                        status,
+                        Some(path.to_path_buf()),
+                        detail,
+                    )
+                });
+                return (failed_layer, outcome);
+            }
         };
-
         match toml::from_str(&content) {
             Ok(parsed) => (
                 Some(parsed),
@@ -4250,8 +4382,8 @@ impl Config {
                     )
                 }),
             ),
-            Err(e) if source == ConfigSource::AutoProject => {
-                let detail = safe_auto_project_toml_error(&content, &e);
+            Err(error) if source == ConfigSource::AutoProject => {
+                let detail = safe_auto_project_toml_error(&content, &error);
                 crate::emit_stderr!("Warning: {}; ignoring it", detail);
                 (
                     None,
@@ -4266,21 +4398,31 @@ impl Config {
                     }),
                 )
             }
-            Err(e) => {
-                crate::emit_stderr!(
-                    "Warning: Failed to parse config file '{}': {}",
-                    path.display(),
-                    e
+            Err(error) => {
+                // Retain a non-overridable failure instead of dropping policies.
+                // Error::message omits the potentially large source excerpt.
+                let offset = error.span().map_or(0, |span| span.start.min(content.len()));
+                let line = content
+                    .as_bytes()
+                    .iter()
+                    .take(offset)
+                    .filter(|byte| **byte == b'\n')
+                    .count()
+                    + 1;
+                let detail = format!(
+                    "invalid TOML or policy value at line {line}: {}",
+                    error.message()
                 );
+                let failed_layer = Self::failed_config_layer(path, &detail);
                 (
-                    None,
+                    Some(failed_layer),
                     capture_outcome.then(|| {
                         ConfigSourceOutcome::new(
                             layer,
                             authority,
                             ConfigFileStatus::Invalid,
                             Some(path.to_path_buf()),
-                            Some(format!("Invalid TOML: {e}")),
+                            Some(detail),
                         )
                     }),
                 )
@@ -4327,7 +4469,7 @@ impl Config {
         candidates
     }
 
-    /// Load the first valid user configuration candidate and record every
+    /// Load the first present user candidate, retaining any fatal error, and record every
     /// candidate actually attempted before it.
     fn load_user_config_layer_with_outcomes(
         sources: &mut Option<Vec<ConfigSourceOutcome>>,
@@ -4530,6 +4672,14 @@ impl Config {
     }
 
     fn merge_overrides_layer(&mut self, overrides: OverridesConfig) {
+        if let Some(error) = overrides.configuration_error {
+            if let Some(existing) = self.overrides.configuration_error.as_mut() {
+                existing.push('\n');
+                existing.push_str(&error);
+            } else {
+                self.overrides.configuration_error = Some(error);
+            }
+        }
         self.overrides.allow.extend(overrides.allow);
         self.overrides.block.extend(overrides.block);
         // #327: carry the removed-key sentinels forward so `dcg config` and
@@ -5090,6 +5240,10 @@ impl Config {
     /// anyone who does not opt in (issue #160).
     #[must_use]
     pub fn is_fail_closed(&self) -> bool {
+        // Environment preferences cannot turn missing trusted policy into an allow.
+        if self.configuration_error().is_some() {
+            return true;
+        }
         if let Some(value) = env::var(format!("{ENV_PREFIX}_FAIL_CLOSED"))
             .ok()
             .and_then(|value| parse_env_bool(&value))
@@ -5133,6 +5287,10 @@ impl Config {
     /// forces the default review routing, anything else is ignored.
     #[must_use]
     pub fn unverified_denies(&self) -> bool {
+        // Environment preferences cannot turn missing trusted policy into an allow.
+        if self.configuration_error().is_some() {
+            return true;
+        }
         if let Ok(value) = env::var(format!("{ENV_PREFIX}_UNVERIFIED_DECISION")) {
             match value.trim().to_ascii_lowercase().as_str() {
                 "deny" => return true,
@@ -5159,6 +5317,66 @@ impl Config {
 
         // Fall back to global config
         self.packs.clone()
+    }
+
+    /// The pack configuration that applies in the current directory: a
+    /// matching `[projects]` entry's packs, else the global `[packs]`.
+    fn effective_packs_for_cwd(&self) -> PacksConfig {
+        if self.projects.is_empty() {
+            return self.packs.clone();
+        }
+        std::env::current_dir().map_or_else(
+            |_| self.packs.clone(),
+            |cwd| self.effective_packs_for_project(&cwd),
+        )
+    }
+
+    /// The packs loaded from `packs.custom_paths` that this configuration
+    /// leaves enabled, sorted by ID (#588).
+    ///
+    /// Loading a pack through `custom_paths` enables it without listing it in
+    /// `packs.enabled`, the way `system.disk` is on without being listed, so
+    /// `packs.disabled` turns it off again by its exact ID or by its category.
+    /// For an agent, the profile applies on top exactly as it does to the
+    /// built-in packs: `extra_packs` puts a disabled pack back and
+    /// `disabled_packs` removes it last. Preset names cancel only the
+    /// preset's own contribution, which never includes an external pack, so
+    /// they remove nothing here. Core packs are built in, not loaded from
+    /// `custom_paths`, so nothing here can turn them off.
+    #[must_use]
+    pub fn enabled_external_pack_ids(
+        &self,
+        store: &crate::packs::ExternalPackStore,
+        agent: Option<&crate::agent::Agent>,
+    ) -> Vec<String> {
+        fn names_pack_or_category(entries: &[String], pack_id: &str) -> bool {
+            entries.iter().any(|entry| {
+                crate::packs::preset_members(entry).is_none()
+                    && (pack_id == entry
+                        || pack_id
+                            .strip_prefix(entry.as_str())
+                            .is_some_and(|rest| rest.starts_with('.')))
+            })
+        }
+
+        if store.is_empty() {
+            return Vec::new();
+        }
+        let packs = self.effective_packs_for_cwd();
+        let profile = agent.map(|agent| self.agents.profile_for_agent(agent));
+        let mut ids: Vec<String> = store
+            .pack_ids()
+            .filter(|id| {
+                let restored =
+                    profile.is_some_and(|profile| names_pack_or_category(&profile.extra_packs, id));
+                let removed_by_profile = profile
+                    .is_some_and(|profile| names_pack_or_category(&profile.disabled_packs, id));
+                (restored || !names_pack_or_category(&packs.disabled, id)) && !removed_by_profile
+            })
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// Get enabled pack IDs as a deduplicated set.
@@ -5217,13 +5435,7 @@ impl Config {
     }
 
     fn careful_company_preset_is_requested(&self) -> bool {
-        let packs = if self.projects.is_empty() {
-            self.packs.clone()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            self.effective_packs_for_project(&cwd)
-        } else {
-            self.packs.clone()
-        };
+        let packs = self.effective_packs_for_cwd();
         packs
             .enabled
             .iter()
@@ -5293,13 +5505,7 @@ impl Config {
         windows_payload: bool,
     ) -> HashSet<String> {
         let profile = self.agents.profile_for_agent(agent);
-        let packs_config = if self.projects.is_empty() {
-            self.packs.clone()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            self.effective_packs_for_project(&cwd)
-        } else {
-            self.packs.clone()
-        };
+        let packs_config = self.effective_packs_for_cwd();
 
         // A profile can cancel a preset contribution from the base config, but
         // it must not remove member packs that were also enabled independently
@@ -5328,27 +5534,6 @@ impl Config {
         packs.insert("core".to_string());
 
         packs
-    }
-
-    /// Remove an agent profile's pack exclusions from an already-expanded set.
-    ///
-    /// [`Self::enabled_pack_ids_for_agent`] applies profile exclusions to the
-    /// configured built-in packs. Callers then auto-enable external packs, so
-    /// those later contributions need the same final exclusion pass. Core
-    /// packs remain mandatory regardless of profile settings.
-    pub fn remove_disabled_packs_for_agent(
-        &self,
-        enabled_packs: &mut HashSet<String>,
-        agent: &crate::agent::Agent,
-    ) {
-        let profile = self.agents.profile_for_agent(agent);
-        for disabled in &profile.disabled_packs {
-            if disabled == "core" || disabled.starts_with("core.") {
-                continue;
-            }
-            enabled_packs.remove(disabled);
-            enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
-        }
     }
 
     /// Apply an agent profile to already-loaded project/user/system allowlists.
@@ -5439,6 +5624,9 @@ impl Config {
     /// Returns an error if the config directory cannot be determined/created,
     /// serialization fails, or the config file cannot be written.
     pub fn save_to_user_config(&self) -> Result<PathBuf, String> {
+        if let Some(error) = self.configuration_error() {
+            return Err(error.to_string());
+        }
         let path = Self::user_config_path().ok_or("Could not determine config directory")?;
 
         let content =
@@ -5819,6 +6007,12 @@ history_window = "24h"
 
 # [projects."/path/to/k8s-infra"]
 # packs.enabled = ["kubernetes", "cloud.aws", "infrastructure.terraform"]
+
+# Factory Droid profile (selected by dcg install --droid).
+# Uses the same agent-profile fields as every other supported agent.
+# [agents.droid]
+# extra_packs = ["database"]
+# disabled_allowlist = true
 "#
         .to_string()
     }
@@ -9243,6 +9437,40 @@ enabled = false
     }
 
     #[test]
+    fn test_droid_profile_and_alias_use_existing_agent_configuration() {
+        use crate::agent::Agent;
+
+        for key in ["droid", "factory-droid", "factory_droid"] {
+            let config: Config = toml::from_str(&format!(
+                r#"
+                [agents.{key}]
+                trust_level = "low"
+                extra_packs = ["database.postgresql"]
+                disabled_packs = ["core"]
+                disabled_allowlist = true
+                additional_allowlist = ["git reset --hard"]
+            "#
+            ))
+            .unwrap();
+            let profile = config.agents.profile_for_agent(&Agent::Droid);
+            assert_eq!(profile.trust_level, TrustLevel::Low);
+            assert!(profile.disabled_allowlist);
+            assert_eq!(profile.additional_allowlist, ["git reset --hard"]);
+            let packs = config.enabled_pack_ids_for_agent(&Agent::Droid);
+            assert!(packs.contains("database.postgresql"));
+            assert!(
+                packs.contains("core"),
+                "profiles must preserve mandatory core protections"
+            );
+            assert!(
+                !config
+                    .enabled_pack_ids_for_agent(&Agent::ClaudeCode)
+                    .contains("database.postgresql")
+            );
+        }
+    }
+
+    #[test]
     fn test_agents_config_profile_for_unknown_falls_back_to_default() {
         let mut config = AgentsConfig::default();
         config.default.trust_level = TrustLevel::Low;
@@ -10418,3 +10646,7 @@ exempt_target_globs = ["/**"]
         );
     }
 }
+
+#[cfg(test)]
+#[path = "config_load_regression_tests.rs"]
+mod config_load_regression_tests;

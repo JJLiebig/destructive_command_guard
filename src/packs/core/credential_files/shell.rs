@@ -28,7 +28,14 @@ use crate::normalize::{ShellDialect, is_env_assignment};
 use crate::packs::PatternSuggestion;
 use std::ops::Range;
 
+pub(super) mod indirection;
 mod windows_shells;
+
+pub(crate) use windows_shells::{
+    PowerShellInvokedCommand, PowerShellTruncationTarget, WindowsShellParseIncomplete,
+    powershell_file_truncation_targets, powershell_file_truncation_targets_in_dialect,
+    powershell_file_writer_scan_required, powershell_literal_invocations,
+};
 
 /// Rule name under `core.filesystem`. The pattern entry in
 /// `filesystem::create_destructive_patterns` carries the static reason shown
@@ -161,6 +168,16 @@ pub(crate) fn classify_credential_file_write(
             .or_else(|| windows_shells::classify(segment, ShellDialect::PowerShell))
             .or_else(|| windows_shells::classify(segment, ShellDialect::Cmd)),
     }
+}
+
+/// PowerShell is scanned as a whole source, retaining every command's write
+/// and every native tee destination. Granting a Git write must not hide a
+/// credential write in the same invocation or a later command.
+pub(crate) fn classify_powershell_credential_writes(source: &str) -> Vec<CredentialFileWrite> {
+    if !may_name_protected_path(source) {
+        return Vec::new();
+    }
+    windows_shells::classify_all(source, ShellDialect::PowerShell)
 }
 
 /// All Git redirect writes, retaining the existing truncate and append rule
@@ -1274,7 +1291,7 @@ enum WriteMode {
     Append,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Token {
     Word(Word),
     /// An output redirect with a file target.
@@ -3265,8 +3282,9 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
         "stdbuf" => (&['i', 'o', 'e'], &["input", "output", "error"]),
         "exec" => (&['a'], &[]),
         "caffeinate" => (&['t', 'w'], &[]),
-        "command" | "nohup" | "builtin" | "time" | "chronic" | "setsid" | "unbuffer" => (&[], &[]),
-        _ => return None,
+        "command" | "nohup" | "builtin" | "time" | "chronic" | "setsid" | "unbuffer" | "noglob"
+        | "nocorrect" | "-" => (&[], &[]),
+        _ => return launcher_writer_operand(name, args),
     };
     let mut index = 0usize;
     while let Some(word) = args.get(index) {
@@ -3279,8 +3297,13 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
             // `env -S` re-splits a string into words dcg cannot see.
             return None;
         }
-        if name == "command" && matches!(text.as_str(), "-v" | "-V") {
-            // A query, not an execution.
+        if name == "command"
+            && text.len() > 1
+            && text.starts_with('-')
+            && !text.starts_with("--")
+            && text[1..].chars().any(|flag| matches!(flag, 'v' | 'V'))
+        {
+            // A query (`-v`, `-V`, `-pv`, `-pV`, etc.), not an execution.
             return None;
         }
         if let Some(long) = text.strip_prefix("--") {
@@ -3321,14 +3344,59 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
     Some(index)
 }
 
+/// A launcher whose options [`skip_wrapper`] does not model still runs a
+/// program named among its operands: `strace -f tee ~/.ssh/authorized_keys`
+/// writes the key file. Returning `None` for it read the launcher as an
+/// unknown program, so these writes were allowed behind `strace`, `firejail`,
+/// `gosu`, `unshare`, `flock`, `chroot`, `watch` and every other launcher the
+/// Git pack already treats as running its operands.
+///
+/// The launcher's options are not modeled, so the program is not known to be
+/// its first writer-named operand: an option value or a lock file can name a
+/// writer too (`strace -o sed tee ~/.ssh/authorized_keys`,
+/// `flock /tmp/dd tee …`), and reading that one as the program judged
+/// `sed tee …`, which writes nothing, and allowed the write. So the writer
+/// returned is the first whose own argv writes a credential file, and the
+/// first writer-named operand only when none does. A writer word is never a
+/// launcher, so judging its argv here does not come back to this function.
+fn launcher_writer_operand(name: &str, args: &[&Word]) -> Option<usize> {
+    let next = args.first().map(|word| word.as_string());
+    let runs_operand =
+        crate::packs::core::git::unmodeled_exec_wrapper(name, next.as_deref()) || name == "watch";
+    if !runs_operand {
+        return None;
+    }
+    let mut writers = args.iter().enumerate().filter_map(|(index, word)| {
+        executable_name(word)
+            .is_some_and(|executable| writer_kind(&executable).is_some())
+            .then_some(index)
+    });
+    let first = writers.next()?;
+    std::iter::once(first)
+        .chain(writers)
+        .find(|&index| classify_writer_argv(&args[index..]).is_some())
+        .or(Some(first))
+}
+
 const MAX_WRAPPER_DEPTH: usize = 16;
 
 /// Drop reserved words, leading assignments, and wrapper commands.
-fn strip_prefixes<'a>(mut words: &'a [&'a Word]) -> Option<&'a [&'a Word]> {
+fn strip_prefixes<'a>(words: &'a [&'a Word]) -> Option<&'a [&'a Word]> {
+    strip_prefixes_in_view(words, true)
+}
+
+/// Expanded argv has already lost syntactic assignment/reserved-word roles.
+/// A value such as `x=y` or `if` is an executable name, not new shell syntax.
+fn strip_prefixes_in_view<'a>(
+    mut words: &'a [&'a Word],
+    source_syntax: bool,
+) -> Option<&'a [&'a Word]> {
     for _ in 0..MAX_WRAPPER_DEPTH {
         let first = *words.first()?;
         let text = first.as_string();
-        if crate::context::is_shell_command_prefix_reserved_word(&text) || is_env_assignment(&text)
+        if source_syntax
+            && (crate::context::is_shell_command_prefix_reserved_word(&text)
+                || is_env_assignment(&text))
         {
             words = &words[1..];
             continue;
@@ -3345,6 +3413,14 @@ fn strip_prefixes<'a>(mut words: &'a [&'a Word]) -> Option<&'a [&'a Word]> {
 }
 
 fn classify_simple_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
+    classify_command_in_view(tokens, true)
+}
+
+fn classify_expanded_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
+    classify_command_in_view(tokens, false)
+}
+
+fn classify_command_in_view(tokens: &[Token], source_syntax: bool) -> Option<CredentialFileWrite> {
     let mut words: Vec<&Word> = Vec::new();
     for token in tokens {
         match token {
@@ -3365,7 +3441,16 @@ fn classify_simple_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
             Token::Separator => {}
         }
     }
-    let argv = strip_prefixes(&words)?;
+    let argv = if source_syntax {
+        strip_prefixes(&words)
+    } else {
+        strip_prefixes_in_view(&words, false)
+    }?;
+    classify_writer_argv(argv)
+}
+
+/// The credential write an argv whose program is a writer performs.
+fn classify_writer_argv(argv: &[&Word]) -> Option<CredentialFileWrite> {
     let (argv0, args) = argv.split_first()?;
     let kind = writer_kind(&executable_name(argv0)?)?;
     match kind {
@@ -5732,6 +5817,44 @@ mod tests {
                     ));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unmodeled_launchers_do_not_hide_credential_writers() {
+        for command in [
+            "echo k | strace -f tee ~/.ssh/authorized_keys",
+            "echo k | firejail tee ~/.ssh/authorized_keys",
+            "echo k | gosu me tee ~/.ssh/authorized_keys",
+            "echo k | unshare -r tee ~/.ssh/authorized_keys",
+            "echo k | flock /tmp/l tee ~/.ssh/authorized_keys",
+            "echo k | chroot / tee ~/.ssh/authorized_keys",
+            "watch -n1 tee ~/.ssh/authorized_keys",
+            "strace -f cp evil ~/.ssh/authorized_keys",
+            "echo k | arch -arch x86_64 tee ~/.ssh/authorized_keys",
+            "echo k | xcrun tee ~/.ssh/authorized_keys",
+            "echo k | noglob tee ~/.ssh/authorized_keys",
+            "echo k | nocorrect tee ~/.ssh/authorized_keys",
+            "echo k | builtin command tee ~/.ssh/authorized_keys",
+            // A writer name earlier among the launcher's operands, as an
+            // option value or a lock file, is not the program.
+            "echo k | strace -o sed tee ~/.ssh/authorized_keys",
+            "echo k | strace -o dd tee ~/.ssh/authorized_keys",
+            "echo k | flock /tmp/dd tee ~/.ssh/authorized_keys",
+            "echo k | chroot /tmp/sed tee ~/.ssh/authorized_keys",
+            "echo k | gosu dd tee ~/.ssh/authorized_keys",
+            "strace -o dd cp /tmp/k ~/.ssh/authorized_keys",
+        ] {
+            denied(command);
+        }
+        for command in [
+            "strace -f tee ~/notes.txt",
+            "strace -e trace=open cat ~/.ssh/id_rsa",
+            "firejail ls ~/.ssh",
+            "watch -n1 ls ~/.ssh",
+            "unknown-tool tee ~/.ssh/authorized_keys",
+        ] {
+            allowed(command);
         }
     }
 
