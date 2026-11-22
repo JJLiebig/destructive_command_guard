@@ -1059,11 +1059,10 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     }
 
     if buf.len() > max_bytes {
-        // Keep draining into a bounded metadata buffer. Only its first 4 MiB
-        // reaches command evaluation; the remainder can recover a late
-        // Codex++ capability marker without making input consumption unbounded.
-        // Best-effort: a read error here just shortens the scan buffer, it
-        // never changes the (already decided) oversized verdict.
+        // Preserve the entire initial read when the configured limit exceeds
+        // the scan cap. Extra bytes above that prefix are metadata only.
+        let scan_limit = buf.len().max(MAX_OVERSIZED_SCAN_BYTES);
+        // Drain a bounded extension to recover a late Codex++ capability marker.
         if buf.len() < MAX_OVERSIZED_METADATA_BYTES {
             let _phase = crate::perf::phase(crate::perf::ProfilePhase::InputRead);
             let remaining = (MAX_OVERSIZED_METADATA_BYTES - buf.len()) as u64;
@@ -1075,7 +1074,7 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         let metadata_prefix = String::from_utf8_lossy(&buf);
         let permission_decision_ask_supported =
             permission_decision_ask_supported_from_truncated_json(&metadata_prefix);
-        let scan_len = buf.len().min(MAX_OVERSIZED_SCAN_BYTES);
+        let scan_len = buf.len().min(scan_limit);
         // Lossy: the cap can land mid-codepoint, and the scanner distrusts
         // anything it cannot decode cleanly anyway.
         return Err(HookReadError::InputTooLarge {

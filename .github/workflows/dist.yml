@@ -422,7 +422,7 @@ jobs:
       - name: Verify complete signed release matrix
         # Fail closed before publishing. A release is not complete unless every
         # declared platform archive and both installers have a valid checksum
-        # sidecar plus a non-empty Sigstore bundle. This prevents a disabled,
+        # sidecar plus a verified Sigstore bundle. This prevents a disabled,
         # skipped, or partially successful build matrix from yielding another
         # platform-incomplete public release (#238).
         run: |
@@ -453,8 +453,10 @@ jobs:
             done
 
             sha256sum --check --strict "$artifact.sha256"
-            jq --exit-status 'type == "object"' \
-              "$artifact.sigstore.json" >/dev/null
+            cosign verify-blob --bundle "$artifact.sigstore.json" \
+              --certificate-identity "$GITHUB_SERVER_URL/$GITHUB_WORKFLOW_REF" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$artifact"
           }
 
           for archive in "${archives[@]}"; do

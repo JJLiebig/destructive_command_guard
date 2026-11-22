@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# This gate validates upstream's DSR/Minisign releases. The Codex++ fork
+# verifies its signed archives in .github/workflows/dist.yml.
 # e2e_fleet_install.sh — install dcg on every real platform from the PUBLIC
 # release URL using the same authenticated installer assets as `dcg update`, then
 # prove the installed binary actually guards commands.
@@ -216,7 +218,7 @@ grep -qi "checksum" "$INSTALL_LOG" && echo "RESULT:checksum_verified:PASS" \
   || echo "RESULT:checksum_verified:FAIL:no checksum evidence in installer output"
 grep -qi "Signature verified (minisign key " "$INSTALL_LOG" \
   && echo "RESULT:minisign_verified:PASS" \
-  || echo "RESULT:minisign_verified:FAIL:strict minisign key verification did not complete"
+  || echo "RESULT:minisign_verified:FAIL:no minisign key verification evidence"
 
 BIN="$DEST/dcg"
 [ -x "$BIN" ] || { echo "RESULT:binary_present:FAIL:not executable at $BIN"; exit 1; }

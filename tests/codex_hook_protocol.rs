@@ -561,6 +561,50 @@ fn codex_ask_capability_selects_decision() {
 }
 
 #[test]
+fn codex_late_capability_survives_oversized_error_paths() {
+    for (supported, expected) in [(true, "ask"), (false, "deny")] {
+        let payload = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"git status"}},"padding":"{}","permission_decision_ask_supported":{supported}}}"#,
+            "A".repeat(5 * 1024 * 1024)
+        );
+        for (config, diagnostic) in [
+            ("[general]\nfail_closed = true\n", "size limit"),
+            ("[invalid", "configuration error"),
+        ] {
+            let outcome = run_hook_raw_with_config(payload.as_bytes(), config, &[]);
+            let json = outcome.stdout_json();
+            let decision = json["hookSpecificOutput"].as_object().unwrap();
+            assert_eq!(outcome.exit_code, 0);
+            assert_eq!(decision.len(), 3, "expected the minimal Codex response");
+            assert_eq!(decision["permissionDecision"], expected);
+            assert!(
+                decision["permissionDecisionReason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(diagnostic))
+            );
+        }
+    }
+}
+
+#[test]
+fn oversized_scan_preserves_bytes_read_under_configured_limit() {
+    let payload = format!(
+        r#"{{"tool_name":"Bash","padding":"{}","tool_input":{{"command":"git reset --hard"}},"tail":"{}"}}"#,
+        "A".repeat(4 * 1024 * 1024),
+        "A".repeat(2 * 1024 * 1024)
+    );
+    let outcome = run_hook_raw_with_config(
+        payload.as_bytes(),
+        "[general]\nmax_hook_input_bytes = 5242880\n",
+        &[],
+    );
+    assert_eq!(
+        outcome.stdout_json()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+}
+
+#[test]
 fn smoke_claude_destructive_command_blocked() {
     let outcome = run_claude_hook("git reset --hard HEAD~1");
     assert!(

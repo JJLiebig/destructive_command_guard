@@ -415,21 +415,47 @@ fn blocking_verdict_exit_code(protocol: hook::HookProtocol, delivery: io::Result
 /// identified agent: a planted marker must not be able to switch, say,
 /// Codex's JSON deny into an exit status Codex treats as a pass.
 fn payloadless_hook_protocol(detected_agent: &Agent, prefix: Option<&str>) -> hook::HookProtocol {
-    if let Some(prefix) = prefix {
-        if hook::shell_tool_from_truncated_json(prefix).is_some() {
-            match hook::permission_decision_ask_supported_from_truncated_json(prefix) {
-                Some(true) => return hook::HookProtocol::CodexAsk,
-                Some(false) => return hook::HookProtocol::Codex,
-                None => {}
-            }
-        }
-    }
     if !detected_agent.is_known() {
         if let Some(protocol) = prefix.and_then(hook::protocol_from_truncated_json) {
             return protocol;
         }
     }
     hook_protocol_for_agent(detected_agent)
+}
+
+fn unparseable_hook_prefix(error: &hook::HookReadError) -> Option<&str> {
+    match error {
+        hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix),
+        hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy),
+        hook::HookReadError::Json { raw, .. } => Some(raw),
+        hook::HookReadError::Io(_) => None,
+    }
+}
+
+fn unparseable_hook_protocol(
+    detected_agent: &Agent,
+    error: &hook::HookReadError,
+) -> hook::HookProtocol {
+    let prefix = unparseable_hook_prefix(error);
+    let capability = match error {
+        hook::HookReadError::InputTooLarge {
+            permission_decision_ask_supported,
+            ..
+        } => *permission_decision_ask_supported,
+        _ => prefix.and_then(hook::permission_decision_ask_supported_from_truncated_json),
+    };
+    if let Some(supported) = capability
+        && let Some(prefix) = prefix
+        && hook::shell_tool_from_truncated_json(prefix).is_some()
+        && hook::protocol_from_truncated_json(prefix).is_none()
+    {
+        return if supported {
+            hook::HookProtocol::CodexAsk
+        } else {
+            hook::HookProtocol::Codex
+        };
+    }
+    payloadless_hook_protocol(detected_agent, prefix)
 }
 
 /// Leave hook mode with `exit_code`.
@@ -622,19 +648,7 @@ fn handle_unparseable_hook_input(
     // cannot run protocol detection, so derive the protocol from the
     // env/process-detected agent, or from whatever envelope markers the raw
     // bytes still show when no agent was identified.
-    let raw_prefix = match read_err {
-        hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
-        hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
-        hook::HookReadError::Json { raw, .. } => Some(raw.as_str()),
-        hook::HookReadError::Io(_) => None,
-    };
-    let protocol = match read_err {
-        hook::HookReadError::InputTooLarge {
-            permission_decision_ask_supported: Some(true),
-            ..
-        } => hook::HookProtocol::CodexAsk,
-        _ => payloadless_hook_protocol(detected_agent, raw_prefix),
-    };
+    let protocol = unparseable_hook_protocol(detected_agent, read_err);
     let reason = if host_fail_closed && !(blockable && config.is_fail_closed()) {
         "BLOCKED by dcg: the hook input was unreadable, malformed or over the size limit, \
          so the command was not verified. dcg always fails closed for this host. Check \
@@ -768,8 +782,7 @@ fn push_oversized_scan_windows(
 fn try_deny_unparseable_payload(
     config: &Config,
     detected_agent: &Agent,
-    prefix: &str,
-    permission_decision_ask_supported: Option<bool>,
+    read_err: &hook::HookReadError,
     deadline: &Deadline,
     compiled_overrides: &CompiledOverrides,
     heredoc_settings: &HeredocSettings,
@@ -777,6 +790,7 @@ fn try_deny_unparseable_payload(
 ) -> Option<i32> {
     // Attribute the payload to a shell tool before evaluating anything. The
     // dialect comes from the same mapping the normal parsed path uses.
+    let prefix = unparseable_hook_prefix(read_err)?;
     let (_tool_name, shell_dialect) = hook::shell_tool_from_truncated_json(prefix)?;
 
     // The padding may live INSIDE the command string (the issue's repro
@@ -834,15 +848,7 @@ fn try_deny_unparseable_payload(
         return None;
     }
 
-    // Preserve Codex++'s capability even when the scan prefix ends before
-    // its marker. Otherwise use upstream's payloadless protocol detection.
-    let ask_supported = permission_decision_ask_supported
-        .or_else(|| hook::permission_decision_ask_supported_from_truncated_json(prefix));
-    let hook_protocol = match ask_supported {
-        Some(true) => hook::HookProtocol::CodexAsk,
-        Some(false) => hook::HookProtocol::Codex,
-        None => payloadless_hook_protocol(detected_agent, Some(prefix)),
-    };
+    let hook_protocol = unparseable_hook_protocol(detected_agent, read_err);
     let effective_agent = effective_agent_for_hook_protocol(hook_protocol, detected_agent);
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, detected_agent);
 
@@ -2343,15 +2349,7 @@ fn main() {
                 };
                 host_hook_protocol(extracted.protocol, &detected_agent)
             }
-            Err(error) => {
-                let prefix = match error {
-                    hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
-                    hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
-                    hook::HookReadError::Json { raw, .. } => Some(raw.as_str()),
-                    hook::HookReadError::Io(_) => None,
-                };
-                payloadless_hook_protocol(&detected_agent, prefix)
-            }
+            Err(error) => unparseable_hook_protocol(&detected_agent, error),
         };
         emit_stderr!("Error: {reason}");
         let delivery = hook::output_indeterminate_for_protocol(protocol, reason, true);
@@ -2446,33 +2444,17 @@ fn main() {
                 // found so far (a numeric Copilot `timestamp`, a wrong-typed
                 // field, a lone surrogate escape) failed open with the command
                 // in plain view, and this judges the next unforeseen one.
-                let salvageable = match &read_err {
-                    hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
-                    hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
-                    hook::HookReadError::Json { raw, .. } => Some(raw.as_str()),
-                    hook::HookReadError::Io(_) => None,
-                };
-                if let Some(prefix) = salvageable {
-                    let permission_decision_ask_supported = match &read_err {
-                        hook::HookReadError::InputTooLarge {
-                            permission_decision_ask_supported,
-                            ..
-                        } => *permission_decision_ask_supported,
-                        _ => None,
-                    };
-                    if let Some(exit_code) = try_deny_unparseable_payload(
-                        &config,
-                        &detected_agent,
-                        prefix,
-                        permission_decision_ask_supported,
-                        &deadline,
-                        &compiled_overrides,
-                        &heredoc_settings,
-                        external_store,
-                    ) {
-                        finish_hook_mode(exit_code);
-                        return;
-                    }
+                if let Some(exit_code) = try_deny_unparseable_payload(
+                    &config,
+                    &detected_agent,
+                    &read_err,
+                    &deadline,
+                    &compiled_overrides,
+                    &heredoc_settings,
+                    external_store,
+                ) {
+                    finish_hook_mode(exit_code);
+                    return;
                 }
             }
             let exit_code =
