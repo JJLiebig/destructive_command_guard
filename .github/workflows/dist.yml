@@ -81,7 +81,7 @@ jobs:
             target: x86_64-apple-darwin
             artifact_name: dcg
           # macOS Apple Silicon
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: dcg
           # Windows x64
